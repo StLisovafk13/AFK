@@ -169,8 +169,25 @@ def upscale_w_param(u: str, max_w: int) -> str:
     return u
 
 def guess_filename(url: str, idx: int) -> str:
-    base = url.split("?")[0].rstrip("/").split("/")[-1]
+    """Return a deterministic file name derived from URL.
+
+    Some VSCO CDN URLs use the same media file name while placing a
+    unique identifier in the path right before it. For example:
+
+        .../6340fee78c264f3f15c8be6c/vsco_100722.jpg
+        .../6340fe288c264f3f15c8be68/vsco_100722.jpg
+
+    Without accounting for the parent directory, both would save as
+    ``vsco_100722.jpg`` and overwrite each other.  To avoid this we
+    prepend the immediate parent folder when available.
+    """
+
+    path_parts = urlsplit(url).path.rstrip("/").split("/")
+    base = path_parts[-1] if path_parts else ""
     if base and "." in base:
+        # Include the segment preceding the filename to keep URLs unique
+        if len(path_parts) >= 2 and path_parts[-2]:
+            return f"{path_parts[-2]}_{base}"
         return base
     path = urlsplit(url).path.lower()
     if path.endswith(".mp4"):  return f"vsco_{idx:05d}.mp4"
