@@ -1407,7 +1407,7 @@ async def _dl_worker():
                                         pass
                         txt = f"🔄 <b>{stage}</b>: <code>{job.target}</code>"
                         if total_found is not None:
-                            txt += f"\\n🔎 Найдено медиа: <b>{total_found}</b>"
+                            txt += f"\n🔎 Найдено медиа: <b>{total_found}</b>"
                         now = loop.time()
                         if now - last_edit >= 2.0:
                             await _safe_edit(job.chat_id, progress.message_id, txt)
@@ -1454,7 +1454,7 @@ async def _dl_worker():
                         try:
                             base = f"🔄 <b>{stage}</b>: <code>{job.target}</code>"
                             if total_found is not None:
-                                base += f"\\n🔎 Найдено медиа: <b>{total_found}</b>"
+                                base += f"\n🔎 Найдено медиа: <b>{total_found}</b>"
                             await _safe_edit(job.chat_id, progress.message_id, base)
                         except Exception:
                             pass
@@ -1491,7 +1491,7 @@ async def _dl_worker():
                     lines = [f"✅ Готово."]
                     if total_found is not None:
                         lines.append(f"🔎 Медиа найдено: <b>{total_found}</b>")
-                    await _safe_edit(job.chat_id, progress.message_id, "\\n".join(lines))
+                    await _safe_edit(job.chat_id, progress.message_id, "\n".join(lines))
                     if man.exists():
                         await bot.send_document(
                             job.chat_id,
