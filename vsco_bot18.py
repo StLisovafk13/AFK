@@ -27,13 +27,18 @@ import json
 import time
 from html import escape
 
-import pandas as pd
+try:
+    import pandas as pd  # type: ignore
+except Exception:  # pandas is optional
+    pd = None  # type: ignore
+
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
     Message,
     BufferedInputFile,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     CallbackQuery,
@@ -55,6 +60,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 WORKDIR = Path(os.getenv("BOT_WORKDIR", "./work")); WORKDIR.mkdir(parents=True, exist_ok=True)
 LOGDIR = Path(os.getenv("BOT_LOGDIR", "./logs")); LOGDIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = os.getenv("BOT_DB_PATH", "vsco_links.db")
+SEND_TIMEOUT = int(os.getenv("BOT_SEND_TIMEOUT", "600"))
 
 def setup_logging():
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -78,6 +84,9 @@ def setup_logging():
 
 setup_logging()
 log = logging.getLogger("vsco-bot")
+
+if pd is None:
+    log.warning("pandas is not installed; CSV features are disabled")
 
 # ---------------------- VSCO constants ----------------------
 VSCO_HOSTS = {"vsco.co", "www.vsco.co"}
@@ -927,6 +936,9 @@ async def on_document(msg: Message):
     low = (p.name or "").lower()
 
     if low.endswith(".csv"):
+        if pd is None:
+            await msg.answer("Обработка CSV недоступна: не установлен pandas")
+            return
         ses.uploaded_csv.append(p)
         try:
             df = pd.read_csv(p)
@@ -1032,6 +1044,9 @@ async def on_export_click(cq: CallbackQuery):
     if len(parts)>=3 and parts[1]=="format":
         fmt = parts[2]
         if fmt == "csv":
+            if pd is None:
+                await cq.answer("Экспорт CSV недоступен: не установлен pandas", show_alert=True)
+                return
             users = fetch_gallery_users(ses.export_scope, chat_id)
             if not users: await cq.answer("Нет данных", show_alert=True); return
             flat = [{
@@ -1206,12 +1221,15 @@ async def on_links_click(cq: CallbackQuery):
     elif parts[1] == "refresh":
         page = 1
     elif parts[1] == "csv":
+        if pd is None:
+            await cq.answer("Экспорт CSV недоступен: не установлен pandas", show_alert=True)
+            return
         since = _since_utc_iso(1)
         total, rows = _links_since_query(chat_id, ses.export_scope, since, limit=10_000, offset=0)
         if not rows:
             await cq.answer("За день нет ссылок", show_alert=True)
             return
-        df = pd.DataFrame([{"username": r[0], "url": r[1], "created_at": r[2], "chat_id": r[3]} for r in rows])
+        df = pd.DataFrame([{ "username": r[0], "url": r[1], "created_at": r[2], "chat_id": r[3]} for r in rows])
         out = get_session(chat_id).dir / f"links_day_{ses.export_scope}.csv"
         df.to_csv(out, index=False, encoding="utf-8")
         await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
@@ -1327,6 +1345,7 @@ async def _dl_worker():
     while True:
         job: DLJob = await _DL_QUEUE.get()
         try:
+            job_started = time.time()
             progress = await bot.send_message(job.chat_id, f"⏳ Сканирование профиля: <code>{job.target}</code>")
 
             script = _dl_script_path()
@@ -1457,15 +1476,18 @@ async def _dl_worker():
             if user_dir is None:
                 await _safe_edit(job.chat_id, progress.message_id, f"⚠️ Завершено, но результирующих файлов не найдено.")
             else:
-                zips = sorted(user_dir.glob("*.zip"))
+                zips = sorted(
+                    p for p in user_dir.glob("*.zip") if p.stat().st_mtime >= job_started
+                )
                 if zips:
                     await _safe_edit(job.chat_id, progress.message_id, "📦 Архив(ы) готовы — отправляю…")
                     for z in zips:
                         try:
                             await bot.send_document(
                                 job.chat_id,
-                                BufferedInputFile(z.read_bytes(), filename=z.name),
-                                caption=f"📦 {z.name}"
+                                FSInputFile(z, filename=z.name),
+                                caption=f"📦 {z.name}",
+                                request_timeout=SEND_TIMEOUT,
                             )
                         except Exception as e:
                             await bot.send_message(job.chat_id, f"Не удалось отправить {z.name}: {e}")
@@ -1480,13 +1502,15 @@ async def _dl_worker():
                         await bot.send_document(
                             job.chat_id,
                             BufferedInputFile(man.read_bytes(), filename=man.name),
-                            caption="manifest.json"
+                            caption="manifest.json",
+                            request_timeout=SEND_TIMEOUT,
                         )
                     if urls.exists():
                         await bot.send_document(
                             job.chat_id,
                             BufferedInputFile(urls.read_bytes(), filename=urls.name),
-                            caption="urls_extracted.txt"
+                            caption="urls_extracted.txt",
+                            request_timeout=SEND_TIMEOUT,
                         )
 
             await bot.send_message(job.chat_id, f"✅ Задание #{job.id} завершено.")
@@ -1505,11 +1529,17 @@ async def _dl_worker():
 async def cmd_help(msg: Message):
     text = (
         "🆘 <b>Справка</b>\n\n"
-        "Этот бот скачивает медиа из VSCO через очередь заданий.\n"
-        "Во время сканирования профиля я показываю, <b>сколько медиа найдено</b>.\n\n"
+        "Этот бот скачивает медиа из VSCO через очередь заданий, собирает статистику\n"
+        "и позволяет экспортировать ссылки. Во время сканирования профиля я показываю,\n"
+        "<b>сколько медиа найдено</b>. Можно загружать CSV/HTML со ссылками.\n\n"
         "📋 <b>Команды</b>:\n"
-        "• <b>/dl &lt;username|profile_url&gt; [--flags]</b> — поставить на скачивание\n"
+        "• <b>/start</b> — приветствие и справка\n"
+        "• <b>/dl &lt;username|profile_url&gt; [--flags]</b> — поставить профиль на скачивание\n"
         "• <b>/qstat</b> — показать размер очереди\n"
+        "• <b>/links</b> — ссылки за последние 24 часа\n"
+        "• <b>/export</b> — экспорт CSV/галереи или карты\n"
+        "• <b>/stats</b> — статистика по скачанным данным\n"
+        "• <b>/reset</b> — очистить текущую сессию\n"
         "• <b>/help</b> — эта справка\n\n"
         "🔧 <b>Полезные флаги</b>:\n"
         "• <code>--max N</code> — лимит медиа (0 = все)\n"
