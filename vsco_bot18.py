@@ -38,6 +38,7 @@ from aiogram.filters import Command
 from aiogram.types import (
     Message,
     BufferedInputFile,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     CallbackQuery,
@@ -59,6 +60,7 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 WORKDIR = Path(os.getenv("BOT_WORKDIR", "./work")); WORKDIR.mkdir(parents=True, exist_ok=True)
 LOGDIR = Path(os.getenv("BOT_LOGDIR", "./logs")); LOGDIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = os.getenv("BOT_DB_PATH", "vsco_links.db")
+SEND_TIMEOUT = int(os.getenv("BOT_SEND_TIMEOUT", "600"))
 
 def setup_logging():
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -1323,6 +1325,43 @@ async def cmd_qstat(msg: Message):
     await msg.answer(f"📊 В очереди заданий: {size}. Один воркер обрабатывает по одному.")
 
 
+def rebuild_urls_extracted(user_dir: Path) -> None:
+    """Recreate urls_extracted.txt from manifest.json using full image URLs.
+
+    Some external downloaders deduplicate entries by filename which causes
+    distinct VSCO links with the same basename to be lost. Here we rebuild the
+    list so every unique image URL is written out regardless of name
+    collisions.
+    """
+    man = user_dir / "manifest.json"
+    if not man.exists():
+        return
+    try:
+        data = json.loads(man.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    items = data.get("items", data) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return
+    urls: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("image_url") or item.get("responsive_url")
+        if isinstance(url, str) and url not in seen:
+            urls.append(url)
+            seen.add(url)
+    if not urls:
+        return
+    try:
+        out = user_dir / "urls_extracted.txt"
+        out.write_text("\n".join(urls) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+
 
 async def _dl_worker():
     """Единственный воркер: берёт задания по одному и запускает downloader как отдельный процесс.
@@ -1343,6 +1382,7 @@ async def _dl_worker():
     while True:
         job: DLJob = await _DL_QUEUE.get()
         try:
+            job_started = time.time()
             progress = await bot.send_message(job.chat_id, f"⏳ Сканирование профиля: <code>{job.target}</code>")
 
             script = _dl_script_path()
@@ -1470,18 +1510,24 @@ async def _dl_worker():
             user_dirs = [p for p in job.out_base.glob("*") if p.is_dir()]
             user_dir = max(user_dirs, key=lambda p: p.stat().st_mtime, default=None)
 
+            if user_dir is not None:
+                rebuild_urls_extracted(user_dir)
+
             if user_dir is None:
                 await _safe_edit(job.chat_id, progress.message_id, f"⚠️ Завершено, но результирующих файлов не найдено.")
             else:
-                zips = sorted(user_dir.glob("*.zip"))
+                zips = sorted(
+                    p for p in user_dir.glob("*.zip") if p.stat().st_mtime >= job_started
+                )
                 if zips:
                     await _safe_edit(job.chat_id, progress.message_id, "📦 Архив(ы) готовы — отправляю…")
                     for z in zips:
                         try:
                             await bot.send_document(
                                 job.chat_id,
-                                BufferedInputFile(z.read_bytes(), filename=z.name),
-                                caption=f"📦 {z.name}"
+                                FSInputFile(z, filename=z.name),
+                                caption=f"📦 {z.name}",
+                                request_timeout=SEND_TIMEOUT,
                             )
                         except Exception as e:
                             await bot.send_message(job.chat_id, f"Не удалось отправить {z.name}: {e}")
@@ -1496,13 +1542,15 @@ async def _dl_worker():
                         await bot.send_document(
                             job.chat_id,
                             BufferedInputFile(man.read_bytes(), filename=man.name),
-                            caption="manifest.json"
+                            caption="manifest.json",
+                            request_timeout=SEND_TIMEOUT,
                         )
                     if urls.exists():
                         await bot.send_document(
                             job.chat_id,
                             BufferedInputFile(urls.read_bytes(), filename=urls.name),
-                            caption="urls_extracted.txt"
+                            caption="urls_extracted.txt",
+                            request_timeout=SEND_TIMEOUT,
                         )
 
             await bot.send_message(job.chat_id, f"✅ Задание #{job.id} завершено.")
