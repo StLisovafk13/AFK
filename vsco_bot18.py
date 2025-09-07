@@ -27,7 +27,11 @@ import json
 import time
 from html import escape
 
-import pandas as pd
+try:
+    import pandas as pd  # type: ignore
+except Exception:  # pandas is optional
+    pd = None  # type: ignore
+
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -78,6 +82,9 @@ def setup_logging():
 
 setup_logging()
 log = logging.getLogger("vsco-bot")
+
+if pd is None:
+    log.warning("pandas is not installed; CSV features are disabled")
 
 # ---------------------- VSCO constants ----------------------
 VSCO_HOSTS = {"vsco.co", "www.vsco.co"}
@@ -927,6 +934,9 @@ async def on_document(msg: Message):
     low = (p.name or "").lower()
 
     if low.endswith(".csv"):
+        if pd is None:
+            await msg.answer("Обработка CSV недоступна: не установлен pandas")
+            return
         ses.uploaded_csv.append(p)
         try:
             df = pd.read_csv(p)
@@ -1032,6 +1042,9 @@ async def on_export_click(cq: CallbackQuery):
     if len(parts)>=3 and parts[1]=="format":
         fmt = parts[2]
         if fmt == "csv":
+            if pd is None:
+                await cq.answer("Экспорт CSV недоступен: не установлен pandas", show_alert=True)
+                return
             users = fetch_gallery_users(ses.export_scope, chat_id)
             if not users: await cq.answer("Нет данных", show_alert=True); return
             flat = [{
@@ -1206,12 +1219,15 @@ async def on_links_click(cq: CallbackQuery):
     elif parts[1] == "refresh":
         page = 1
     elif parts[1] == "csv":
+        if pd is None:
+            await cq.answer("Экспорт CSV недоступен: не установлен pandas", show_alert=True)
+            return
         since = _since_utc_iso(1)
         total, rows = _links_since_query(chat_id, ses.export_scope, since, limit=10_000, offset=0)
         if not rows:
             await cq.answer("За день нет ссылок", show_alert=True)
             return
-        df = pd.DataFrame([{"username": r[0], "url": r[1], "created_at": r[2], "chat_id": r[3]} for r in rows])
+        df = pd.DataFrame([{ "username": r[0], "url": r[1], "created_at": r[2], "chat_id": r[3]} for r in rows])
         out = get_session(chat_id).dir / f"links_day_{ses.export_scope}.csv"
         df.to_csv(out, index=False, encoding="utf-8")
         await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
