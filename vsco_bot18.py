@@ -1325,6 +1325,43 @@ async def cmd_qstat(msg: Message):
     await msg.answer(f"📊 В очереди заданий: {size}. Один воркер обрабатывает по одному.")
 
 
+def rebuild_urls_extracted(user_dir: Path) -> None:
+    """Recreate urls_extracted.txt from manifest.json using full image URLs.
+
+    Some external downloaders deduplicate entries by filename which causes
+    distinct VSCO links with the same basename to be lost. Here we rebuild the
+    list so every unique image URL is written out regardless of name
+    collisions.
+    """
+    man = user_dir / "manifest.json"
+    if not man.exists():
+        return
+    try:
+        data = json.loads(man.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    items = data.get("items", data) if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return
+    urls: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("image_url") or item.get("responsive_url")
+        if isinstance(url, str) and url not in seen:
+            urls.append(url)
+            seen.add(url)
+    if not urls:
+        return
+    try:
+        out = user_dir / "urls_extracted.txt"
+        out.write_text("\n".join(urls) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+
 
 async def _dl_worker():
     """Единственный воркер: берёт задания по одному и запускает downloader как отдельный процесс.
@@ -1472,6 +1509,9 @@ async def _dl_worker():
             # Отправка результатов
             user_dirs = [p for p in job.out_base.glob("*") if p.is_dir()]
             user_dir = max(user_dirs, key=lambda p: p.stat().st_mtime, default=None)
+
+            if user_dir is not None:
+                rebuild_urls_extracted(user_dir)
 
             if user_dir is None:
                 await _safe_edit(job.chat_id, progress.message_id, f"⚠️ Завершено, но результирующих файлов не найдено.")
