@@ -169,8 +169,26 @@ def upscale_w_param(u: str, max_w: int) -> str:
     return u
 
 def guess_filename(url: str, idx: int) -> str:
-    base = url.split("?")[0].rstrip("/").split("/")[-1]
+    """Return a deterministic file name derived from URL.
+
+    Some VSCO CDN URLs use the same media file name while placing a
+    unique identifier in the path right before it. For example:
+
+        .../6340fee78c264f3f15c8be6c/vsco_100722.jpg
+        .../6340fe288c264f3f15c8be68/vsco_100722.jpg
+
+    Without accounting for the parent directory, both would save as
+    ``vsco_100722.jpg`` and overwrite each other.  To avoid this we
+    prepend the immediate parent folder when available.
+    """
+
+    path_parts = urlsplit(url).path.rstrip("/").split("/")
+    base = path_parts[-1] if path_parts else ""
     if base and "." in base:
+        if len(path_parts) >= 2 and path_parts[-2]:
+            parent = re.sub(r"[^0-9A-Za-z_-]", "_", path_parts[-2])
+            # Include the sanitized parent segment to keep URLs unique
+            return f"{parent}_{base}"
         return base
     path = urlsplit(url).path.lower()
     if path.endswith(".mp4"):  return f"vsco_{idx:05d}.mp4"
@@ -277,15 +295,15 @@ async def collect_image_urls(
 
         return urls
 
-    def dedup_keep_order(seq: List[str]) -> List[str]:
-        seen, out = set(), []
-        for u in seq:
-            if u not in seen:
-                seen.add(u); out.append(u)
-        return out
+    seen: set[str] = set()
+    urls: List[str] = []
 
     html = await page.content()
-    urls = dedup_keep_order(extract_from_html(html))
+    for u in extract_from_html(html):
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+            logger.info(f"scan_progress {len(urls)}")
     if not urls:
         logger.warning("На первом экране не нашли img/picture. Пробуем прокрутку и кнопку Load More…")
 
@@ -334,7 +352,11 @@ async def collect_image_urls(
 
         # Повторное извлечение
         html = await page.content()
-        urls = dedup_keep_order(urls + extract_from_html(html))
+        for u in extract_from_html(html):
+            if u not in seen:
+                seen.add(u)
+                urls.append(u)
+                logger.info(f"scan_progress {len(urls)}")
 
         new_height = await page.evaluate("() => document.body.scrollHeight")
         grew = (new_height > last_height) or (len(urls) > prev_count)
