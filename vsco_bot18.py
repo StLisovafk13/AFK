@@ -1297,8 +1297,10 @@ async def scan_history_for_links(bot: Bot, chat_id: int, limit: int = 1000, step
 
 @dp.message(Command("scan_links"))
 async def cmd_scan_links(msg: Message):
-    if msg.chat.type not in ("group", "supergroup", "channel") or not msg.chat.username:
-        await msg.answer("Команда работает только в публичных чатах")
+    if msg.chat.type not in ("group", "supergroup", "channel"):
+        await msg.answer(
+            "Команда работает только в группах, супергруппах и каналах"
+        )
         return
     me = await msg.bot.get_me()
     member = await msg.bot.get_chat_member(msg.chat.id, me.id)
@@ -1307,7 +1309,9 @@ async def cmd_scan_links(msg: Message):
         return
     await msg.answer("Начинаю сканирование истории…")
     scanned, added = await scan_history_for_links(msg.bot, msg.chat.id)
-    await msg.answer(f"Просмотрено сообщений: {scanned}, добавлено ссылок: {added}")
+    await msg.answer(
+        f"Просмотрено сообщений: {scanned}, добавлено ссылок: {added}"
+    )
     if pd is not None and added:
         conn = db_connect()
         try:
