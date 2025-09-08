@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 """
 VSCO Media Downloader (Playwright-session) + Auto-upscale + Load More + Multi-ZIP (NO EXIF)
 
@@ -185,9 +182,10 @@ def guess_filename(url: str, idx: int) -> str:
     path_parts = urlsplit(url).path.rstrip("/").split("/")
     base = path_parts[-1] if path_parts else ""
     if base and "." in base:
-        # Include the segment preceding the filename to keep URLs unique
         if len(path_parts) >= 2 and path_parts[-2]:
-            return f"{path_parts[-2]}_{base}"
+            parent = re.sub(r"[^0-9A-Za-z_-]", "_", path_parts[-2])
+            # Include the sanitized parent segment to keep URLs unique
+            return f"{parent}_{base}"
         return base
     path = urlsplit(url).path.lower()
     if path.endswith(".mp4"):  return f"vsco_{idx:05d}.mp4"
@@ -294,18 +292,16 @@ async def collect_image_urls(
 
         return urls
 
-    def dedup_keep_order(seq: List[str]) -> List[str]:
-        seen, out = set(), []
-        for u in seq:
-            if u not in seen:
-                seen.add(u); out.append(u)
-        return out
+    seen: set[str] = set()
+    urls: List[str] = []
 
     html = await page.content()
-    urls = dedup_keep_order(extract_from_html(html))
-    if urls:
-        logger.info(f"scan_progress {len(urls)}")
-    else:
+    for u in extract_from_html(html):
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+            logger.info(f"scan_progress {len(urls)}")
+    if not urls:
         logger.warning("На первом экране не нашли img/picture. Пробуем прокрутку и кнопку Load More…")
 
     max_scrolls = 999999 if target_count == 0 else max(30, min(999999, target_count // 2 + 20))
@@ -353,9 +349,11 @@ async def collect_image_urls(
 
         # Повторное извлечение
         html = await page.content()
-        urls = dedup_keep_order(urls + extract_from_html(html))
-        if len(urls) > prev_count:
-            logger.info(f"scan_progress {len(urls)}")
+        for u in extract_from_html(html):
+            if u not in seen:
+                seen.add(u)
+                urls.append(u)
+                logger.info(f"scan_progress {len(urls)}")
 
         new_height = await page.evaluate("() => document.body.scrollHeight")
         grew = (new_height > last_height) or (len(urls) > prev_count)
