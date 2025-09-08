@@ -1415,6 +1415,7 @@ async def _dl_worker():
         try:
             job_started = time.time()
             log.info("Job #%s: start for %s", job.id, job.target)
+
             cancel_kb = InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="Отменить", callback_data=f"cancel:{job.id}")]]
             )
@@ -1425,6 +1426,7 @@ async def _dl_worker():
             )
             global _CURRENT_JOB
             _CURRENT_JOB = {"job": job, "progress": progress}
+
 
             script = _dl_script_path()
             if not script.exists():
@@ -1548,6 +1550,7 @@ async def _dl_worker():
 
                     if any(k in low for k in ("download", "загрузка", "скачива")) and stage != "Загрузка":
                         stage = "Загрузка"
+
                         downloaded = 0
                         log.info("Job #%s: stage -> %s", job.id, stage)
                         base = f"📥 <b>{stage}</b>: <code>{job.target}</code>"
@@ -1589,16 +1592,27 @@ async def _dl_worker():
                                 await _safe_edit(job.chat_id, progress.message_id, base, reply_markup=cancel_kb)
                         continue
 
+                        log.info("Job #%s: stage -> %s", job.id, stage)
+                    elif any(k in low for k in ("zip", "архив")) and stage != "Архив":
+                        stage = "Архив"
+                        log.info("Job #%s: stage -> %s", job.id, stage)
+
+
+
                     if total_found is None:
                         m = re.search(r"(?:found|найден[оа])\D+(\d+)\D+(?:media|items|files|медиа|ссыл)", low)
                         if m:
                             try:
                                 total_found = int(m.group(1))
                                 log.info("Job #%s: media count from stdout %d", job.id, total_found)
+
                                 base = f"🔄 <b>{stage}</b>: <code>{job.target}</code>\n🔎 Найдено медиа: <b>{total_found}</b>"
                                 if stage == "Загрузка":
                                     base += f"\n📥 Загрузка: <b>{downloaded}/{total_found}</b>"
                                 await _safe_edit(job.chat_id, progress.message_id, base, reply_markup=cancel_kb)
+
+                                await _safe_edit(job.chat_id, progress.message_id, f"🔎 Найдено медиа: <b>{total_found}</b>")
+
                             except Exception:
                                 pass
                         continue
@@ -1692,7 +1706,10 @@ async def _dl_worker():
 
             await bot.send_message(job.chat_id, f"✅ Задание #{job.id} завершено.")
             log.info("Job #%s: finished", job.id)
+
             _CURRENT_JOB = None
+
+
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1703,7 +1720,10 @@ async def _dl_worker():
             log.exception("Job #%s: failed", job.id)
         finally:
             _DL_QUEUE.task_done()
+
             _CURRENT_JOB = None
+
+
             log.debug("Job #%s: task done", job.id)
 
 
