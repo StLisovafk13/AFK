@@ -303,7 +303,9 @@ async def collect_image_urls(
 
     html = await page.content()
     urls = dedup_keep_order(extract_from_html(html))
-    if not urls:
+    if urls:
+        logger.info(f"scan_progress {len(urls)}")
+    else:
         logger.warning("На первом экране не нашли img/picture. Пробуем прокрутку и кнопку Load More…")
 
     max_scrolls = 999999 if target_count == 0 else max(30, min(999999, target_count // 2 + 20))
@@ -352,6 +354,8 @@ async def collect_image_urls(
         # Повторное извлечение
         html = await page.content()
         urls = dedup_keep_order(urls + extract_from_html(html))
+        if len(urls) > prev_count:
+            logger.info(f"scan_progress {len(urls)}")
 
         new_height = await page.evaluate("() => document.body.scrollHeight")
         grew = (new_height > last_height) or (len(urls) > prev_count)
