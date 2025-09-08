@@ -1381,6 +1381,7 @@ async def _dl_worker():
 
     while True:
         job: DLJob = await _DL_QUEUE.get()
+        log.info("Start job %s for %s", job.id, job.target)
         try:
             job_started = time.time()
             progress = await bot.send_message(job.chat_id, f"⏳ Сканирование профиля: <code>{job.target}</code>")
@@ -1457,6 +1458,7 @@ async def _dl_worker():
                     await asyncio.sleep(2.0)
 
             # Запускаем процесс и фоновый опрос файловой системы
+            log.debug("Downloader args: %s", args)
             proc = await asyncio.create_subprocess_exec(
                 *args,
                 stdout=asyncio.subprocess.PIPE,
@@ -1501,6 +1503,7 @@ async def _dl_worker():
                         last_ping = now
 
                 rc = await proc.wait()
+                log.info("Downloader exited with code %s", rc)
             finally:
                 stop_evt.set()
                 with contextlib.suppress(Exception):
@@ -1523,6 +1526,7 @@ async def _dl_worker():
                     await _safe_edit(job.chat_id, progress.message_id, "📦 Архив(ы) готовы — отправляю…")
                     for z in zips:
                         try:
+                            log.info("Sending archive %s", z)
                             await bot.send_document(
                                 job.chat_id,
                                 FSInputFile(z, filename=z.name),
@@ -1530,6 +1534,7 @@ async def _dl_worker():
                                 request_timeout=SEND_TIMEOUT,
                             )
                         except Exception as e:
+                            log.exception("Failed to send %s", z)
                             await bot.send_message(job.chat_id, f"Не удалось отправить {z.name}: {e}")
                 else:
                     man = user_dir / "manifest.json"
@@ -1557,6 +1562,7 @@ async def _dl_worker():
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            log.exception("Job %s failed: %s", job.id, e)
             try:
                 await bot.send_message(job.chat_id, f"❌ Ошибка в задании #{job.id}: {e}")
             except Exception:
