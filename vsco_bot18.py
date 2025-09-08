@@ -153,6 +153,15 @@ def init_db():
       UNIQUE(item_id, comment),
       FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
     )""")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS chat_links(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id INTEGER NOT NULL,
+      message_id INTEGER NOT NULL,
+      url TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(chat_id, message_id, url)
+    )""")
     conn.commit(); conn.close()
     log.info("DB initialized at %s", DB_PATH)
 
@@ -162,6 +171,12 @@ def utc_now_iso() -> str:
 
 def _since_utc_iso(days: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=timezone.utc).isoformat()
+
+def extract_urls(text: str) -> List[str]:
+    """Return all URLs found in text using URL_RE."""
+    if not text:
+        return []
+    return [m.group(0).rstrip('.,);!?]') for m in URL_RE.finditer(text)]
 
 def is_vsco_url(u: str) -> bool:
     try:
@@ -306,6 +321,14 @@ def add_vsco_link_legacy(username: str, url: str, chat_id: int, conn: sqlite3.Co
         "INSERT OR IGNORE INTO links(chat_id,username,url,created_at) VALUES(?,?,?,?)",
         (chat_id, username, url, utc_now_iso())
     )
+
+def add_chat_link(chat_id: int, message_id: int, url: str, conn: sqlite3.Connection) -> bool:
+    """Insert generic URL from chat history. Returns True if inserted."""
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO chat_links(chat_id,message_id,url,created_at) VALUES(?,?,?,?)",
+        (chat_id, message_id, url, utc_now_iso()),
+    )
+    return cur.rowcount > 0
 
 def _get_item_id(conn: sqlite3.Connection, username: str, profile_url: str, image_url: str) -> Optional[int]:
     row = conn.execute(
@@ -1248,6 +1271,56 @@ async def on_links_click(cq: CallbackQuery):
     except Exception:
         await cq.message.answer(txt, reply_markup=_links_scope_keyboard(ses, page, total))
     await cq.answer("Готово")
+
+# ---------- scan history for links ----------
+async def scan_history_for_links(bot: Bot, chat_id: int, limit: int = 1000, step: int = 100) -> Tuple[int, int]:
+    conn = db_connect()
+    scanned = added = 0
+    offset = 0
+    try:
+        while offset < limit:
+            msgs = await bot.get_chat_history(chat_id=chat_id, offset=offset, limit=min(step, limit - offset))
+            if not msgs:
+                break
+            for m in msgs:
+                scanned += 1
+                text = (m.text or "") + "\n" + (m.caption or "")
+                for url in extract_urls(text):
+                    if add_chat_link(chat_id, m.message_id, url, conn):
+                        added += 1
+            offset += len(msgs)
+            await asyncio.sleep(0.4)
+        conn.commit()
+    finally:
+        conn.close()
+    return scanned, added
+
+@dp.message(Command("scan_links"))
+async def cmd_scan_links(msg: Message):
+    if msg.chat.type not in ("group", "supergroup", "channel") or not msg.chat.username:
+        await msg.answer("Команда работает только в публичных чатах")
+        return
+    me = await msg.bot.get_me()
+    member = await msg.bot.get_chat_member(msg.chat.id, me.id)
+    if member.status not in ("administrator", "creator"):
+        await msg.answer("Нужны права администратора")
+        return
+    await msg.answer("Начинаю сканирование истории…")
+    scanned, added = await scan_history_for_links(msg.bot, msg.chat.id)
+    await msg.answer(f"Просмотрено сообщений: {scanned}, добавлено ссылок: {added}")
+    if pd is not None and added:
+        conn = db_connect()
+        try:
+            df = pd.read_sql_query(
+                "SELECT chat_id,message_id,url,created_at FROM chat_links WHERE chat_id=? ORDER BY message_id DESC",
+                conn,
+                params=(msg.chat.id,),
+            )
+            out = get_session(msg.chat.id).dir / f"chat_links_{int(time.time())}.csv"
+            df.to_csv(out, index=False, encoding="utf-8")
+            await send_file(msg, out, caption=f"Всего ссылок: {len(df)}")
+        finally:
+            conn.close()
 
 # ---------- reset ----------
 @dp.message(Command("reset"))
