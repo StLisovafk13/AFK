@@ -48,6 +48,7 @@ from aiogram.exceptions import TelegramBadRequest
 import aiohttp
 import sys
 import contextlib
+import shlex
 
 # ---- external utils (optional HTML export parser) ----
 from vsco_parser3 import parse_html_file, dedupe_rows
@@ -1383,10 +1384,12 @@ async def _dl_worker():
         job: DLJob = await _DL_QUEUE.get()
         try:
             job_started = time.time()
+            log.info("Job #%s: start for %s", job.id, job.target)
             progress = await bot.send_message(job.chat_id, f"⏳ Сканирование профиля: <code>{job.target}</code>")
 
             script = _dl_script_path()
             if not script.exists():
+                log.error("Job #%s: downloader script not found at %s", job.id, script)
                 await bot.send_message(job.chat_id, "❌ Не найден vsco_downloader.py рядом с ботом.")
                 continue
 
@@ -1404,9 +1407,13 @@ async def _dl_worker():
             if job.extra_flags:
                 args += job.extra_flags
 
+            cmd_display = " ".join(shlex.quote(str(a)) for a in args)
+            log.info("Job #%s: running downloader: %s", job.id, cmd_display)
+
             total_found: int | None = None
             stage = "Сканирование"
             user_dir: Path | None = None
+            log.debug("Job #%s: initial stage %s", job.id, stage)
 
             stop_evt = asyncio.Event()
 
@@ -1420,6 +1427,7 @@ async def _dl_worker():
                             cand = [p for p in job.out_base.glob("*") if p.is_dir()]
                             if cand:
                                 user_dir = max(cand, key=lambda p: p.stat().st_mtime)
+                                log.debug("Job #%s: working directory %s", job.id, user_dir)
                         if user_dir and total_found is None:
                             man = user_dir / "manifest.json"
                             if man.exists():
@@ -1436,6 +1444,8 @@ async def _dl_worker():
                                         total_found = len(data)
                                 except Exception:
                                     pass
+                            if total_found is not None:
+                                log.info("Job #%s: media count determined: %d", job.id, total_found)
                             if total_found is None:
                                 urls = user_dir / "urls_extracted.txt"
                                 if urls.exists():
@@ -1445,6 +1455,8 @@ async def _dl_worker():
                                             total_found = n
                                     except Exception:
                                         pass
+                            if total_found is not None and stage == "Сканирование":
+                                log.info("Job #%s: media found so far %d", job.id, total_found)
                         txt = f"🔄 <b>{stage}</b>: <code>{job.target}</code>"
                         if total_found is not None:
                             txt += f"\n🔎 Найдено медиа: <b>{total_found}</b>"
@@ -1463,6 +1475,7 @@ async def _dl_worker():
                 stderr=asyncio.subprocess.STDOUT
             )
             fs_task = asyncio.create_task(fs_probe_loop())
+            log.debug("Job #%s: subprocess started", job.id)
 
             # Разбираем stdout для подсказок по стадиям и числу найденных
             last_ping = 0.0
@@ -1475,9 +1488,11 @@ async def _dl_worker():
                     low = txt.lower()
                     if any(k in low for k in ("download", "загрузка", "скачива")) and stage != "Загрузка":
                         stage = "Загрузка"
+                        log.info("Job #%s: stage -> %s", job.id, stage)
                         await _safe_edit(job.chat_id, progress.message_id, f"📥 <b>{stage}</b>: <code>{job.target}</code>")
                     elif any(k in low for k in ("zip", "архив")) and stage != "Архив":
                         stage = "Архив"
+                        log.info("Job #%s: stage -> %s", job.id, stage)
                         await _safe_edit(job.chat_id, progress.message_id, f"🗜️ <b>{stage}</b>: <code>{job.target}</code>")
 
                     if total_found is None:
@@ -1485,6 +1500,7 @@ async def _dl_worker():
                         if m:
                             try:
                                 total_found = int(m.group(1))
+                                log.info("Job #%s: media count from stdout %d", job.id, total_found)
                                 await _safe_edit(job.chat_id, progress.message_id, f"🔎 Найдено медиа: <b>{total_found}</b>")
                             except Exception:
                                 pass
@@ -1501,6 +1517,7 @@ async def _dl_worker():
                         last_ping = now
 
                 rc = await proc.wait()
+                log.info("Job #%s: downloader exited with code %s", job.id, rc)
             finally:
                 stop_evt.set()
                 with contextlib.suppress(Exception):
@@ -1514,15 +1531,18 @@ async def _dl_worker():
                 rebuild_urls_extracted(user_dir)
 
             if user_dir is None:
+                log.warning("Job #%s: completed but no results found", job.id)
                 await _safe_edit(job.chat_id, progress.message_id, f"⚠️ Завершено, но результирующих файлов не найдено.")
             else:
                 zips = sorted(
                     p for p in user_dir.glob("*.zip") if p.stat().st_mtime >= job_started
                 )
                 if zips:
+                    log.info("Job #%s: %d zip(s) ready", job.id, len(zips))
                     await _safe_edit(job.chat_id, progress.message_id, "📦 Архив(ы) готовы — отправляю…")
                     for z in zips:
                         try:
+                            log.info("Job #%s: sending archive %s", job.id, z)
                             await bot.send_document(
                                 job.chat_id,
                                 FSInputFile(z, filename=z.name),
@@ -1530,6 +1550,7 @@ async def _dl_worker():
                                 request_timeout=SEND_TIMEOUT,
                             )
                         except Exception as e:
+                            log.warning("Job #%s: failed to send %s: %s", job.id, z, e)
                             await bot.send_message(job.chat_id, f"Не удалось отправить {z.name}: {e}")
                 else:
                     man = user_dir / "manifest.json"
@@ -1539,6 +1560,7 @@ async def _dl_worker():
                         lines.append(f"🔎 Медиа найдено: <b>{total_found}</b>")
                     await _safe_edit(job.chat_id, progress.message_id, "\n".join(lines))
                     if man.exists():
+                        log.info("Job #%s: sending manifest", job.id)
                         await bot.send_document(
                             job.chat_id,
                             BufferedInputFile(man.read_bytes(), filename=man.name),
@@ -1546,6 +1568,7 @@ async def _dl_worker():
                             request_timeout=SEND_TIMEOUT,
                         )
                     if urls.exists():
+                        log.info("Job #%s: sending urls_extracted", job.id)
                         await bot.send_document(
                             job.chat_id,
                             BufferedInputFile(urls.read_bytes(), filename=urls.name),
@@ -1554,6 +1577,7 @@ async def _dl_worker():
                         )
 
             await bot.send_message(job.chat_id, f"✅ Задание #{job.id} завершено.")
+            log.info("Job #%s: finished", job.id)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1561,8 +1585,10 @@ async def _dl_worker():
                 await bot.send_message(job.chat_id, f"❌ Ошибка в задании #{job.id}: {e}")
             except Exception:
                 pass
+            log.exception("Job #%s: failed", job.id)
         finally:
             _DL_QUEUE.task_done()
+            log.debug("Job #%s: task done", job.id)
 
 
 @dp.message(Command("start", "help"))
