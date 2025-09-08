@@ -169,8 +169,25 @@ def upscale_w_param(u: str, max_w: int) -> str:
     return u
 
 def guess_filename(url: str, idx: int) -> str:
-    base = url.split("?")[0].rstrip("/").split("/")[-1]
+    """Return a deterministic file name derived from URL.
+
+    Some VSCO CDN URLs use the same media file name while placing a
+    unique identifier in the path right before it. For example:
+
+        .../6340fee78c264f3f15c8be6c/vsco_100722.jpg
+        .../6340fe288c264f3f15c8be68/vsco_100722.jpg
+
+    Without accounting for the parent directory, both would save as
+    ``vsco_100722.jpg`` and overwrite each other.  To avoid this we
+    prepend the immediate parent folder when available.
+    """
+
+    path_parts = urlsplit(url).path.rstrip("/").split("/")
+    base = path_parts[-1] if path_parts else ""
     if base and "." in base:
+        # Include the segment preceding the filename to keep URLs unique
+        if len(path_parts) >= 2 and path_parts[-2]:
+            return f"{path_parts[-2]}_{base}"
         return base
     path = urlsplit(url).path.lower()
     if path.endswith(".mp4"):  return f"vsco_{idx:05d}.mp4"
@@ -286,7 +303,9 @@ async def collect_image_urls(
 
     html = await page.content()
     urls = dedup_keep_order(extract_from_html(html))
-    if not urls:
+    if urls:
+        logger.info(f"scan_progress {len(urls)}")
+    else:
         logger.warning("На первом экране не нашли img/picture. Пробуем прокрутку и кнопку Load More…")
 
     max_scrolls = 999999 if target_count == 0 else max(30, min(999999, target_count // 2 + 20))
@@ -335,6 +354,8 @@ async def collect_image_urls(
         # Повторное извлечение
         html = await page.content()
         urls = dedup_keep_order(urls + extract_from_html(html))
+        if len(urls) > prev_count:
+            logger.info(f"scan_progress {len(urls)}")
 
         new_height = await page.evaluate("() => document.body.scrollHeight")
         grew = (new_height > last_height) or (len(urls) > prev_count)
