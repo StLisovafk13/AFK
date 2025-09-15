@@ -51,8 +51,6 @@ import sys
 import contextlib
 import shlex
 
-from telethon import TelegramClient
-
 # ---- external utils (optional HTML export parser) ----
 from vsco_parser3 import parse_html_file, dedupe_rows
 
@@ -65,14 +63,6 @@ WORKDIR = Path(os.getenv("BOT_WORKDIR", "./work")); WORKDIR.mkdir(parents=True, 
 LOGDIR = Path(os.getenv("BOT_LOGDIR", "./logs")); LOGDIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = os.getenv("BOT_DB_PATH", "vsco_links.db")
 SEND_TIMEOUT = int(os.getenv("BOT_SEND_TIMEOUT", "600"))
-
-try:
-    API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-except ValueError:
-    API_ID = 0
-API_HASH = os.getenv("TELEGRAM_API_HASH", "")
-TELETHON_SESSION = os.getenv("TELETHON_SESSION", "telethon.session")
-_tclient: TelegramClient | None = None
 
 def setup_logging():
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -163,15 +153,6 @@ def init_db():
       UNIQUE(item_id, comment),
       FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
     )""")
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS chat_links(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      chat_id INTEGER NOT NULL,
-      message_id INTEGER NOT NULL,
-      url TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      UNIQUE(chat_id, message_id, url)
-    )""")
     conn.commit(); conn.close()
     log.info("DB initialized at %s", DB_PATH)
 
@@ -181,12 +162,6 @@ def utc_now_iso() -> str:
 
 def _since_utc_iso(days: int) -> str:
     return (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=timezone.utc).isoformat()
-
-def extract_urls(text: str) -> List[str]:
-    """Return all URLs found in text using URL_RE."""
-    if not text:
-        return []
-    return [m.group(0).rstrip('.,);!?]') for m in URL_RE.finditer(text)]
 
 def is_vsco_url(u: str) -> bool:
     try:
@@ -331,14 +306,6 @@ def add_vsco_link_legacy(username: str, url: str, chat_id: int, conn: sqlite3.Co
         "INSERT OR IGNORE INTO links(chat_id,username,url,created_at) VALUES(?,?,?,?)",
         (chat_id, username, url, utc_now_iso())
     )
-
-def add_chat_link(chat_id: int, message_id: int, url: str, conn: sqlite3.Connection) -> bool:
-    """Insert generic URL from chat history. Returns True if inserted."""
-    cur = conn.execute(
-        "INSERT OR IGNORE INTO chat_links(chat_id,message_id,url,created_at) VALUES(?,?,?,?)",
-        (chat_id, message_id, url, utc_now_iso()),
-    )
-    return cur.rowcount > 0
 
 def _get_item_id(conn: sqlite3.Connection, username: str, profile_url: str, image_url: str) -> Optional[int]:
     row = conn.execute(
@@ -1282,73 +1249,6 @@ async def on_links_click(cq: CallbackQuery):
         await cq.message.answer(txt, reply_markup=_links_scope_keyboard(ses, page, total))
     await cq.answer("Готово")
 
-# ---------- scan history for links ----------
-async def scan_history_for_links(chat_id: int, limit: int = 1000, step: int = 100) -> Tuple[int, int]:
-    if _tclient is None:
-        raise RuntimeError("Telethon client is not available")
-    conn = db_connect()
-    scanned = added = 0
-    remaining = limit
-    last_id = 0
-    try:
-        while remaining > 0:
-            batch: list = []
-            async for m in _tclient.iter_messages(chat_id, limit=min(step, remaining), offset_id=last_id):
-                batch.append(m)
-            if not batch:
-                break
-            for m in batch:
-                scanned += 1
-                text = m.text or ""
-                for url in extract_urls(text):
-                    if add_chat_link(chat_id, m.id, url, conn):
-                        added += 1
-            last_id = batch[-1].id
-            remaining -= len(batch)
-            await asyncio.sleep(0.4)
-        conn.commit()
-    finally:
-        conn.close()
-    return scanned, added
-
-@dp.message(Command("scan_links"))
-async def cmd_scan_links(msg: Message):
-    if msg.chat.type not in ("group", "supergroup", "channel"):
-        await msg.answer(
-            "Команда работает только в группах, супергруппах и каналах"
-        )
-        return
-    if _tclient is None or not _tclient.is_connected():
-        await msg.answer("🚫 Telethon клиент недоступен, команда отключена")
-        return
-    me = await msg.bot.get_me()
-    member = await msg.bot.get_chat_member(msg.chat.id, me.id)
-    if member.status not in ("administrator", "creator"):
-        await msg.answer("Нужны права администратора")
-        return
-    await msg.answer("Начинаю сканирование истории…")
-    try:
-        scanned, added = await scan_history_for_links(msg.chat.id)
-    except Exception as e:
-        await msg.answer(f"Ошибка сканирования: {e}")
-        return
-    await msg.answer(
-        f"Просмотрено сообщений: {scanned}, добавлено ссылок: {added}"
-    )
-    if pd is not None and added:
-        conn = db_connect()
-        try:
-            df = pd.read_sql_query(
-                "SELECT chat_id,message_id,url,created_at FROM chat_links WHERE chat_id=? ORDER BY message_id DESC",
-                conn,
-                params=(msg.chat.id,),
-            )
-            out = get_session(msg.chat.id).dir / f"chat_links_{int(time.time())}.csv"
-            df.to_csv(out, index=False, encoding="utf-8")
-            await send_file(msg, out, caption=f"Всего ссылок: {len(df)}")
-        finally:
-            conn.close()
-
 # ---------- reset ----------
 @dp.message(Command("reset"))
 async def cmd_reset(msg: Message):
@@ -1868,25 +1768,13 @@ async def cmd_help(msg: Message):
 
 async def main():
     init_db()
-    global _DL_WORKER_TASK, _DL_QUEUE, _tclient
-    if API_ID and API_HASH:
-        try:
-            _tclient = TelegramClient(TELETHON_SESSION, API_ID, API_HASH)
-            await _tclient.connect()
-            if not await _tclient.is_user_authorized():
-                log.error("Telethon client is not authorized")
-                _tclient = None
-            else:
-                log.info("Telethon client started")
-        except Exception as e:
-            log.error("Telethon start failed: %s", e)
-            _tclient = None
-    else:
-        log.warning("Telethon API credentials not set; /scan_links disabled")
     await bot.delete_webhook(drop_pending_updates=True)
+    # --- start download worker ---
+    global _DL_WORKER_TASK, _DL_QUEUE
     if _DL_QUEUE is None:
         _DL_QUEUE = asyncio.Queue()
     _DL_WORKER_TASK = asyncio.create_task(_dl_worker())
+    # -----------------------------
     log.info("Bot is starting polling…")
     try:
         await dp.start_polling(bot)
@@ -1895,8 +1783,6 @@ async def main():
             _DL_WORKER_TASK.cancel()
             with contextlib.suppress(Exception):
                 await _DL_WORKER_TASK
-        if _tclient:
-            await _tclient.disconnect()
 if __name__ == "__main__":
     try:
         asyncio.run(main())
