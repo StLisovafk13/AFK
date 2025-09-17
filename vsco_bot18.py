@@ -44,7 +44,6 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     CallbackQuery,
-    User,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest
@@ -148,7 +147,6 @@ def init_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       chat_id INTEGER NOT NULL,
       username TEXT DEFAULT '',
-      added_by TEXT DEFAULT '',
       latitude REAL,
       longitude REAL,
       profile_url TEXT DEFAULT '',
@@ -159,10 +157,6 @@ def init_db():
       created_at TEXT NOT NULL,
       UNIQUE(chat_id, username, image_url, profile_url)
     )""")
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
-    if "added_by" not in columns:
-        conn.execute("ALTER TABLE items ADD COLUMN added_by TEXT DEFAULT ''")
-        log.info("DB: added 'added_by' column to items table")
     conn.execute("""
     CREATE TABLE IF NOT EXISTS comments(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -185,6 +179,7 @@ def utc_now_iso() -> str:
 
 def _since_utc_iso(days: int) -> str:
     return (datetime.now(LOCAL_TZ) - timedelta(days=days)).isoformat()
+
 
 def resolve_added_by(user: Optional[User]) -> str:
     if user is None:
@@ -257,14 +252,6 @@ def has_daily_data_access(chat_id: int) -> Tuple[bool, str]:
         )
 
     return allowed, text
-
-def resolve_added_by(user: Optional[User]) -> str:
-    if user is None:
-        return ""
-    if user.username:
-        return user.username.strip()
-    name = (user.full_name or "").strip()
-    return name
 
 def is_vsco_url(u: str) -> bool:
     try:
@@ -425,17 +412,11 @@ def _insert_item(conn: sqlite3.Connection, chat_id: int, username: str, profile_
                  source: str, source_file: Optional[str], added_by: str) -> int:
     cur = conn.cursor()
     cur.execute(
-
         """INSERT INTO items(chat_id,username,latitude,longitude,profile_url,image_url,source,source_file,added_by,created_at)
-
-        """INSERT INTO items(chat_id,username,added_by,latitude,longitude,profile_url,image_url,source,source_file,created_at)
-
            VALUES(?,?,?,?,?,?,?,?,?,?)""",
         (
             chat_id,
             username,
-
-            added_by or "",
             latitude,
             longitude,
             profile_url,
@@ -449,18 +430,9 @@ def _insert_item(conn: sqlite3.Connection, chat_id: int, username: str, profile_
     return cur.lastrowid
 
 def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source: str, source_file: Optional[str], added_by: str) -> Tuple[int,int]:
-=======
-            utc_now_iso(),
-        ),
-    )
-    return cur.lastrowid
-
-def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source: str,
-                               source_file: Optional[str], added_by: str = "") -> Tuple[int,int]:
     if not pairs: return (0,0)
     conn = db_connect()
     added_items = added_comments = 0
-    added_by_norm = (added_by or "").strip()
     try:
         for r in pairs:
             username = (r.get("username") or "").lstrip("@")
@@ -471,9 +443,7 @@ def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source:
 
             item_id = _get_item_id(conn, username, profile_url, image_url)
             if item_id is None:
-
                 item_id = _insert_item(conn, chat_id, username, profile_url, image_url, None, None, source, source_file, added_by)
-                item_id = _insert_item(conn, chat_id, username, profile_url, image_url, None, None, source, source_file, added_by_norm)
                 added_items += 1
 
             if comment:
@@ -492,12 +462,8 @@ def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source:
         conn.close()
 
 def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_file: str, added_by: str) -> int:
-
-def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_file: str,
-                               added_by: str = "") -> int:
     if not rows: return 0
     conn = db_connect(); added = 0
-    added_by_norm = (added_by or "").strip()
     try:
         for r in rows:
             username = (r.get("username") or "").lstrip("@")
@@ -508,22 +474,10 @@ def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_f
             except Exception: lat = None
             try: lon = float(lon) if lon not in ("", None, "None") else None
             except Exception: lon = None
-            row_added_by = r.get("added_by")
-            if isinstance(row_added_by, str):
-                row_added_by_norm = row_added_by.strip()
-            elif row_added_by is None:
-                row_added_by_norm = ""
-            else:
-                row_added_by_norm = str(row_added_by).strip()
-            final_added_by = row_added_by_norm or added_by_norm
             if not username or not profile_url: continue
 
             if _get_item_id(conn, username, profile_url, image_url) is None:
-
                 _insert_item(conn, chat_id, username, profile_url, image_url, lat, lon, "html", source_file, added_by)
-
-                _insert_item(conn, chat_id, username, profile_url, image_url, lat, lon, "html", source_file, final_added_by)
-
                 added += 1
                 add_vsco_link_legacy(username, profile_url, chat_id, conn)
         conn.commit()
@@ -673,17 +627,11 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
         g = groups.setdefault(uname, {
             "username": uname, "profile_url": purl or (f"https://vsco.co/{uname}" if uname else ""),
             "lat_sum":0.0, "lon_sum":0.0, "lat_n":0, "lon_n":0,
-
             "images": set(), "added_by": "",
-
-            "images": set(), "added_by": set()
         })
         if purl and not g["profile_url"]:
             g["profile_url"] = purl
         if img: g["images"].add(img)
-        added_by_val = (added_by or "").strip() if isinstance(added_by, str) else str(added_by or "").strip()
-        if added_by_val:
-            g["added_by"].add(added_by_val)
         if lat is not None and lon is not None:
             try:
                 g["lat_sum"] += float(lat); g["lon_sum"] += float(lon)
@@ -722,12 +670,9 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "comments": u_comments,
             "images_count": len(g["images"]),
             "comments_count": len(u_comments),
-
             "added_by": display,
             "added_by_link": link or "",
             "added_by_raw": raw_added,
-
-            "added_by": sorted(g["added_by"]),
         })
     conn.close()
     return out
@@ -756,11 +701,7 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
         except Exception: lat = None
         try: lon = float(lon) if lon not in ("", None, "None") else None
         except Exception: lon = None
-
         display, link = added_by_display_and_link(added_by or "")
-
-        added_by_val = (added_by or "").strip() if isinstance(added_by, str) else str(added_by or "").strip()
-
         out.append({
             "id": iid,
             "username": uname or "",
@@ -768,12 +709,9 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "image_url": img or "",
             "lat": lat, "lon": lon,
             "comments": comments_map.get(iid, []),
-
             "added_by": display,
             "added_by_link": link or "",
             "added_by_raw": added_by or "",
-
-            "added_by": added_by_val,
         })
     conn.close()
     return out
@@ -1146,9 +1084,6 @@ async def on_document(msg: Message):
             source_file="caption",
             added_by=added_by,
         )
-
-        ai, ac = upsert_items_with_comments(msg.chat.id, pairs, source="text", source_file="caption", added_by=added_by)
-
         added_items += ai; added_comments += ac
 
     p = ses.dir / (msg.document.file_name or "file.bin")
@@ -1168,7 +1103,6 @@ async def on_document(msg: Message):
                     pairs.extend(parse_vsco_pairs_from_cell(v))
             pairs = await normalize_vsco_pairs(pairs)
             found += len(pairs)
-
             ai, ac = upsert_items_with_comments(
                 msg.chat.id,
                 pairs,
@@ -1176,9 +1110,6 @@ async def on_document(msg: Message):
                 source_file=p.name,
                 added_by=added_by,
             )
-
-            ai, ac = upsert_items_with_comments(msg.chat.id, pairs, source="csv", source_file=p.name, added_by=added_by)
-
             added_items += ai; added_comments += ac
             await msg.answer(
                 f"CSV загружен: <code>{escape(p.name)}</code>\n"
@@ -1210,7 +1141,6 @@ async def on_text(msg: Message):
     if not pairs:
         return  # без ответа
     added_by = resolve_added_by(msg.from_user)
-
     ai, ac = upsert_items_with_comments(
         msg.chat.id,
         pairs,
@@ -1218,9 +1148,6 @@ async def on_text(msg: Message):
         source_file="message",
         added_by=added_by,
     )
-
-    ai, ac = upsert_items_with_comments(msg.chat.id, pairs, source="text", source_file="message", added_by=added_by)
-
     await msg.answer(f"Найдено VSCO-ссылок: {len(pairs)}, добавлено записей: {ai}, комментариев: {ac}")
 
 # ---------- export ----------
@@ -1313,13 +1240,9 @@ async def on_export_click(cq: CallbackQuery):
                 "lat": u["lat"], "lon": u["lon"],
                 "images_count": u["images_count"], "comments_count": u["comments_count"],
                 "comments": " | ".join(u["comments"]),
-
                 "added_by": u.get("added_by_raw", ""),
                 "added_by_display": u.get("added_by", ""),
                 "added_by_link": u.get("added_by_link", ""),
-
-                "added_by": " | ".join(u.get("added_by", [])),
-
             } for u in users]
             out = ses.dir / f"export_{ses.export_scope}.csv"
             pd.DataFrame(flat).to_csv(out, index=False, encoding="utf-8")
@@ -1446,9 +1369,6 @@ def _fmt_links_block(rows: List[Tuple[str,str,str,int,Optional[str]]]) -> str:
         added_html = added_by_html(added_by or "")
         by_part = f" — добавил {added_html}" if added_html else ""
         out.append(f"• <a href=\"{href}\">@{u}</a>{by_part} <i>({LOCAL_TZ_LABEL} {t})</i>")
-
-        out.append(f"• <a href=\"{href}\">@{u}</a> <i>({LOCAL_TZ_LABEL} {t})</i>")
-
     return "\n".join(out) if out else "— нет ссылок"
 
 def _links_scope_keyboard(ses: Session, page: int, total: int) -> InlineKeyboardMarkup:
