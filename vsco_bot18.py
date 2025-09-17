@@ -1090,6 +1090,7 @@ async def on_export_click(cq: CallbackQuery):
     if cq.message.chat.type in ("group", "supergroup"):
         await cq.answer("Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.", show_alert=True)
         return
+
     allowed, info = has_daily_data_access(chat_id)
     if not allowed:
         await cq.answer(info, show_alert=True)
