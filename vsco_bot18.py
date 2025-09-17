@@ -20,7 +20,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Sequence
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 import json
@@ -44,6 +44,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     CallbackQuery,
+    MessageEntity,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest
@@ -322,6 +323,52 @@ async def fetch_media_image_url(url: str, session: aiohttp.ClientSession) -> Opt
     return None
 
 # === Парсер "ссылка, комментарий до следующей ссылки" ========================
+def _expand_text_with_entities(text: Optional[str], entities: Optional[Sequence[MessageEntity]]) -> str:
+    if not text:
+        return ""
+    if not entities:
+        return text
+
+    parts: List[str] = []
+    last_index = 0
+    text_length = len(text)
+    for entity in sorted(entities, key=lambda e: getattr(e, "offset", 0) or 0):
+        offset = getattr(entity, "offset", 0) or 0
+        length = getattr(entity, "length", 0) or 0
+        if offset < last_index:
+            continue
+        if offset > text_length:
+            break
+        end = min(offset + length, text_length)
+        if offset > last_index:
+            parts.append(text[last_index:offset])
+
+        entity_text = text[offset:end]
+        entity_type = getattr(entity, "type", "")
+        if hasattr(entity_type, "value"):
+            entity_type = entity_type.value
+        entity_type = str(entity_type or "")
+
+        replacement = entity_text
+        if entity_type == "text_link" and getattr(entity, "url", None):
+            replacement = entity.url or ""
+        elif entity_type == "url":
+            replacement = entity_text
+
+        parts.append(replacement)
+        last_index = end
+
+    if last_index < text_length:
+        parts.append(text[last_index:])
+
+    return "".join(parts)
+
+
+def parse_vsco_pairs_from_message(text: Optional[str], entities: Optional[Sequence[MessageEntity]]) -> List[Dict[str, str]]:
+    expanded = _expand_text_with_entities(text, entities)
+    return _parse_vsco_pairs(expanded)
+
+
 def _parse_vsco_pairs(text: str) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     if not text:
@@ -1075,7 +1122,7 @@ async def on_document(msg: Message):
     added_by = resolve_added_by(msg.from_user)
 
     if msg.caption:
-        pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_text(msg.caption))
+        pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_message(msg.caption, msg.caption_entities))
         found += len(pairs)
         ai, ac = upsert_items_with_comments(
             msg.chat.id,
@@ -1137,7 +1184,7 @@ async def on_document(msg: Message):
 # ---------- plain text ----------
 @dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(msg: Message):
-    pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_text(msg.text))
+    pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_message(msg.text, msg.entities))
     if not pairs:
         return  # без ответа
     added_by = resolve_added_by(msg.from_user)
