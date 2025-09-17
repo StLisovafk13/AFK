@@ -64,6 +64,17 @@ LOGDIR = Path(os.getenv("BOT_LOGDIR", "./logs")); LOGDIR.mkdir(parents=True, exi
 DB_PATH = os.getenv("BOT_DB_PATH", "vsco_links.db")
 SEND_TIMEOUT = int(os.getenv("BOT_SEND_TIMEOUT", "600"))
 
+LOCAL_TZ = timezone(timedelta(hours=3))
+_LOCAL_TZ_OFFSET = LOCAL_TZ.utcoffset(None) or timedelta()
+if _LOCAL_TZ_OFFSET == timedelta():
+    LOCAL_TZ_LABEL = "UTC"
+else:
+    total_minutes = int(_LOCAL_TZ_OFFSET.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    total_minutes = abs(total_minutes)
+    hours, minutes = divmod(total_minutes, 60)
+    LOCAL_TZ_LABEL = f"UTC{sign}{hours:02d}:{minutes:02d}"
+
 def setup_logging():
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
@@ -158,10 +169,55 @@ def init_db():
 
 # ---------------------- helpers ----------------------
 def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(tzinfo=timezone.utc).isoformat()
+    return datetime.now(LOCAL_TZ).isoformat()
 
 def _since_utc_iso(days: int) -> str:
-    return (datetime.now(timezone.utc) - timedelta(days=days)).replace(tzinfo=timezone.utc).isoformat()
+    return (datetime.now(LOCAL_TZ) - timedelta(days=days)).isoformat()
+
+DAILY_COORDS_LIMIT = 10
+DAILY_NO_COORDS_LIMIT = 5
+
+
+def has_daily_data_access(chat_id: int) -> Tuple[bool, str]:
+    """Check whether a chat accumulated enough fresh items for export/download."""
+    since = _since_utc_iso(1)
+    conn = db_connect()
+    try:
+        with_coords, without_coords = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL THEN 1 ELSE 0 END) AS with_coords,
+                SUM(CASE WHEN latitude IS NULL OR longitude IS NULL THEN 1 ELSE 0 END) AS without_coords
+            FROM items
+            WHERE chat_id = ? AND created_at >= ?
+            """,
+            (chat_id, since),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    with_coords = int(with_coords or 0)
+    without_coords = int(without_coords or 0)
+    allowed = with_coords >= DAILY_COORDS_LIMIT or without_coords >= DAILY_NO_COORDS_LIMIT
+
+    counters = (
+        f"с координатами — {with_coords}/{DAILY_COORDS_LIMIT}, "
+        f"без координат — {without_coords}/{DAILY_NO_COORDS_LIMIT}"
+    )
+
+    if allowed:
+        text = (
+            "✅ Доступ к экспорту и скачиванию активен на текущие сутки.\n"
+            f"За последние 24 часа: {counters}. Лимит обновляется ежедневно."
+        )
+    else:
+        text = (
+            "🚫 Нужно накопить за последние 24 часа минимум "
+            f"{DAILY_COORDS_LIMIT} элементов с координатами или {DAILY_NO_COORDS_LIMIT} без координат.\n"
+            f"Сейчас: {counters}. Лимит обнуляется каждый день."
+        )
+
+    return allowed, text
 
 def is_vsco_url(u: str) -> bool:
     try:
@@ -1015,6 +1071,13 @@ def kb_struct(kb: InlineKeyboardMarkup | None):
 
 @dp.message(Command("export"))
 async def cmd_export(msg: Message):
+    if msg.chat.type in ("group", "supergroup"):
+        await msg.answer("🚫 Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.")
+        return
+    allowed, info = has_daily_data_access(msg.chat.id)
+    if not allowed:
+        await msg.answer(info)
+        return
     ses = get_session(msg.chat.id)
     await msg.answer(
         "Экспорт VSCO:\n• CSV / Галерея\n• Карта: по пользователям или по фото",
@@ -1024,6 +1087,17 @@ async def cmd_export(msg: Message):
 @dp.callback_query(F.data.startswith("export:"))
 async def on_export_click(cq: CallbackQuery):
     chat_id = cq.message.chat.id
+    if cq.message.chat.type in ("group", "supergroup"):
+        await cq.answer("Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.", show_alert=True)
+        return
+    allowed, info = has_daily_data_access(chat_id)
+    if not allowed:
+        await cq.answer(info, show_alert=True)
+        try:
+            await cq.message.answer(info)
+        except Exception:
+            pass
+        return
     ses = get_session(chat_id)
     parts = cq.data.split(":")
     if len(parts)>=3 and parts[1]=="scope":
@@ -1159,13 +1233,17 @@ def _fmt_links_block(rows: List[Tuple[str,str,str,int]]) -> str:
         t = created_at
         try:
             dt = datetime.fromisoformat(created_at.replace("Z","+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=LOCAL_TZ)
+            else:
+                dt = dt.astimezone(LOCAL_TZ)
             t = dt.strftime("%H:%M")
         except Exception:
             pass
         u = escape(uname or "")
         href = escape(url or "")
         # ВАЖНО: не используем <span>; Telegram не поддерживает. Берём <i>.
-        out.append(f"• <a href=\"{href}\">@{u}</a> <i>(UTC {t})</i>")
+        out.append(f"• <a href=\"{href}\">@{u}</a> <i>({LOCAL_TZ_LABEL} {t})</i>")
     return "\n".join(out) if out else "— нет ссылок"
 
 def _links_scope_keyboard(ses: Session, page: int, total: int) -> InlineKeyboardMarkup:
@@ -1295,6 +1373,11 @@ async def cmd_dl_enqueue(msg: Message):
     if len(parts) < 2:
         await msg.answer("Usage: <code>/dl &lt;username|profile_url&gt; [--flags...]</code>\n"
                          "Например: <code>/dl johndoe --max 120 --split-zip-size-mb 45</code>")
+        return
+
+    allowed, info = has_daily_data_access(msg.chat.id)
+    if not allowed:
+        await msg.answer(info)
         return
 
     target = parts[1]
@@ -1749,10 +1832,12 @@ async def cmd_help(msg: Message):
         "• <b>/dl &lt;username|profile_url&gt; [--flags]</b> — поставить профиль на скачивание\n"
         "• <b>/qstat</b> — показать размер очереди\n"
         "• <b>/links</b> — ссылки за последние 24 часа\n"
-        "• <b>/export</b> — экспорт CSV/галереи или карты\n"
+        f"• <b>/export</b> — экспорт CSV/галереи или карты (после {DAILY_COORDS_LIMIT} элементов с координатами или {DAILY_NO_COORDS_LIMIT} без координат за сутки)\n"
         "• <b>/stats</b> — статистика по скачанным данным\n"
         "• <b>/reset</b> — очистить текущую сессию\n"
         "• <b>/help</b> — эта справка\n\n"
+        f"ℹ️ Экспорт и скачивание доступны, если за последние 24 часа собрано {DAILY_COORDS_LIMIT} элементов с координатами "
+        f"или {DAILY_NO_COORDS_LIMIT} без координат. Лимит обнуляется ежедневно.\n\n"
         "🔧 <b>Полезные флаги</b>:\n"
         "• <code>--max N</code> — лимит медиа (0 = все)\n"
         "• <code>--split-zip-size-mb N</code> — размер части архива (если включена упаковка)\n"
