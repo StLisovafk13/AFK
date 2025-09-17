@@ -38,6 +38,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
     Message,
+    User,
     BufferedInputFile,
     FSInputFile,
     InlineKeyboardButton,
@@ -111,6 +112,7 @@ VSCO_RESERVED = {
     "signin", "login", "signup", "api"
 }
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+TG_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
 URL_RE = re.compile(r'(https?://[^\s<>"\'\]\)]+)', re.IGNORECASE)
 MEDIA_PATH_RE = re.compile(r"^/([^/]+)/media/([A-Za-z0-9]+)")
 
@@ -153,6 +155,7 @@ def init_db():
       image_url TEXT DEFAULT '',
       source TEXT DEFAULT '',
       source_file TEXT DEFAULT '',
+      added_by TEXT DEFAULT '',
       created_at TEXT NOT NULL,
       UNIQUE(chat_id, username, image_url, profile_url)
     )""")
@@ -170,6 +173,9 @@ def init_db():
       UNIQUE(item_id, comment),
       FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
     )""")
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
+    if "added_by" not in cols:
+        conn.execute("ALTER TABLE items ADD COLUMN added_by TEXT DEFAULT ''")
     conn.commit(); conn.close()
     log.info("DB initialized at %s", DB_PATH)
 
@@ -179,6 +185,33 @@ def utc_now_iso() -> str:
 
 def _since_utc_iso(days: int) -> str:
     return (datetime.now(LOCAL_TZ) - timedelta(days=days)).isoformat()
+
+def resolve_added_by(user: Optional[User]) -> str:
+    if user is None:
+        return ""
+    if user.username:
+        return f"@{user.username}"
+    full_name = (user.full_name or "").strip()
+    return full_name
+
+
+def added_by_display_and_link(value: str) -> Tuple[str, Optional[str]]:
+    raw = (value or "").strip()
+    if not raw:
+        return "", None
+    handle = raw[1:] if raw.startswith("@") else raw
+    if TG_USERNAME_RE.match(handle):
+        return f"@{handle}", f"https://t.me/{handle}"
+    return raw, None
+
+
+def added_by_html(value: str) -> str:
+    display, link = added_by_display_and_link(value)
+    if not display:
+        return ""
+    if link:
+        return f"<a href=\"{escape(link)}\">{escape(display)}</a>"
+    return escape(display)
 
 DAILY_COORDS_LIMIT = 10
 DAILY_NO_COORDS_LIMIT = 5
@@ -224,7 +257,6 @@ def has_daily_data_access(chat_id: int) -> Tuple[bool, str]:
         )
 
     return allowed, text
-
 
 def resolve_added_by(user: Optional[User]) -> str:
     if user is None:
@@ -393,11 +425,16 @@ def _insert_item(conn: sqlite3.Connection, chat_id: int, username: str, profile_
                  source: str, source_file: Optional[str], added_by: str) -> int:
     cur = conn.cursor()
     cur.execute(
+
+        """INSERT INTO items(chat_id,username,latitude,longitude,profile_url,image_url,source,source_file,added_by,created_at)
+
         """INSERT INTO items(chat_id,username,added_by,latitude,longitude,profile_url,image_url,source,source_file,created_at)
+
            VALUES(?,?,?,?,?,?,?,?,?,?)""",
         (
             chat_id,
             username,
+
             added_by or "",
             latitude,
             longitude,
@@ -405,6 +442,14 @@ def _insert_item(conn: sqlite3.Connection, chat_id: int, username: str, profile_
             image_url,
             source or "",
             source_file or "",
+            added_by or "",
+            utc_now_iso(),
+        )
+    )
+    return cur.lastrowid
+
+def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source: str, source_file: Optional[str], added_by: str) -> Tuple[int,int]:
+=======
             utc_now_iso(),
         ),
     )
@@ -426,6 +471,8 @@ def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source:
 
             item_id = _get_item_id(conn, username, profile_url, image_url)
             if item_id is None:
+
+                item_id = _insert_item(conn, chat_id, username, profile_url, image_url, None, None, source, source_file, added_by)
                 item_id = _insert_item(conn, chat_id, username, profile_url, image_url, None, None, source, source_file, added_by_norm)
                 added_items += 1
 
@@ -443,6 +490,8 @@ def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source:
         return (added_items, added_comments)
     finally:
         conn.close()
+
+def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_file: str, added_by: str) -> int:
 
 def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_file: str,
                                added_by: str = "") -> int:
@@ -470,7 +519,11 @@ def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_f
             if not username or not profile_url: continue
 
             if _get_item_id(conn, username, profile_url, image_url) is None:
+
+                _insert_item(conn, chat_id, username, profile_url, image_url, lat, lon, "html", source_file, added_by)
+
                 _insert_item(conn, chat_id, username, profile_url, image_url, lat, lon, "html", source_file, final_added_by)
+
                 added += 1
                 add_vsco_link_legacy(username, profile_url, chat_id, conn)
         conn.commit()
@@ -620,6 +673,9 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
         g = groups.setdefault(uname, {
             "username": uname, "profile_url": purl or (f"https://vsco.co/{uname}" if uname else ""),
             "lat_sum":0.0, "lon_sum":0.0, "lat_n":0, "lon_n":0,
+
+            "images": set(), "added_by": "",
+
             "images": set(), "added_by": set()
         })
         if purl and not g["profile_url"]:
@@ -633,6 +689,8 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
                 g["lat_sum"] += float(lat); g["lon_sum"] += float(lon)
                 g["lat_n"] += 1; g["lon_n"] += 1
             except Exception: pass
+        if added_by and not g.get("added_by"):
+            g["added_by"] = added_by
         ids_by_user.setdefault(uname, []).append(iid)
 
     all_ids = [iid for lst in ids_by_user.values() for iid in lst]
@@ -654,6 +712,8 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             for c in u_comments:
                 if c not in seen: seen.add(c); ded.append(c)
             u_comments = ded
+        raw_added = g.get("added_by", "")
+        display, link = added_by_display_and_link(raw_added)
         out.append({
             "username": uname,
             "profile_url": g["profile_url"],
@@ -662,6 +722,11 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "comments": u_comments,
             "images_count": len(g["images"]),
             "comments_count": len(u_comments),
+
+            "added_by": display,
+            "added_by_link": link or "",
+            "added_by_raw": raw_added,
+
             "added_by": sorted(g["added_by"]),
         })
     conn.close()
@@ -691,7 +756,11 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
         except Exception: lat = None
         try: lon = float(lon) if lon not in ("", None, "None") else None
         except Exception: lon = None
+
+        display, link = added_by_display_and_link(added_by or "")
+
         added_by_val = (added_by or "").strip() if isinstance(added_by, str) else str(added_by or "").strip()
+
         out.append({
             "id": iid,
             "username": uname or "",
@@ -699,6 +768,11 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "image_url": img or "",
             "lat": lat, "lon": lon,
             "comments": comments_map.get(iid, []),
+
+            "added_by": display,
+            "added_by_link": link or "",
+            "added_by_raw": added_by or "",
+
             "added_by": added_by_val,
         })
     conn.close()
@@ -742,6 +816,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     .card .head .name a {{ font-weight:700; text-decoration:none; color:#111; }}
     .btn {{ display:inline-block; padding:6px 10px; border-radius:10px; background:#10b981; color:#fff; text-decoration:none; font-weight:600; }}
     .meta {{ font-size:12px; color:#6b7280; margin:4px 0 8px 0; }}
+    .meta.added {{ color:#4b5563; margin-top:2px; }}
     .thumbs {{ display:flex; gap:6px; overflow:hidden; }}
     .thumbs img {{ width:72px; height:120px; object-fit:cover; border-radius:8px; border:1px solid #eee; }}
     .cm {{ margin-top:10px; font-size:13px; }}
@@ -824,6 +899,14 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         }}
         const thumbs = images.map(src=>`<img src="${{src}}" loading="lazy">`).join('');
         const latStr = (u.lat!=null && u.lon!=null) ? `${{u.lat.toFixed(6)}}, ${{u.lon.toFixed(6)}}` : '';
+        const addedBy = (()=>{{
+          if (!u.added_by) return '';
+          const label = escapeHtml(u.added_by);
+          if (u.added_by_link) {{
+            return `<a href="${{escapeHtml(u.added_by_link)}}" target="_blank">${{label}}</a>`;
+          }}
+          return label;
+        }})();
         const card = document.createElement('div');
         card.className = 'card';
         card.innerHTML = `
@@ -831,7 +914,8 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
             <div class="name"><a href="${{u.profile_url}}" target="_blank">@${{escapeHtml(u.username)}}</a></div>
             <a class="btn" href="${{u.profile_url}}" target="_blank">View Profile</a>
           </div>
-          <div class="meta">${{latStr}} • ${{u.images_count}} item(s) • ${{u.comments_count}} comment(s)</div>
+          <div class="meta">${{latStr ? latStr + ' • ' : ''}}${{u.images_count}} item(s) • ${{u.comments_count}} comment(s)</div>
+          <div class="meta added">Добавил: ${{addedBy || '—'}}</div>
           <div class="thumbs">${{thumbs}}</div>
           <div class="cm">${{cmHtml}}</div>
         `;
@@ -886,6 +970,7 @@ def _map_html(title: str, list_html: str, marker_js: List[str]) -> str:
     .panel .row {{ padding:10px 14px; border-bottom:1px dashed #e5e7eb; display:grid; grid-template-columns:auto 80px 1fr; gap:8px; align-items:center; }}
     .panel .row .u a {{ font-weight:600; color:#111; text-decoration:none; }}
     .panel .row .c {{ font-size: 13px; color:#111; }}
+    .panel .row .ab {{ grid-column:1 / -1; font-size:12px; color:#4b5563; }}
     @media (max-width: 900px) {{
       .layout {{ flex-direction: column; }}
       .panel {{ width: 100%; max-width: 100%; height: 46vh; }}
@@ -945,10 +1030,13 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
             head = "".join(f"<li>{escape(x) if x else ''}</li>" for x in cm[:3])
             more = f"<div class='c'>и ещё {len(cm)-3}…</div>" if len(cm) > 3 else ""
             cm_txt = f"<div class='c'><ul>{head}</ul>{more}</div>"
+        added_html = added_by_html(u.get("added_by_raw", ""))
+        added_block = f"<div class='ab'>Добавил: {added_html or '—'}</div>"
         list_rows.append(f"""
           <div class="row">
             <div class="u"><a href="{link}" target="_blank">@{uname}</a></div>
             {cm_txt}
+            {added_block}
           </div>""")
     list_html = "".join(list_rows)
 
@@ -959,7 +1047,11 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
             lat=u.get("lat"); lon=u.get("lon")
             if lat is None or lon is None: continue
             uname=escape(str(u.get("username") or "")); prof=escape(str(u.get("profile_url") or ""))
-            popup=f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a></div>"
+            added_html = added_by_html(u.get("added_by_raw", ""))
+            if added_html:
+                popup=f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a><br/>Добавил: {added_html}</div>"
+            else:
+                popup=f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a></div>"
             marker_js.append(f"var m=L.marker([{lat},{lon}]).bindPopup({popup!r}); markers.addLayer(m); bounds.extend([{lat},{lon}]);")
         marker_js += ["map.addLayer(markers);","if(bounds.isValid()){{map.fitBounds(bounds.pad(0.1));}}else{{map.setView([20,0],2);}}"]
     else:
@@ -982,11 +1074,14 @@ def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"
             head = "".join(f"<li>{escape(x) if x else ''}</li>" for x in cm[:2])
             more = f"<div class='c'>и ещё {len(cm)-2}…</div>" if len(cm) > 2 else ""
             cm_txt = f"<div class='c'><ul>{head}</ul>{more}</div>"
+        added_html = added_by_html(r.get("added_by_raw", ""))
+        added_block = f"<div class='ab'>Добавил: {added_html or '—'}</div>"
         rows.append(f"""
           <div class="row">
             <div class="u"><a href="{link}" target="_blank">@{uname}</a></div>
             <div class="t">{img_html}</div>
             {cm_txt}
+            {added_block}
           </div>""")
     list_html="".join(rows)
 
@@ -999,7 +1094,11 @@ def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"
             uname=escape(str(r.get("username") or "")); prof=escape(str(r.get("profile_url") or ""))
             img=r.get("image_url") or ""
             img_html = f"<img src='{escape(img)}' loading='lazy' style='width:140px;height:140px;object-fit:cover;border-radius:10px;border:1px solid #eee;'/>" if img else ""
-            popup=f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a><br/>{img_html}</div>"
+            added_html = added_by_html(r.get("added_by_raw", ""))
+            if added_html:
+                popup=f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a><br/>{img_html}<br/>Добавил: {added_html}</div>"
+            else:
+                popup=f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a><br/>{img_html}</div>"
             marker_js.append(f"var m=L.marker([{lat},{lon}]).bindPopup({popup!r}); markers.addLayer(m); bounds.extend([{lat},{lon}]);")
         marker_js += ["map.addLayer(markers);","if(bounds.isValid()){{map.fitBounds(bounds.pad(0.1));}}else{{map.setView([20,0],2);}}"]
     else:
@@ -1040,7 +1139,16 @@ async def on_document(msg: Message):
     if msg.caption:
         pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_text(msg.caption))
         found += len(pairs)
+        ai, ac = upsert_items_with_comments(
+            msg.chat.id,
+            pairs,
+            source="text",
+            source_file="caption",
+            added_by=added_by,
+        )
+
         ai, ac = upsert_items_with_comments(msg.chat.id, pairs, source="text", source_file="caption", added_by=added_by)
+
         added_items += ai; added_comments += ac
 
     p = ses.dir / (msg.document.file_name or "file.bin")
@@ -1060,7 +1168,17 @@ async def on_document(msg: Message):
                     pairs.extend(parse_vsco_pairs_from_cell(v))
             pairs = await normalize_vsco_pairs(pairs)
             found += len(pairs)
+
+            ai, ac = upsert_items_with_comments(
+                msg.chat.id,
+                pairs,
+                source="csv",
+                source_file=p.name,
+                added_by=added_by,
+            )
+
             ai, ac = upsert_items_with_comments(msg.chat.id, pairs, source="csv", source_file=p.name, added_by=added_by)
+
             added_items += ai; added_comments += ac
             await msg.answer(
                 f"CSV загружен: <code>{escape(p.name)}</code>\n"
@@ -1092,7 +1210,17 @@ async def on_text(msg: Message):
     if not pairs:
         return  # без ответа
     added_by = resolve_added_by(msg.from_user)
+
+    ai, ac = upsert_items_with_comments(
+        msg.chat.id,
+        pairs,
+        source="text",
+        source_file="message",
+        added_by=added_by,
+    )
+
     ai, ac = upsert_items_with_comments(msg.chat.id, pairs, source="text", source_file="message", added_by=added_by)
+
     await msg.answer(f"Найдено VSCO-ссылок: {len(pairs)}, добавлено записей: {ai}, комментариев: {ac}")
 
 # ---------- export ----------
@@ -1145,7 +1273,6 @@ async def on_export_click(cq: CallbackQuery):
     if cq.message.chat.type in ("group", "supergroup"):
         await cq.answer("Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.", show_alert=True)
         return
-
     allowed, info = has_daily_data_access(chat_id)
     if not allowed:
         await cq.answer(info, show_alert=True)
@@ -1186,7 +1313,13 @@ async def on_export_click(cq: CallbackQuery):
                 "lat": u["lat"], "lon": u["lon"],
                 "images_count": u["images_count"], "comments_count": u["comments_count"],
                 "comments": " | ".join(u["comments"]),
+
+                "added_by": u.get("added_by_raw", ""),
+                "added_by_display": u.get("added_by", ""),
+                "added_by_link": u.get("added_by_link", ""),
+
                 "added_by": " | ".join(u.get("added_by", [])),
+
             } for u in users]
             out = ses.dir / f"export_{ses.export_scope}.csv"
             pd.DataFrame(flat).to_csv(out, index=False, encoding="utf-8")
@@ -1277,16 +1410,26 @@ def _links_since_query(chat_id: int, scope: str, since_iso: str, limit: int, off
         total = conn.execute(f"SELECT COUNT(*) FROM links WHERE {where}", tuple(params)).fetchone()[0]
         order = "ORDER BY datetime(created_at) DESC, username ASC"
         rows = conn.execute(
-            f"SELECT username, url, created_at, chat_id FROM links WHERE {where} {order} LIMIT ? OFFSET ?",
+            f"""
+            SELECT username, url, created_at, chat_id,
+                   (
+                       SELECT added_by FROM items
+                       WHERE chat_id = links.chat_id AND username = links.username
+                       ORDER BY datetime(created_at) ASC
+                       LIMIT 1
+                   ) AS added_by
+            FROM links
+            WHERE {where} {order} LIMIT ? OFFSET ?
+            """,
             tuple(params + [limit, offset])
         ).fetchall()
         return int(total or 0), rows
     finally:
         conn.close()
 
-def _fmt_links_block(rows: List[Tuple[str,str,str,int]]) -> str:
+def _fmt_links_block(rows: List[Tuple[str,str,str,int,Optional[str]]]) -> str:
     out = []
-    for uname, url, created_at, _chat in rows:
+    for uname, url, created_at, _chat, added_by in rows:
         t = created_at
         try:
             dt = datetime.fromisoformat(created_at.replace("Z","+00:00"))
@@ -1300,7 +1443,12 @@ def _fmt_links_block(rows: List[Tuple[str,str,str,int]]) -> str:
         u = escape(uname or "")
         href = escape(url or "")
         # ВАЖНО: не используем <span>; Telegram не поддерживает. Берём <i>.
+        added_html = added_by_html(added_by or "")
+        by_part = f" — добавил {added_html}" if added_html else ""
+        out.append(f"• <a href=\"{href}\">@{u}</a>{by_part} <i>({LOCAL_TZ_LABEL} {t})</i>")
+
         out.append(f"• <a href=\"{href}\">@{u}</a> <i>({LOCAL_TZ_LABEL} {t})</i>")
+
     return "\n".join(out) if out else "— нет ссылок"
 
 def _links_scope_keyboard(ses: Session, page: int, total: int) -> InlineKeyboardMarkup:
@@ -1366,7 +1514,16 @@ async def on_links_click(cq: CallbackQuery):
         if not rows:
             await cq.answer("За день нет ссылок", show_alert=True)
             return
-        df = pd.DataFrame([{ "username": r[0], "url": r[1], "created_at": r[2], "chat_id": r[3]} for r in rows])
+        df = pd.DataFrame([
+            {
+                "username": r[0],
+                "url": r[1],
+                "created_at": r[2],
+                "chat_id": r[3],
+                "added_by": r[4],
+            }
+            for r in rows
+        ])
         out = get_session(chat_id).dir / f"links_day_{ses.export_scope}.csv"
         df.to_csv(out, index=False, encoding="utf-8")
         await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
