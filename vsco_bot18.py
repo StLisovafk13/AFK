@@ -43,6 +43,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     CallbackQuery,
+    User,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest
@@ -145,6 +146,7 @@ def init_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       chat_id INTEGER NOT NULL,
       username TEXT DEFAULT '',
+      added_by TEXT DEFAULT '',
       latitude REAL,
       longitude REAL,
       profile_url TEXT DEFAULT '',
@@ -154,6 +156,10 @@ def init_db():
       created_at TEXT NOT NULL,
       UNIQUE(chat_id, username, image_url, profile_url)
     )""")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
+    if "added_by" not in columns:
+        conn.execute("ALTER TABLE items ADD COLUMN added_by TEXT DEFAULT ''")
+        log.info("DB: added 'added_by' column to items table")
     conn.execute("""
     CREATE TABLE IF NOT EXISTS comments(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -218,6 +224,15 @@ def has_daily_data_access(chat_id: int) -> Tuple[bool, str]:
         )
 
     return allowed, text
+
+
+def resolve_added_by(user: Optional[User]) -> str:
+    if user is None:
+        return ""
+    if user.username:
+        return user.username.strip()
+    name = (user.full_name or "").strip()
+    return name
 
 def is_vsco_url(u: str) -> bool:
     try:
@@ -375,20 +390,32 @@ def _get_item_id(conn: sqlite3.Connection, username: str, profile_url: str, imag
 
 def _insert_item(conn: sqlite3.Connection, chat_id: int, username: str, profile_url: str,
                  image_url: str, latitude: Optional[float], longitude: Optional[float],
-                 source: str, source_file: Optional[str]) -> int:
+                 source: str, source_file: Optional[str], added_by: str) -> int:
     cur = conn.cursor()
     cur.execute(
-        """INSERT INTO items(chat_id,username,latitude,longitude,profile_url,image_url,source,source_file,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?)""",
-        (chat_id, username, latitude, longitude, profile_url, image_url, source or "", source_file or "",
-         utc_now_iso())
+        """INSERT INTO items(chat_id,username,added_by,latitude,longitude,profile_url,image_url,source,source_file,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        (
+            chat_id,
+            username,
+            added_by or "",
+            latitude,
+            longitude,
+            profile_url,
+            image_url,
+            source or "",
+            source_file or "",
+            utc_now_iso(),
+        ),
     )
     return cur.lastrowid
 
-def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source: str, source_file: Optional[str]) -> Tuple[int,int]:
+def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source: str,
+                               source_file: Optional[str], added_by: str = "") -> Tuple[int,int]:
     if not pairs: return (0,0)
     conn = db_connect()
     added_items = added_comments = 0
+    added_by_norm = (added_by or "").strip()
     try:
         for r in pairs:
             username = (r.get("username") or "").lstrip("@")
@@ -399,7 +426,7 @@ def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source:
 
             item_id = _get_item_id(conn, username, profile_url, image_url)
             if item_id is None:
-                item_id = _insert_item(conn, chat_id, username, profile_url, image_url, None, None, source, source_file)
+                item_id = _insert_item(conn, chat_id, username, profile_url, image_url, None, None, source, source_file, added_by_norm)
                 added_items += 1
 
             if comment:
@@ -417,9 +444,11 @@ def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source:
     finally:
         conn.close()
 
-def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_file: str) -> int:
+def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_file: str,
+                               added_by: str = "") -> int:
     if not rows: return 0
     conn = db_connect(); added = 0
+    added_by_norm = (added_by or "").strip()
     try:
         for r in rows:
             username = (r.get("username") or "").lstrip("@")
@@ -430,10 +459,18 @@ def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_f
             except Exception: lat = None
             try: lon = float(lon) if lon not in ("", None, "None") else None
             except Exception: lon = None
+            row_added_by = r.get("added_by")
+            if isinstance(row_added_by, str):
+                row_added_by_norm = row_added_by.strip()
+            elif row_added_by is None:
+                row_added_by_norm = ""
+            else:
+                row_added_by_norm = str(row_added_by).strip()
+            final_added_by = row_added_by_norm or added_by_norm
             if not username or not profile_url: continue
 
             if _get_item_id(conn, username, profile_url, image_url) is None:
-                _insert_item(conn, chat_id, username, profile_url, image_url, lat, lon, "html", source_file)
+                _insert_item(conn, chat_id, username, profile_url, image_url, lat, lon, "html", source_file, final_added_by)
                 added += 1
                 add_vsco_link_legacy(username, profile_url, chat_id, conn)
         conn.commit()
@@ -565,24 +602,32 @@ def format_stats_text(stats: Dict[str, Dict[str, int]], scope: str) -> str:
 def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     conn = db_connect(); conn.execute("PRAGMA read_uncommitted=1;")
     if scope == "chat":
-        rows = conn.execute("SELECT id,username,profile_url,latitude,longitude,image_url FROM items WHERE chat_id=?", (chat_id,)).fetchall()
+        rows = conn.execute(
+            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by FROM items WHERE chat_id=?",
+            (chat_id,),
+        ).fetchall()
     else:
-        rows = conn.execute("SELECT id,username,profile_url,latitude,longitude,image_url FROM items").fetchall()
+        rows = conn.execute(
+            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by FROM items"
+        ).fetchall()
     if not rows:
         conn.close(); return []
 
     groups: Dict[str, Dict[str, Any]] = {}
     ids_by_user: Dict[str,List[int]] = {}
-    for iid, uname, purl, lat, lon, img in rows:
+    for iid, uname, purl, lat, lon, img, added_by in rows:
         uname = uname or ""
         g = groups.setdefault(uname, {
             "username": uname, "profile_url": purl or (f"https://vsco.co/{uname}" if uname else ""),
             "lat_sum":0.0, "lon_sum":0.0, "lat_n":0, "lon_n":0,
-            "images": set()
+            "images": set(), "added_by": set()
         })
         if purl and not g["profile_url"]:
             g["profile_url"] = purl
         if img: g["images"].add(img)
+        added_by_val = (added_by or "").strip() if isinstance(added_by, str) else str(added_by or "").strip()
+        if added_by_val:
+            g["added_by"].add(added_by_val)
         if lat is not None and lon is not None:
             try:
                 g["lat_sum"] += float(lat); g["lon_sum"] += float(lon)
@@ -617,6 +662,7 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "comments": u_comments,
             "images_count": len(g["images"]),
             "comments_count": len(u_comments),
+            "added_by": sorted(g["added_by"]),
         })
     conn.close()
     return out
@@ -624,9 +670,14 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
 def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     conn = db_connect(); conn.execute("PRAGMA read_uncommitted=1;")
     if scope == "chat":
-        rows = conn.execute("SELECT id,username,profile_url,image_url,latitude,longitude FROM items WHERE chat_id=?", (chat_id,)).fetchall()
+        rows = conn.execute(
+            "SELECT id,username,profile_url,image_url,latitude,longitude,added_by FROM items WHERE chat_id=?",
+            (chat_id,),
+        ).fetchall()
     else:
-        rows = conn.execute("SELECT id,username,profile_url,image_url,latitude,longitude FROM items").fetchall()
+        rows = conn.execute(
+            "SELECT id,username,profile_url,image_url,latitude,longitude,added_by FROM items"
+        ).fetchall()
     if not rows:
         conn.close(); return []
     ids = [r[0] for r in rows]
@@ -635,18 +686,20 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     for iid, c in conn.execute(f"SELECT item_id,comment FROM comments WHERE item_id IN ({q}) ORDER BY id ASC", ids):
         comments_map.setdefault(iid, []).append(c)
     out = []
-    for iid, uname, purl, img, lat, lon in rows:
+    for iid, uname, purl, img, lat, lon, added_by in rows:
         try: lat = float(lat) if lat not in ("", None, "None") else None
         except Exception: lat = None
         try: lon = float(lon) if lon not in ("", None, "None") else None
         except Exception: lon = None
+        added_by_val = (added_by or "").strip() if isinstance(added_by, str) else str(added_by or "").strip()
         out.append({
             "id": iid,
             "username": uname or "",
             "profile_url": purl or (f"https://vsco.co/{uname}" if uname else ""),
             "image_url": img or "",
             "lat": lat, "lon": lon,
-            "comments": comments_map.get(iid, [])
+            "comments": comments_map.get(iid, []),
+            "added_by": added_by_val,
         })
     conn.close()
     return out
@@ -982,11 +1035,12 @@ async def send_file(msg: Message, path: Path, caption: str = ""):
 async def on_document(msg: Message):
     ses = get_session(msg.chat.id)
     found = added_items = added_comments = 0
+    added_by = resolve_added_by(msg.from_user)
 
     if msg.caption:
         pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_text(msg.caption))
         found += len(pairs)
-        ai, ac = upsert_items_with_comments(msg.chat.id, pairs, source="text", source_file="caption")
+        ai, ac = upsert_items_with_comments(msg.chat.id, pairs, source="text", source_file="caption", added_by=added_by)
         added_items += ai; added_comments += ac
 
     p = ses.dir / (msg.document.file_name or "file.bin")
@@ -1006,7 +1060,7 @@ async def on_document(msg: Message):
                     pairs.extend(parse_vsco_pairs_from_cell(v))
             pairs = await normalize_vsco_pairs(pairs)
             found += len(pairs)
-            ai, ac = upsert_items_with_comments(msg.chat.id, pairs, source="csv", source_file=p.name)
+            ai, ac = upsert_items_with_comments(msg.chat.id, pairs, source="csv", source_file=p.name, added_by=added_by)
             added_items += ai; added_comments += ac
             await msg.answer(
                 f"CSV загружен: <code>{escape(p.name)}</code>\n"
@@ -1021,7 +1075,7 @@ async def on_document(msg: Message):
         ses.uploaded_html.append(p)
         try:
             rows = dedupe_rows(parse_html_file(p), mode="safe")
-            added_full = insert_full_rows_from_html(msg.chat.id, rows, source_file=p.name)
+            added_full = insert_full_rows_from_html(msg.chat.id, rows, source_file=p.name, added_by=added_by)
             extra = f"\n+ из подписи: добавлено {added_items} записей, комментариев {added_comments}" if msg.caption else ""
             await msg.answer(f"HTML загружен: <code>{escape(p.name)}</code>\nСохранено элементов: {added_full}{extra}")
         except Exception as e:
@@ -1037,7 +1091,8 @@ async def on_text(msg: Message):
     pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_text(msg.text))
     if not pairs:
         return  # без ответа
-    ai, ac = upsert_items_with_comments(msg.chat.id, pairs, source="text", source_file="message")
+    added_by = resolve_added_by(msg.from_user)
+    ai, ac = upsert_items_with_comments(msg.chat.id, pairs, source="text", source_file="message", added_by=added_by)
     await msg.answer(f"Найдено VSCO-ссылок: {len(pairs)}, добавлено записей: {ai}, комментариев: {ac}")
 
 # ---------- export ----------
@@ -1130,7 +1185,8 @@ async def on_export_click(cq: CallbackQuery):
                 "username": u["username"], "profile_url": u["profile_url"],
                 "lat": u["lat"], "lon": u["lon"],
                 "images_count": u["images_count"], "comments_count": u["comments_count"],
-                "comments": " | ".join(u["comments"])
+                "comments": " | ".join(u["comments"]),
+                "added_by": " | ".join(u.get("added_by", [])),
             } for u in users]
             out = ses.dir / f"export_{ses.export_scope}.csv"
             pd.DataFrame(flat).to_csv(out, index=False, encoding="utf-8")
