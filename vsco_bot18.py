@@ -1015,6 +1015,9 @@ def kb_struct(kb: InlineKeyboardMarkup | None):
 
 @dp.message(Command("export"))
 async def cmd_export(msg: Message):
+    if msg.chat.type in ("group", "supergroup"):
+        await msg.answer("🚫 Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.")
+        return
     ses = get_session(msg.chat.id)
     await msg.answer(
         "Экспорт VSCO:\n• CSV / Галерея\n• Карта: по пользователям или по фото",
@@ -1024,6 +1027,9 @@ async def cmd_export(msg: Message):
 @dp.callback_query(F.data.startswith("export:"))
 async def on_export_click(cq: CallbackQuery):
     chat_id = cq.message.chat.id
+    if cq.message.chat.type in ("group", "supergroup"):
+        await cq.answer("Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.", show_alert=True)
+        return
     ses = get_session(chat_id)
     parts = cq.data.split(":")
     if len(parts)>=3 and parts[1]=="scope":
