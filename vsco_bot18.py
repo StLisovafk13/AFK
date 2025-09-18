@@ -20,7 +20,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Sequence
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 import json
@@ -44,9 +44,11 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     CallbackQuery,
+    MessageEntity,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.utils.text_decorations import add_surrogates, remove_surrogates
 import aiohttp
 import sys
 import contextlib
@@ -322,6 +324,63 @@ async def fetch_media_image_url(url: str, session: aiohttp.ClientSession) -> Opt
     return None
 
 # === Парсер "ссылка, комментарий до следующей ссылки" ========================
+def _expand_text_with_entities(text: Optional[str], entities: Optional[Sequence[MessageEntity]]) -> str:
+    if not text:
+        return ""
+    if not entities:
+        return text
+
+    surrogate_text = add_surrogates(text)
+    parts: List[str] = []
+    cursor_units = 0
+    total_units = len(surrogate_text) // 2
+
+    for entity in sorted(entities, key=lambda e: getattr(e, "offset", 0) or 0):
+        offset_units = max(int(getattr(entity, "offset", 0) or 0), 0)
+        length_units = max(int(getattr(entity, "length", 0) or 0), 0)
+
+        if offset_units < cursor_units:
+            continue
+        if offset_units > total_units:
+            break
+
+        if offset_units > cursor_units:
+            start = cursor_units * 2
+            end = offset_units * 2
+            parts.append(remove_surrogates(surrogate_text[start:end]))
+
+        end_units = min(offset_units + length_units, total_units)
+        start_bytes = offset_units * 2
+        end_bytes = end_units * 2
+        entity_slice = surrogate_text[start_bytes:end_bytes]
+        entity_text = remove_surrogates(entity_slice)
+
+        entity_type = getattr(entity, "type", "")
+        if hasattr(entity_type, "value"):
+            entity_type = entity_type.value
+        entity_type = str(entity_type or "")
+
+        replacement = entity_text
+        if entity_type == "text_link" and getattr(entity, "url", None):
+            replacement = entity.url or ""
+        elif entity_type == "url":
+            replacement = entity_text
+
+        parts.append(replacement)
+        cursor_units = end_units
+
+    if cursor_units < total_units:
+        start = cursor_units * 2
+        parts.append(remove_surrogates(surrogate_text[start:]))
+
+    return "".join(parts)
+
+
+def parse_vsco_pairs_from_message(text: Optional[str], entities: Optional[Sequence[MessageEntity]]) -> List[Dict[str, str]]:
+    expanded = _expand_text_with_entities(text, entities)
+    return _parse_vsco_pairs(expanded)
+
+
 def _parse_vsco_pairs(text: str) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     if not text:
@@ -1075,7 +1134,7 @@ async def on_document(msg: Message):
     added_by = resolve_added_by(msg.from_user)
 
     if msg.caption:
-        pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_text(msg.caption))
+        pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_message(msg.caption, msg.caption_entities))
         found += len(pairs)
         ai, ac = upsert_items_with_comments(
             msg.chat.id,
@@ -1137,7 +1196,7 @@ async def on_document(msg: Message):
 # ---------- plain text ----------
 @dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(msg: Message):
-    pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_text(msg.text))
+    pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_message(msg.text, msg.entities))
     if not pairs:
         return  # без ответа
     added_by = resolve_added_by(msg.from_user)
