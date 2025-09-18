@@ -48,6 +48,7 @@ from aiogram.types import (
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.utils.text_decorations import add_surrogates, remove_surrogates
 import aiohttp
 import sys
 import contextlib
@@ -329,21 +330,31 @@ def _expand_text_with_entities(text: Optional[str], entities: Optional[Sequence[
     if not entities:
         return text
 
+    surrogate_text = add_surrogates(text)
     parts: List[str] = []
-    last_index = 0
-    text_length = len(text)
-    for entity in sorted(entities, key=lambda e: getattr(e, "offset", 0) or 0):
-        offset = getattr(entity, "offset", 0) or 0
-        length = getattr(entity, "length", 0) or 0
-        if offset < last_index:
-            continue
-        if offset > text_length:
-            break
-        end = min(offset + length, text_length)
-        if offset > last_index:
-            parts.append(text[last_index:offset])
+    cursor_units = 0
+    total_units = len(surrogate_text) // 2
 
-        entity_text = text[offset:end]
+    for entity in sorted(entities, key=lambda e: getattr(e, "offset", 0) or 0):
+        offset_units = max(int(getattr(entity, "offset", 0) or 0), 0)
+        length_units = max(int(getattr(entity, "length", 0) or 0), 0)
+
+        if offset_units < cursor_units:
+            continue
+        if offset_units > total_units:
+            break
+
+        if offset_units > cursor_units:
+            start = cursor_units * 2
+            end = offset_units * 2
+            parts.append(remove_surrogates(surrogate_text[start:end]))
+
+        end_units = min(offset_units + length_units, total_units)
+        start_bytes = offset_units * 2
+        end_bytes = end_units * 2
+        entity_slice = surrogate_text[start_bytes:end_bytes]
+        entity_text = remove_surrogates(entity_slice)
+
         entity_type = getattr(entity, "type", "")
         if hasattr(entity_type, "value"):
             entity_type = entity_type.value
@@ -356,10 +367,11 @@ def _expand_text_with_entities(text: Optional[str], entities: Optional[Sequence[
             replacement = entity_text
 
         parts.append(replacement)
-        last_index = end
+        cursor_units = end_units
 
-    if last_index < text_length:
-        parts.append(text[last_index:])
+    if cursor_units < total_units:
+        start = cursor_units * 2
+        parts.append(remove_surrogates(surrogate_text[start:]))
 
     return "".join(parts)
 
