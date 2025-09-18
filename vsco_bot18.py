@@ -2153,11 +2153,11 @@ async def _dl_worker():
 @dp.message(Command("tutorial"))
 async def cmd_tutorial(msg: Message):
     text = (
- "❗ <b>Tutorial:</b>\n"
+        "❗ <b>Tutorial:</b>\n"
         "<b>Как получать ссылки профилей и ссылки фоток с координатами.</b>\n\n"
 
         "В <a href='https://t.me/VSCoord_bot'>@VSCoord_bot</a> даётся 0.6 бесплатных кредитов.\n"
-        "Их можно использовать для получения профилей на радиус 3.4 км, для фоток с координатами на радиус 1.8 км.\n\n"
+        "Их можно использовать для получения профилей на радиус 3.4 км, фоток с координатами на радиус 1.8 км.\n\n"
 
         "Бот <a href='https://t.me/vscoleak_bot'>@vscoleak_bot</a> создан для сбора всех ссылок в одном месте и скачивания профиля.\n"
         "Также формируется карта с координатами.\n\n"
@@ -2200,7 +2200,7 @@ async def cmd_help(msg: Message):
         f"или {DAILY_NO_COORDS_LIMIT} без координат. Лимит обнуляется ежедневно.\n\n"
         "💡 <b>Примеры</b>:\n"
         "• <code>/dl johndoe</code>\n"
-        "• <code>/dl https://vsco.co/johndoe\n\n"
+        "• <code>/dl https://vsco.co/johndoe </code>\n\n"
     )
     await msg.answer(text)
 
