@@ -67,6 +67,22 @@ LOGDIR = Path(os.getenv("BOT_LOGDIR", "./logs")); LOGDIR.mkdir(parents=True, exi
 DB_PATH = os.getenv("BOT_DB_PATH", "vsco_links.db")
 SEND_TIMEOUT = int(os.getenv("BOT_SEND_TIMEOUT", "600"))
 
+
+def _parse_admin_ids(raw: str) -> set[int]:
+    ids: set[int] = set()
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            ids.add(int(chunk))
+        except ValueError:
+            continue
+    return ids
+
+
+BOT_ADMIN_IDS = _parse_admin_ids(os.getenv("BOT_ADMIN_IDS", ""))
+
 LOCAL_TZ = timezone(timedelta(hours=3))
 _LOCAL_TZ_OFFSET = LOCAL_TZ.utcoffset(None) or timedelta()
 if _LOCAL_TZ_OFFSET == timedelta():
@@ -77,6 +93,21 @@ else:
     total_minutes = abs(total_minutes)
     hours, minutes = divmod(total_minutes, 60)
     LOCAL_TZ_LABEL = f"UTC{sign}{hours:02d}:{minutes:02d}"
+
+
+def is_admin_id(user_id: Optional[int]) -> bool:
+    if user_id is None:
+        return False
+    try:
+        return int(user_id) in BOT_ADMIN_IDS
+    except Exception:
+        return False
+
+
+def require_admin(msg: Message) -> bool:
+    user = getattr(msg, "from_user", None)
+    user_id = getattr(user, "id", None) if user else None
+    return is_admin_id(user_id)
 
 def setup_logging():
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -214,8 +245,7 @@ DAILY_COORDS_LIMIT = 10
 DAILY_NO_COORDS_LIMIT = 5
 
 
-def has_daily_data_access(chat_id: int) -> Tuple[bool, str]:
-    """Check whether a chat accumulated enough fresh items for export/download."""
+def _daily_item_counts(chat_id: int) -> Tuple[int, int]:
     since = _since_utc_iso(1)
     conn = db_connect()
     try:
@@ -232,14 +262,26 @@ def has_daily_data_access(chat_id: int) -> Tuple[bool, str]:
     finally:
         conn.close()
 
-    with_coords = int(with_coords or 0)
-    without_coords = int(without_coords or 0)
-    allowed = with_coords >= DAILY_COORDS_LIMIT or without_coords >= DAILY_NO_COORDS_LIMIT
+    return int(with_coords or 0), int(without_coords or 0)
+
+
+def has_daily_data_access(chat_id: int, user_id: Optional[int] = None) -> Tuple[bool, str]:
+    """Check whether a chat accumulated enough fresh items for export/download."""
+    with_coords, without_coords = _daily_item_counts(chat_id)
 
     counters = (
         f"с координатами — {with_coords}/{DAILY_COORDS_LIMIT}, "
         f"без координат — {without_coords}/{DAILY_NO_COORDS_LIMIT}"
     )
+
+    if is_admin_id(user_id):
+        text = (
+            "👑 Администратор: лимиты отключены. Доступ к экспорту и скачиванию всегда открыт.\n"
+            f"За последние 24 часа: {counters}."
+        )
+        return True, text
+
+    allowed = with_coords >= DAILY_COORDS_LIMIT or without_coords >= DAILY_NO_COORDS_LIMIT
 
     if allowed:
         text = (
@@ -1243,7 +1285,7 @@ async def cmd_export(msg: Message):
     if msg.chat.type in ("group", "supergroup"):
         await msg.answer("🚫 Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.")
         return
-    allowed, info = has_daily_data_access(msg.chat.id)
+    allowed, info = has_daily_data_access(msg.chat.id, getattr(msg.from_user, "id", None))
     if not allowed:
         await msg.answer(info)
         return
@@ -1259,7 +1301,7 @@ async def on_export_click(cq: CallbackQuery):
     if cq.message.chat.type in ("group", "supergroup"):
         await cq.answer("Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.", show_alert=True)
         return
-    allowed, info = has_daily_data_access(chat_id)
+    allowed, info = has_daily_data_access(chat_id, getattr(cq.from_user, "id", None))
     if not allowed:
         await cq.answer(info, show_alert=True)
         try:
@@ -1568,7 +1610,7 @@ async def cmd_dl_enqueue(msg: Message):
                          "Например: <code>/dl johndoe --max 120 --split-zip-size-mb 45</code>")
         return
 
-    allowed, info = has_daily_data_access(msg.chat.id)
+    allowed, info = has_daily_data_access(msg.chat.id, getattr(msg.from_user, "id", None))
     if not allowed:
         await msg.answer(info)
         return
@@ -1603,6 +1645,101 @@ async def cmd_qstat(msg: Message):
     q = _DL_QUEUE
     size = q.qsize() if q else 0
     await msg.answer(f"📊 В очереди заданий: {size}. Один воркер обрабатывает по одному.")
+
+
+def _format_admin_queue_report() -> str:
+    lines = ["📋 <b>Очередь загрузок</b>"]
+
+    cur = _CURRENT_JOB
+    job = cur.get("job") if isinstance(cur, dict) else None
+    if isinstance(job, DLJob):
+        flag_display = " ".join(job.extra_flags) if job.extra_flags else "—"
+        lines.append(
+            f"▶️ Выполняется #{job.id} — <code>{escape(job.target)}</code> (чат {job.chat_id})"
+        )
+        lines.append(f"   Флаги: <code>{escape(flag_display)}</code>")
+    else:
+        lines.append("▶️ Активных заданий нет.")
+
+    pending_jobs: List[DLJob] = []
+    q = _DL_QUEUE
+    if q:
+        try:
+            raw = list(q._queue)  # type: ignore[attr-defined]
+        except Exception:
+            raw = []
+        for item in raw:
+            if isinstance(item, DLJob):
+                pending_jobs.append(item)
+
+    if pending_jobs:
+        lines.append(f"⏳ В ожидании: {len(pending_jobs)}")
+        for idx, pending in enumerate(pending_jobs, start=1):
+            flag_display = " ".join(pending.extra_flags) if pending.extra_flags else "—"
+            lines.append(
+                f"{idx}. #{pending.id} — <code>{escape(pending.target)}</code> "
+                f"(чат {pending.chat_id}, флаги: <code>{escape(flag_display)}</code>)"
+            )
+    else:
+        lines.append("⏳ Очередь пуста.")
+
+    return "\n".join(lines)
+
+
+def _admin_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Очередь", callback_data="admin:queue")],
+            [InlineKeyboardButton(text="🧮 Лимиты", callback_data="admin:limits")],
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="admin:stats")],
+        ]
+    )
+
+
+@dp.message(Command("admin"))
+async def cmd_admin(msg: Message):
+    if not require_admin(msg):
+        await msg.answer("🚫 Команда доступна только администраторам.")
+        return
+    await msg.answer(
+        "🛠️ <b>Панель администратора</b>\nВыберите действие:",
+        reply_markup=_admin_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("admin:"))
+async def on_admin_click(cq: CallbackQuery):
+    if not is_admin_id(getattr(cq.from_user, "id", None)):
+        await cq.answer("🚫 Недостаточно прав", show_alert=True)
+        return
+
+    action = (cq.data or "").split(":", 1)[1] if ":" in (cq.data or "") else ""
+    chat_id = cq.message.chat.id if cq.message else None
+
+    if action == "queue":
+        text = _format_admin_queue_report()
+        if cq.message:
+            await cq.message.answer(text)
+        await cq.answer("Готово")
+        return
+
+    if action == "limits" and chat_id is not None:
+        _, info = has_daily_data_access(chat_id, getattr(cq.from_user, "id", None))
+        if cq.message:
+            await cq.message.answer(info)
+        await cq.answer("Готово")
+        return
+
+    if action == "stats" and chat_id is not None:
+        ses = get_session(chat_id)
+        stats = get_stats(chat_id, ses.export_scope)
+        text = format_stats_text(stats, ses.export_scope)
+        if cq.message:
+            await cq.message.answer(text)
+        await cq.answer("Готово")
+        return
+
+    await cq.answer("Неизвестная команда", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("cancel:"))
@@ -2027,6 +2164,7 @@ async def cmd_tutorial(msg: Message):
         "5. Если нужно прервать задание или очистить историю текущей сессии, воспользуйтесь <b>/reset</b>.\n\n"
         "Отправляйте текстовые сообщения, подписи к медиа или документы CSV/HTML со ссылками — бот"
         " извлечёт профили автоматически, включая форматированные текстовые ссылки.\n"
+        "Администраторы могут открыть <b>/admin</b>, чтобы управлять очередью, лимитами и статистикой — для них суточные ограничения отключены.\n"
         "Если остались вопросы, загляните в <b>/help</b> или напишите админу чата."
     )
     await msg.answer(text)
@@ -2047,10 +2185,11 @@ async def cmd_help(msg: Message):
         f"• <b>/export</b> — экспорт CSV/галереи или карты (после {DAILY_COORDS_LIMIT} элементов с координатами или {DAILY_NO_COORDS_LIMIT} без координат за сутки)\n"
         "• <b>/stats</b> — статистика по скачанным данным\n"
         "• <b>/reset</b> — очистить текущую сессию\n"
+        "• <b>/admin</b> — панель администратора (для id из BOT_ADMIN_IDS)\n"
         "• <b>/tutorial</b> — пошаговый гайд по использованию\n"
         "• <b>/help</b> — эта справка\n\n"
         f"ℹ️ Экспорт и скачивание доступны, если за последние 24 часа собрано {DAILY_COORDS_LIMIT} элементов с координатами "
-        f"или {DAILY_NO_COORDS_LIMIT} без координат. Лимит обнуляется ежедневно.\n\n"
+        f"или {DAILY_NO_COORDS_LIMIT} без координат. Лимит обнуляется ежедневно; администраторы из BOT_ADMIN_IDS работают без ограничений.\n\n"
         "🔧 <b>Полезные флаги</b>:\n"
         "• <code>--max N</code> — лимит медиа (0 = все)\n"
         "• <code>--split-zip-size-mb N</code> — размер части архива (если включена упаковка)\n"
