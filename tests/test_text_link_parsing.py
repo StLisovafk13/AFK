@@ -70,6 +70,15 @@ def test_text_link_with_emoji_preserves_comment(vsco_module):
     assert pairs == [{"url": "https://vsco.co/anast2010", "comment": "hi"}]
 
 
+def test_text_link_comment_after_space(vsco_module):
+    text = "anast2010 привет"
+    entity = MessageEntity(type="text_link", offset=0, length=9, url="https://vsco.co/anast2010")
+
+    pairs = vsco_module.parse_vsco_pairs_from_message(text, [entity])
+
+    assert pairs == [{"url": "https://vsco.co/anast2010", "comment": "привет"}]
+
+
 class DummyChat:
     def __init__(self, chat_id: int, chat_type: str = "private") -> None:
         self.id = chat_id

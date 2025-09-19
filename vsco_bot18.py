@@ -436,12 +436,17 @@ def _parse_vsco_pairs(text: str) -> List[Dict[str, str]]:
         while j < len(text) and text[j].isspace():
             j += 1
         comment = ""
-        if j < len(text) and text[j] == ',':
-            k = j + 1
-            while k < len(text) and text[k].isspace():
-                k += 1
-            next_start = matches[i+1].start() if i + 1 < len(matches) else len(text)
-            comment = text[k:next_start].strip()
+        next_start = matches[i+1].start() if i + 1 < len(matches) else len(text)
+        if j < len(text):
+            if text[j] == ',':
+                k = j + 1
+                while k < len(text) and text[k].isspace():
+                    k += 1
+                comment_start = k
+            else:
+                comment_start = j
+            if comment_start < next_start:
+                comment = text[comment_start:next_start].strip()
         out.append({"url": url_trimmed, "comment": comment})
     return out
 
