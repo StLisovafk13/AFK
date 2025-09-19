@@ -47,7 +47,7 @@ from aiogram.types import (
     MessageEntity,
 )
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.utils.text_decorations import add_surrogates, remove_surrogates
 import aiohttp
 import sys
@@ -436,12 +436,17 @@ def _parse_vsco_pairs(text: str) -> List[Dict[str, str]]:
         while j < len(text) and text[j].isspace():
             j += 1
         comment = ""
-        if j < len(text) and text[j] == ',':
-            k = j + 1
-            while k < len(text) and text[k].isspace():
-                k += 1
-            next_start = matches[i+1].start() if i + 1 < len(matches) else len(text)
-            comment = text[k:next_start].strip()
+        next_start = matches[i+1].start() if i + 1 < len(matches) else len(text)
+        if j < len(text):
+            if text[j] == ',':
+                k = j + 1
+                while k < len(text) and text[k].isspace():
+                    k += 1
+                comment_start = k
+            else:
+                comment_start = j
+            if comment_start < next_start:
+                comment = text[comment_start:next_start].strip()
         out.append({"url": url_trimmed, "comment": comment})
     return out
 
@@ -2205,6 +2210,37 @@ async def cmd_help(msg: Message):
     await msg.answer(text)
 
 
+async def _start_polling_with_retries(*, max_attempts: Optional[int] = None) -> None:
+    """Start polling and recover from transient Telegram network errors."""
+    delay = 1
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            await dp.start_polling(bot)
+            log.info("Polling finished (attempt %s)", attempt)
+            break
+        except asyncio.CancelledError:
+            raise
+        except TelegramNetworkError as err:
+            if max_attempts is not None and attempt >= max_attempts:
+                log.error(
+                    "Polling aborted after %s attempts due to network error", attempt, exc_info=err
+                )
+                raise
+            log.error(
+                "Polling failed due to network error (attempt %s), retrying in %s seconds",
+                attempt,
+                delay,
+                exc_info=err,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+        except Exception:
+            log.exception("Unhandled error during polling")
+            raise
+
+
 async def main():
     init_db()
     await bot.delete_webhook(drop_pending_updates=True)
@@ -2212,16 +2248,19 @@ async def main():
     global _DL_WORKER_TASK, _DL_QUEUE
     if _DL_QUEUE is None:
         _DL_QUEUE = asyncio.Queue()
-    _DL_WORKER_TASK = asyncio.create_task(_dl_worker())
+    if _DL_WORKER_TASK is None or _DL_WORKER_TASK.done():
+        _DL_WORKER_TASK = asyncio.create_task(_dl_worker())
     # -----------------------------
     log.info("Bot is starting polling…")
     try:
-        await dp.start_polling(bot)
+        await _start_polling_with_retries()
     finally:
         if _DL_WORKER_TASK:
             _DL_WORKER_TASK.cancel()
             with contextlib.suppress(Exception):
                 await _DL_WORKER_TASK
+        with contextlib.suppress(Exception):
+            await bot.session.close()
 if __name__ == "__main__":
     try:
         asyncio.run(main())

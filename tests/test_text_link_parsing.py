@@ -70,6 +70,15 @@ def test_text_link_with_emoji_preserves_comment(vsco_module):
     assert pairs == [{"url": "https://vsco.co/anast2010", "comment": "hi"}]
 
 
+def test_text_link_comment_after_space(vsco_module):
+    text = "anast2010 привет"
+    entity = MessageEntity(type="text_link", offset=0, length=9, url="https://vsco.co/anast2010")
+
+    pairs = vsco_module.parse_vsco_pairs_from_message(text, [entity])
+
+    assert pairs == [{"url": "https://vsco.co/anast2010", "comment": "привет"}]
+
+
 class DummyChat:
     def __init__(self, chat_id: int, chat_type: str = "private") -> None:
         self.id = chat_id
@@ -185,3 +194,26 @@ def test_admin_limits_callback_uses_admin_message(vsco_module):
     text, _ = message.answer_calls[-1]
     assert "Администратор" in text
     assert callback.answer_calls and callback.answer_calls[-1]["text"] == "Готово"
+
+
+def test_polling_retries_after_network_error(monkeypatch, vsco_module):
+    attempts: list[str] = []
+
+    async def fake_start_polling(bot, *args, **kwargs):
+        attempts.append("call")
+        if len(attempts) == 1:
+            raise vsco_module.TelegramNetworkError(method=None, message="timeout")
+
+    monkeypatch.setattr(vsco_module.dp, "start_polling", fake_start_polling)
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(vsco_module.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(vsco_module._start_polling_with_retries(max_attempts=2))
+
+    assert len(attempts) == 2
+    assert sleeps == [1]
