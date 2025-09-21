@@ -1016,8 +1016,22 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
 </html>"""
     return html
 
-def _map_html(title: str, list_html: str, marker_js: List[str]) -> str:
+def _map_html(
+    title: str,
+    list_html: str,
+    marker_js: List[str],
+    stats: Optional[Dict[str, Any]] = None,
+) -> str:
     # Надёжная загрузка Leaflet + MarkerCluster с fallback и инициализацией после DOMContentLoaded
+    stats = stats or {}
+    summary_text = stats.get("summary_text", "")
+    total = int(stats.get("total", 0) or 0)
+    with_coords = int(stats.get("with_coords", 0) or 0)
+    without_coords = int(stats.get("without_coords", max(total - with_coords, 0)))
+    summary_attrs = (
+        f" data-total=\"{total}\" data-withcoords=\"{with_coords}\""
+        f" data-withoutcoords=\"{without_coords}\" data-text=\"{escape(summary_text)}\""
+    )
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -1027,12 +1041,20 @@ def _map_html(title: str, list_html: str, marker_js: List[str]) -> str:
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
   <style>
-    html, body {{ height:100%; margin:0; }}
+    html, body {{ height:100%; margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }}
     .layout {{ display:flex; height:100vh; }}
     #map {{ flex: 1 1 auto; min-height: 320px; }}
-    .panel {{ width: 420px; max-width: 48vw; border-left:1px solid #e5e7eb; background:#fafafa; overflow:auto; }}
-    .panel .head {{ position: sticky; top:0; background:#fff; padding:12px 14px; border-bottom:1px solid #e5e7eb; font-weight:600; }}
-    .panel .row {{ padding:10px 14px; border-bottom:1px dashed #e5e7eb; display:grid; grid-template-columns:auto 80px 1fr; gap:8px; align-items:center; }}
+    .panel {{ width: 420px; max-width: 48vw; border-left:1px solid #e5e7eb; background:#fafafa; overflow:auto; display:flex; flex-direction:column; }}
+    .panel .head {{ position: sticky; top:0; background:#fff; border-bottom:1px solid #e5e7eb; padding:12px 14px 10px; z-index:1; }}
+    .panel .title {{ font-weight:600; margin-bottom:6px; }}
+    .panel .summary {{ font-size:12px; color:#4b5563; margin-bottom:10px; }}
+    .panel .search label {{ display:block; font-size:11px; color:#6b7280; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px; }}
+    .panel .search input {{ width:100%; padding:6px 8px; border:1px solid #d1d5db; border-radius:6px; font-size:14px; }}
+    .panel .rows {{ flex:1 1 auto; }}
+    .panel .row {{ padding:10px 14px; border-bottom:1px dashed #e5e7eb; display:grid; grid-template-columns:auto 80px 1fr; gap:8px; align-items:center; transition:background 0.2s ease; }}
+    .panel .row[data-key] {{ cursor:pointer; }}
+    .panel .row:hover {{ background:#f3f4f6; }}
+    .panel .row.active {{ background:#e0f2fe; box-shadow:inset 0 0 0 1px #bae6fd; }}
     .panel .row .u a {{ font-weight:600; color:#111; text-decoration:none; }}
     .panel .row .c {{ font-size: 13px; color:#111; }}
     .panel .row .ab {{ grid-column:1 / -1; font-size:12px; color:#4b5563; }}
@@ -1047,8 +1069,15 @@ def _map_html(title: str, list_html: str, marker_js: List[str]) -> str:
   <div class="layout">
     <div id="map"></div>
     <div class="panel">
-      <div class="head">Список / превью</div>
-      {list_html}
+      <div class="head">
+        <div class="title">Список / превью</div>
+        <div class="summary" id="summary"{summary_attrs}>{escape(summary_text)}</div>
+        <div class="search">
+          <label for="filter">Поиск</label>
+          <input id="filter" type="search" placeholder="Поиск по нику, комментариям или добавившему" autocomplete="off"/>
+        </div>
+      </div>
+      <div class="rows" id="list">{list_html}</div>
     </div>
   </div>
   <script>
@@ -1069,7 +1098,83 @@ def _map_html(title: str, list_html: str, marker_js: List[str]) -> str:
         loadScript("https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js", next);
       }});
     }}
+    function debounce(fn, delay) {{
+      var timer; return function() {{
+        var ctx=this, args=arguments; clearTimeout(timer);
+        timer=setTimeout(function() {{ fn.apply(ctx,args); }}, delay);
+      }};
+    }}
+    function setupFiltering() {{
+      var input=document.getElementById('filter');
+      var rows=Array.prototype.slice.call(document.querySelectorAll('.panel .row'));
+      var summary=document.getElementById('summary');
+      var baseText = summary ? (summary.dataset.text || summary.textContent || '') : '';
+      var totals = summary ? {{
+        total: parseInt(summary.dataset.total || rows.length, 10) || rows.length,
+        withCoords: parseInt(summary.dataset.withcoords || 0, 10) || 0
+      }} : {{ total: rows.length, withCoords: rows.filter(function(r) {{ return r.dataset.hasCoords==='1'; }}).length }};
+      function applyFilter() {{
+        var q = (input && input.value ? input.value : '').trim().toLowerCase();
+        var visible = [];
+        rows.forEach(function(row) {{
+          var match = !q || (row.dataset.search || '').indexOf(q) !== -1;
+          row.style.display = match ? '' : 'none';
+          if (match) visible.push(row);
+        }});
+        if (summary) {{
+          if (!q) {{
+            summary.textContent = baseText;
+          }} else {{
+            var coordsShown = visible.filter(function(row) {{ return row.dataset.hasCoords === '1'; }}).length;
+            summary.textContent = visible.length + ' из ' + totals.total + ' записей' + ' • С координатами: ' + coordsShown;
+          }}
+        }}
+      }}
+      if (input) {{
+        input.addEventListener('input', debounce(applyFilter, 150));
+      }}
+      applyFilter();
+    }}
+    function setupListInteractions(map, markerByKey) {{
+      var rows=Array.prototype.slice.call(document.querySelectorAll('.panel .row'));
+      var activeRow=null;
+      function activate(row) {{
+        if (activeRow && activeRow!==row) activeRow.classList.remove('active');
+        if (row) {{
+          row.classList.add('active');
+          activeRow = row;
+          try {{ row.scrollIntoView({{ behavior:'smooth', block:'center', inline:'nearest' }}); }} catch (e) {{ row.scrollIntoView({{ block:'center' }}); }}
+        }}
+      }}
+      rows.forEach(function(row) {{
+        var key=row.dataset.key;
+        if (!key || !markerByKey || !markerByKey[key]) return;
+        row.addEventListener('click', function() {{
+          var marker=markerByKey[key];
+          if (marker) {{
+            var latlng = marker.getLatLng && marker.getLatLng();
+            if (latlng) {{
+              var targetZoom = map.getZoom ? Math.max(map.getZoom(), 6) : 6;
+              if (map.flyTo) map.flyTo(latlng, targetZoom); else map.setView(latlng, targetZoom);
+            }}
+            if (marker.openPopup) marker.openPopup();
+          }}
+          activate(row);
+        }});
+      }});
+      if (markerByKey) {{
+        Object.keys(markerByKey).forEach(function(key) {{
+          var marker=markerByKey[key];
+          if (!marker || !marker.on) return;
+          marker.on('click', function() {{
+            var row=document.querySelector('.panel .row[data-key="'+key+'"]');
+            if (row) activate(row);
+          }});
+        }});
+      }}
+    }}
     document.addEventListener('DOMContentLoaded', function() {{
+      setupFiltering();
       ensureLeaflet(function() {{
         ensureCluster(function() {{
           var map=L.map('map');
@@ -1081,12 +1186,22 @@ def _map_html(title: str, list_html: str, marker_js: List[str]) -> str:
   </script>
 </body>
 </html>"""
-
 def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
-    has_coords = any((u.get("lat") is not None and u.get("lon") is not None) for u in users)
-    list_rows = []
-    for u in users:
-        uname = escape(u.get("username","")); link = escape(u.get("profile_url",""))
+    meta: List[Tuple[Dict[str, Any], Optional[float], Optional[float], str, bool]] = []
+    list_rows: List[str] = []
+    for idx, u in enumerate(users):
+        raw_lat = u.get("lat"); raw_lon = u.get("lon")
+        try:
+            lat = float(raw_lat) if raw_lat is not None else None
+            lon = float(raw_lon) if raw_lon is not None else None
+        except (TypeError, ValueError):
+            lat = lon = None
+        has_coord = lat is not None and lon is not None
+        key = f"u{idx}" if has_coord else ""
+        meta.append((u, lat, lon, key, has_coord))
+
+        uname = escape(u.get("username", ""))
+        link = escape(u.get("profile_url", ""))
         cm = u.get("comments") or []
         cm_txt = ""
         if not cm:
@@ -1095,42 +1210,112 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
             head = "".join(f"<li>{escape(x) if x else ''}</li>" for x in cm[:3])
             more = f"<div class='c'>и ещё {len(cm)-3}…</div>" if len(cm) > 3 else ""
             cm_txt = f"<div class='c'><ul>{head}</ul>{more}</div>"
-        added_html = added_by_html(u.get("added_by_raw", ""))
+
+        added_raw = u.get("added_by_raw", "")
+        added_html = added_by_html(added_raw)
         added_block = f"<div class='ab'>Добавил: {added_html or '—'}</div>"
-        list_rows.append(f"""
-          <div class="row">
-            <div class="u"><a href="{link}" target="_blank">@{uname}</a></div>
+
+        search_parts = [str(u.get("username") or "")] + [str(x or "") for x in cm]
+        added_display, _ = added_by_display_and_link(added_raw)
+        if added_display:
+            search_parts.append(added_display)
+        search_text = " ".join(p.strip() for p in search_parts if p).lower()
+
+        attrs = [f"data-has-coords=\"{1 if has_coord else 0}\"", f"data-search=\"{escape(search_text)}\""]
+        if has_coord:
+            attrs.extend(
+                [
+                    f"data-key=\"{key}\"",
+                    f"data-lat=\"{lat:.6f}\"",
+                    f"data-lon=\"{lon:.6f}\"",
+                ]
+            )
+        attr_html = " " + " ".join(attrs)
+        list_rows.append(
+            f"""
+          <div class=\"row\"{attr_html}>
+            <div class=\"u\"><a href=\"{link}\" target=\"_blank\">@{uname}</a></div>
             {cm_txt}
             {added_block}
-          </div>""")
-    list_html = "".join(list_rows)
+          </div>"""
+        )
 
-    marker_js = []
-    if has_coords:
-        marker_js += ["var bounds=L.latLngBounds();","var markers=L.markerClusterGroup();"]
-        for u in users:
-            lat=u.get("lat"); lon=u.get("lon")
-            if lat is None or lon is None: continue
-            uname=escape(str(u.get("username") or "")); prof=escape(str(u.get("profile_url") or ""))
+    list_html = "".join(list_rows)
+    total = len(users)
+    with_coords = sum(1 for _, _, _, _, hc in meta if hc)
+    summary_text = (
+        "Нет данных"
+        if total == 0
+        else f"Пользователи: {total} • С координатами: {with_coords} • Без координат: {total - with_coords}"
+    )
+
+    marker_js: List[str] = []
+    if with_coords:
+        marker_js += [
+            "var bounds=L.latLngBounds();",
+            "var markers=L.markerClusterGroup();",
+            "var markerByKey={};",
+        ]
+        for u, lat, lon, key, has_coord in meta:
+            if not has_coord:
+                continue
+            uname = escape(str(u.get("username") or ""))
+            prof = escape(str(u.get("profile_url") or ""))
             added_html = added_by_html(u.get("added_by_raw", ""))
             if added_html:
-                popup=f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a><br/>Добавил: {added_html}</div>"
+                popup = (
+                    f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a>"
+                    f"<br/>Добавил: {added_html}</div>"
+                )
             else:
-                popup=f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a></div>"
-            marker_js.append(f"var m=L.marker([{lat},{lon}]).bindPopup({popup!r}); markers.addLayer(m); bounds.extend([{lat},{lon}]);")
-        marker_js += ["map.addLayer(markers);","if(bounds.isValid()){{map.fitBounds(bounds.pad(0.1));}}else{{map.setView([20,0],2);}}"]
+                popup = f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a></div>"
+            marker_js.append(
+                f"var m=L.marker([{lat},{lon}]).bindPopup({popup!r}); "
+                f"markers.addLayer(m); bounds.extend([{lat},{lon}]); markerByKey[{key!r}]=m;"
+            )
+        marker_js += [
+            "map.addLayer(markers);",
+            "if(bounds.isValid()){map.fitBounds(bounds.pad(0.1));}else{map.setView([20,0],2);}",
+            "setupListInteractions(map, markerByKey);",
+        ]
     else:
         marker_js.append("map.setView([20,0],2);")
+        marker_js.append("setupListInteractions(map, {});")
 
-    return _map_html(title, list_html, marker_js)
+    return _map_html(
+        title,
+        list_html,
+        marker_js,
+        stats={
+            "summary_text": summary_text,
+            "total": total,
+            "with_coords": with_coords,
+            "without_coords": total - with_coords,
+        },
+    )
 
 def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"):
-    has_coords = any((r.get("lat") is not None and r.get("lon") is not None) for r in items)
-    rows=[]
-    for r in items:
-        uname=escape(r.get("username","")); link=escape(r.get("profile_url",""))
-        img=r.get("image_url") or ""
-        img_html = f"<img src='{escape(img)}' loading='lazy' style='width:68px;height:68px;object-fit:cover;border-radius:8px;border:1px solid #eee;'/>" if img else ""
+    meta: List[Tuple[Dict[str, Any], Optional[float], Optional[float], str, bool]] = []
+    rows: List[str] = []
+    for idx, r in enumerate(items):
+        raw_lat = r.get("lat"); raw_lon = r.get("lon")
+        try:
+            lat = float(raw_lat) if raw_lat is not None else None
+            lon = float(raw_lon) if raw_lon is not None else None
+        except (TypeError, ValueError):
+            lat = lon = None
+        has_coord = lat is not None and lon is not None
+        key = f"i{idx}" if has_coord else ""
+        meta.append((r, lat, lon, key, has_coord))
+
+        uname = escape(r.get("username", ""))
+        link = escape(r.get("profile_url", ""))
+        img = r.get("image_url") or ""
+        thumb_html = (
+            f"<img src='{escape(img)}' loading='lazy' style='width:68px;height:68px;object-fit:cover;border-radius:8px;border:1px solid #eee;'/>"
+            if img
+            else ""
+        )
         cm = r.get("comments") or []
         cm_txt = ""
         if not cm:
@@ -1139,37 +1324,96 @@ def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"
             head = "".join(f"<li>{escape(x) if x else ''}</li>" for x in cm[:2])
             more = f"<div class='c'>и ещё {len(cm)-2}…</div>" if len(cm) > 2 else ""
             cm_txt = f"<div class='c'><ul>{head}</ul>{more}</div>"
-        added_html = added_by_html(r.get("added_by_raw", ""))
+
+        added_raw = r.get("added_by_raw", "")
+        added_html = added_by_html(added_raw)
         added_block = f"<div class='ab'>Добавил: {added_html or '—'}</div>"
-        rows.append(f"""
-          <div class="row">
-            <div class="u"><a href="{link}" target="_blank">@{uname}</a></div>
-            <div class="t">{img_html}</div>
+
+        search_parts = [str(r.get("username") or ""), str(img or "")] + [str(x or "") for x in cm]
+        added_display, _ = added_by_display_and_link(added_raw)
+        if added_display:
+            search_parts.append(added_display)
+        search_text = " ".join(p.strip() for p in search_parts if p).lower()
+
+        attrs = [f"data-has-coords=\"{1 if has_coord else 0}\"", f"data-search=\"{escape(search_text)}\""]
+        if has_coord:
+            attrs.extend(
+                [
+                    f"data-key=\"{key}\"",
+                    f"data-lat=\"{lat:.6f}\"",
+                    f"data-lon=\"{lon:.6f}\"",
+                ]
+            )
+        attr_html = " " + " ".join(attrs)
+        rows.append(
+            f"""
+          <div class=\"row\"{attr_html}>
+            <div class=\"u\"><a href=\"{link}\" target=\"_blank\">@{uname}</a></div>
+            <div class=\"t\">{thumb_html}</div>
             {cm_txt}
             {added_block}
-          </div>""")
-    list_html="".join(rows)
+          </div>"""
+        )
 
-    marker_js=[]
-    if has_coords:
-        marker_js += ["var bounds=L.latLngBounds();","var markers=L.markerClusterGroup();"]
-        for r in items:
-            lat=r.get("lat"); lon=r.get("lon")
-            if lat is None or lon is None: continue
-            uname=escape(str(r.get("username") or "")); prof=escape(str(r.get("profile_url") or ""))
-            img=r.get("image_url") or ""
-            img_html = f"<img src='{escape(img)}' loading='lazy' style='width:140px;height:140px;object-fit:cover;border-radius:10px;border:1px solid #eee;'/>" if img else ""
+    list_html = "".join(rows)
+    total = len(items)
+    with_coords = sum(1 for _, _, _, _, hc in meta if hc)
+    unique_users = len({str(r.get("username") or "") for r in items if r.get("username")})
+    summary_text = (
+        "Нет данных"
+        if total == 0
+        else f"Фотографии: {total} • Пользователи: {unique_users} • С координатами: {with_coords}"
+    )
+
+    marker_js: List[str] = []
+    if with_coords:
+        marker_js += [
+            "var bounds=L.latLngBounds();",
+            "var markers=L.markerClusterGroup();",
+            "var markerByKey={};",
+        ]
+        for r, lat, lon, key, has_coord in meta:
+            if not has_coord:
+                continue
+            uname = escape(str(r.get("username") or ""))
+            prof = escape(str(r.get("profile_url") or ""))
+            img = r.get("image_url") or ""
+            img_html = (
+                f"<img src='{escape(img)}' loading='lazy' style='width:140px;height:140px;object-fit:cover;border-radius:10px;border:1px solid #eee;'/>"
+                if img
+                else ""
+            )
             added_html = added_by_html(r.get("added_by_raw", ""))
             if added_html:
-                popup=f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a><br/>{img_html}<br/>Добавил: {added_html}</div>"
+                popup = (
+                    f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a><br/>{img_html}<br/>Добавил: {added_html}</div>"
+                )
             else:
-                popup=f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a><br/>{img_html}</div>"
-            marker_js.append(f"var m=L.marker([{lat},{lon}]).bindPopup({popup!r}); markers.addLayer(m); bounds.extend([{lat},{lon}]);")
-        marker_js += ["map.addLayer(markers);","if(bounds.isValid()){{map.fitBounds(bounds.pad(0.1));}}else{{map.setView([20,0],2);}}"]
+                popup = f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a><br/>{img_html}</div>"
+            marker_js.append(
+                f"var m=L.marker([{lat},{lon}]).bindPopup({popup!r}); "
+                f"markers.addLayer(m); bounds.extend([{lat},{lon}]); markerByKey[{key!r}]=m;"
+            )
+        marker_js += [
+            "map.addLayer(markers);",
+            "if(bounds.isValid()){map.fitBounds(bounds.pad(0.1));}else{map.setView([20,0],2);}",
+            "setupListInteractions(map, markerByKey);",
+        ]
     else:
         marker_js.append("map.setView([20,0],2);")
+        marker_js.append("setupListInteractions(map, {});")
 
-    return _map_html(title, list_html, marker_js)
+    return _map_html(
+        title,
+        list_html,
+        marker_js,
+        stats={
+            "summary_text": summary_text,
+            "total": total,
+            "with_coords": with_coords,
+            "without_coords": total - with_coords,
+        },
+    )
 
 # ---------------------- Bot ----------------------
 if not TOKEN: raise SystemExit("TELEGRAM_BOT_TOKEN is not set")
