@@ -33,7 +33,7 @@ def test_text_link_message_inserts_profile(vsco_module):
     assert pairs == [{"url": "https://vsco.co/anast2010", "comment": "hi"}]
 
     normalized = asyncio.run(vsco_module.normalize_vsco_pairs(pairs))
-    items_added, comments_added = vsco_module.upsert_items_with_comments(
+    items_added, comments_added, new_links = vsco_module.upsert_items_with_comments(
         chat_id=100,
         pairs=normalized,
         source="text",
@@ -43,6 +43,7 @@ def test_text_link_message_inserts_profile(vsco_module):
 
     assert items_added == 1
     assert comments_added == 1
+    assert new_links == ["https://vsco.co/anast2010"]
 
     conn = vsco_module.db_connect()
     try:
@@ -77,6 +78,61 @@ def test_text_link_comment_after_space(vsco_module):
     pairs = vsco_module.parse_vsco_pairs_from_message(text, [entity])
 
     assert pairs == [{"url": "https://vsco.co/anast2010", "comment": "привет"}]
+
+
+def test_on_text_replies_with_unique_links(vsco_module):
+    msg = DummyMessage(chat_id=123, user_id=555)
+    msg.text = "https://vsco.co/uniqueuser"
+    msg.entities = None
+    msg.from_user.username = "tester"
+
+    asyncio.run(vsco_module.on_text(msg))
+
+    assert msg.answer_calls, "bot should respond with a message"
+    first_text, _ = msg.answer_calls[-1]
+    assert "Новые ссылки" in first_text
+    assert '<a href="https://vsco.co/uniqueuser">https://vsco.co/uniqueuser</a>' in first_text
+
+    msg2 = DummyMessage(chat_id=123, user_id=555)
+    msg2.text = "https://vsco.co/uniqueuser"
+    msg2.entities = None
+    msg2.from_user.username = "tester"
+
+    asyncio.run(vsco_module.on_text(msg2))
+
+    assert msg2.answer_calls, "bot should respond again"
+    second_text, _ = msg2.answer_calls[-1]
+    assert "Новые ссылки" not in second_text
+
+
+def test_insert_full_rows_from_html_returns_new_links(vsco_module):
+    rows = [
+        {
+            "username": "htmluser",
+            "profile_url": "https://vsco.co/htmluser",
+            "image_url": "",
+        }
+    ]
+
+    added, new_links = vsco_module.insert_full_rows_from_html(
+        chat_id=200,
+        rows=rows,
+        source_file="sample.html",
+        added_by="tester",
+    )
+
+    assert added == 1
+    assert new_links == ["https://vsco.co/htmluser"]
+
+    added_again, new_links_again = vsco_module.insert_full_rows_from_html(
+        chat_id=200,
+        rows=rows,
+        source_file="sample.html",
+        added_by="tester",
+    )
+
+    assert added_again == 0
+    assert new_links_again == []
 
 
 class DummyChat:

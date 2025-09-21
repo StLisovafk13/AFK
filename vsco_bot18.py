@@ -497,11 +497,24 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
     return list(uniq.values())
 
 # ---------------------- DB ops ----------------------
-def add_vsco_link_legacy(username: str, url: str, chat_id: int, conn: sqlite3.Connection):
-    conn.execute(
+def add_vsco_link_legacy(username: str, url: str, chat_id: int, conn: sqlite3.Connection) -> bool:
+    cur = conn.execute(
         "INSERT OR IGNORE INTO links(chat_id,username,url,created_at) VALUES(?,?,?,?)",
         (chat_id, username, url, utc_now_iso())
     )
+    return cur.rowcount > 0
+
+
+def format_new_links_block(links: Sequence[str]) -> str:
+    uniq_links = [link for link in dict.fromkeys(links or []) if link]
+    if not uniq_links:
+        return ""
+    html_links = []
+    for link in uniq_links:
+        href = escape(link, quote=True)
+        text = escape(link)
+        html_links.append(f"<a href=\"{href}\">{text}</a>")
+    return "\nНовые ссылки:\n" + "\n".join(html_links)
 
 def _get_item_id(conn: sqlite3.Connection, username: str, profile_url: str, image_url: str) -> Optional[int]:
     row = conn.execute(
@@ -535,10 +548,11 @@ def _insert_item(conn: sqlite3.Connection, chat_id: int, username: str, profile_
     )
     return cur.lastrowid
 
-def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source: str, source_file: Optional[str], added_by: str) -> Tuple[int,int]:
-    if not pairs: return (0,0)
+def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source: str, source_file: Optional[str], added_by: str) -> Tuple[int,int,List[str]]:
+    if not pairs: return (0,0,[])
     conn = db_connect()
     added_items = added_comments = 0
+    new_links: List[str] = []
     try:
         for r in pairs:
             username = (r.get("username") or "").lstrip("@")
@@ -560,16 +574,20 @@ def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source:
                 if conn.total_changes > 0:
                     added_comments += 1
 
-            add_vsco_link_legacy(username, profile_url, chat_id, conn)
+            if add_vsco_link_legacy(username, profile_url, chat_id, conn):
+                new_links.append(profile_url)
 
         conn.commit()
-        return (added_items, added_comments)
+        return (added_items, added_comments, new_links)
     finally:
         conn.close()
 
-def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_file: str, added_by: str) -> int:
-    if not rows: return 0
-    conn = db_connect(); added = 0
+def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_file: str, added_by: str) -> Tuple[int, List[str]]:
+    if not rows:
+        return (0, [])
+    conn = db_connect()
+    added = 0
+    new_links: List[str] = []
     try:
         for r in rows:
             username = (r.get("username") or "").lstrip("@")
@@ -580,14 +598,17 @@ def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_f
             except Exception: lat = None
             try: lon = float(lon) if lon not in ("", None, "None") else None
             except Exception: lon = None
-            if not username or not profile_url: continue
+            if not username or not profile_url:
+                continue
 
             if _get_item_id(conn, username, profile_url, image_url) is None:
                 _insert_item(conn, chat_id, username, profile_url, image_url, lat, lon, "html", source_file, added_by)
                 added += 1
-                add_vsco_link_legacy(username, profile_url, chat_id, conn)
+
+            if add_vsco_link_legacy(username, profile_url, chat_id, conn):
+                new_links.append(profile_url)
         conn.commit()
-        return added
+        return (added, new_links)
     finally:
         conn.close()
 
@@ -1178,19 +1199,20 @@ async def send_file(msg: Message, path: Path, caption: str = ""):
 async def on_document(msg: Message):
     ses = get_session(msg.chat.id)
     found = added_items = added_comments = 0
+    new_links: List[str] = []
     added_by = resolve_added_by(msg.from_user)
 
     if msg.caption:
         pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_message(msg.caption, msg.caption_entities))
         found += len(pairs)
-        ai, ac = upsert_items_with_comments(
+        ai, ac, links = upsert_items_with_comments(
             msg.chat.id,
             pairs,
             source="text",
             source_file="caption",
             added_by=added_by,
         )
-        added_items += ai; added_comments += ac
+        added_items += ai; added_comments += ac; new_links.extend(links)
 
     p = ses.dir / (msg.document.file_name or "file.bin")
     await msg.bot.download(msg.document, destination=p)
@@ -1209,17 +1231,19 @@ async def on_document(msg: Message):
                     pairs.extend(parse_vsco_pairs_from_cell(v))
             pairs = await normalize_vsco_pairs(pairs)
             found += len(pairs)
-            ai, ac = upsert_items_with_comments(
+            ai, ac, links = upsert_items_with_comments(
                 msg.chat.id,
                 pairs,
                 source="csv",
                 source_file=p.name,
                 added_by=added_by,
             )
-            added_items += ai; added_comments += ac
+            added_items += ai; added_comments += ac; new_links.extend(links)
+            links_block = format_new_links_block(new_links)
             await msg.answer(
                 f"CSV загружен: <code>{escape(p.name)}</code>\n"
                 f"Найдено VSCO-ссылок: {found}, добавлено ссылок/медиа: {added_items}, добавлено комментариев: {added_comments}"
+                f"{links_block}"
             )
         except Exception as e:
             log.exception("CSV processing failed")
@@ -1230,15 +1254,38 @@ async def on_document(msg: Message):
         ses.uploaded_html.append(p)
         try:
             rows = dedupe_rows(parse_html_file(p), mode="safe")
-            added_full = insert_full_rows_from_html(msg.chat.id, rows, source_file=p.name, added_by=added_by)
-            extra = f"\n+ из подписи: добавлено {added_items} записей, комментариев {added_comments}" if msg.caption else ""
-            await msg.answer(f"HTML загружен: <code>{escape(p.name)}</code>\nСохранено элементов: {added_full}{extra}")
+            added_full, html_links = insert_full_rows_from_html(
+                msg.chat.id,
+                rows,
+                source_file=p.name,
+                added_by=added_by,
+            )
+            all_links: List[str] = []
+            if msg.caption:
+                all_links.extend(new_links)
+            all_links.extend(html_links)
+            links_block = format_new_links_block(all_links)
+            extra = ""
+            if msg.caption:
+                extra = (
+                    f"\n+ из подписи: добавлено {added_items} записей, комментариев {added_comments}"
+                )
+            await msg.answer(
+                f"HTML загружен: <code>{escape(p.name)}</code>\n"
+                f"Сохранено элементов: {added_full}"
+                f"{extra}"
+                f"{links_block}"
+            )
         except Exception as e:
             log.exception("HTML processing failed")
             await msg.answer(f"HTML загружен: <code>{escape(p.name)}</code>, но не удалось обработать: {escape(str(e))}")
         return
 
-    await msg.answer("Файл сохранён. Нужны .html/.csv. Ссылки из подписи учтены, если были.")
+    links_block = format_new_links_block(new_links) if msg.caption else ""
+    await msg.answer(
+        "Файл сохранён. Нужны .html/.csv. Ссылки из подписи учтены, если были."
+        f"{links_block}"
+    )
 
 # ---------- plain text ----------
 @dp.message(F.text & ~F.text.startswith("/"))
@@ -1247,14 +1294,17 @@ async def on_text(msg: Message):
     if not pairs:
         return  # без ответа
     added_by = resolve_added_by(msg.from_user)
-    ai, ac = upsert_items_with_comments(
+    ai, ac, links = upsert_items_with_comments(
         msg.chat.id,
         pairs,
         source="text",
         source_file="message",
         added_by=added_by,
     )
-    await msg.answer(f"Найдено VSCO-ссылок: {len(pairs)}, добавлено записей: {ai}, комментариев: {ac}")
+    links_block = format_new_links_block(links)
+    await msg.answer(
+        f"Найдено VSCO-ссылок: {len(pairs)}, добавлено записей: {ai}, комментариев: {ac}{links_block}"
+    )
 
 # ---------- export ----------
 def export_scope_keyboard(ses: Session) -> InlineKeyboardMarkup:
