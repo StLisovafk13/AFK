@@ -91,7 +91,7 @@ def test_on_text_replies_with_unique_links(vsco_module):
     assert msg.answer_calls, "bot should respond with a message"
     first_text, _ = msg.answer_calls[-1]
     assert "Новые ссылки" in first_text
-    assert "https://vsco.co/uniqueuser" in first_text
+    assert '<a href="https://vsco.co/uniqueuser">https://vsco.co/uniqueuser</a>' in first_text
 
     msg2 = DummyMessage(chat_id=123, user_id=555)
     msg2.text = "https://vsco.co/uniqueuser"
@@ -103,6 +103,36 @@ def test_on_text_replies_with_unique_links(vsco_module):
     assert msg2.answer_calls, "bot should respond again"
     second_text, _ = msg2.answer_calls[-1]
     assert "Новые ссылки" not in second_text
+
+
+def test_insert_full_rows_from_html_returns_new_links(vsco_module):
+    rows = [
+        {
+            "username": "htmluser",
+            "profile_url": "https://vsco.co/htmluser",
+            "image_url": "",
+        }
+    ]
+
+    added, new_links = vsco_module.insert_full_rows_from_html(
+        chat_id=200,
+        rows=rows,
+        source_file="sample.html",
+        added_by="tester",
+    )
+
+    assert added == 1
+    assert new_links == ["https://vsco.co/htmluser"]
+
+    added_again, new_links_again = vsco_module.insert_full_rows_from_html(
+        chat_id=200,
+        rows=rows,
+        source_file="sample.html",
+        added_by="tester",
+    )
+
+    assert added_again == 0
+    assert new_links_again == []
 
 
 class DummyChat:

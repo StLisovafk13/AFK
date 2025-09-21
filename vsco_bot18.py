@@ -509,7 +509,12 @@ def format_new_links_block(links: Sequence[str]) -> str:
     uniq_links = [link for link in dict.fromkeys(links or []) if link]
     if not uniq_links:
         return ""
-    return "\nНовые ссылки:\n" + "\n".join(f"<code>{escape(link)}</code>" for link in uniq_links)
+    html_links = []
+    for link in uniq_links:
+        href = escape(link, quote=True)
+        text = escape(link)
+        html_links.append(f"<a href=\"{href}\">{text}</a>")
+    return "\nНовые ссылки:\n" + "\n".join(html_links)
 
 def _get_item_id(conn: sqlite3.Connection, username: str, profile_url: str, image_url: str) -> Optional[int]:
     row = conn.execute(
@@ -577,9 +582,12 @@ def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source:
     finally:
         conn.close()
 
-def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_file: str, added_by: str) -> int:
-    if not rows: return 0
-    conn = db_connect(); added = 0
+def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_file: str, added_by: str) -> Tuple[int, List[str]]:
+    if not rows:
+        return (0, [])
+    conn = db_connect()
+    added = 0
+    new_links: List[str] = []
     try:
         for r in rows:
             username = (r.get("username") or "").lstrip("@")
@@ -590,14 +598,17 @@ def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_f
             except Exception: lat = None
             try: lon = float(lon) if lon not in ("", None, "None") else None
             except Exception: lon = None
-            if not username or not profile_url: continue
+            if not username or not profile_url:
+                continue
 
             if _get_item_id(conn, username, profile_url, image_url) is None:
                 _insert_item(conn, chat_id, username, profile_url, image_url, lat, lon, "html", source_file, added_by)
                 added += 1
-                add_vsco_link_legacy(username, profile_url, chat_id, conn)
+
+            if add_vsco_link_legacy(username, profile_url, chat_id, conn):
+                new_links.append(profile_url)
         conn.commit()
-        return added
+        return (added, new_links)
     finally:
         conn.close()
 
@@ -1243,15 +1254,28 @@ async def on_document(msg: Message):
         ses.uploaded_html.append(p)
         try:
             rows = dedupe_rows(parse_html_file(p), mode="safe")
-            added_full = insert_full_rows_from_html(msg.chat.id, rows, source_file=p.name, added_by=added_by)
+            added_full, html_links = insert_full_rows_from_html(
+                msg.chat.id,
+                rows,
+                source_file=p.name,
+                added_by=added_by,
+            )
+            all_links: List[str] = []
+            if msg.caption:
+                all_links.extend(new_links)
+            all_links.extend(html_links)
+            links_block = format_new_links_block(all_links)
             extra = ""
             if msg.caption:
-                links_block = format_new_links_block(new_links)
                 extra = (
                     f"\n+ из подписи: добавлено {added_items} записей, комментариев {added_comments}"
-                    f"{links_block}"
                 )
-            await msg.answer(f"HTML загружен: <code>{escape(p.name)}</code>\nСохранено элементов: {added_full}{extra}")
+            await msg.answer(
+                f"HTML загружен: <code>{escape(p.name)}</code>\n"
+                f"Сохранено элементов: {added_full}"
+                f"{extra}"
+                f"{links_block}"
+            )
         except Exception as e:
             log.exception("HTML processing failed")
             await msg.answer(f"HTML загружен: <code>{escape(p.name)}</code>, но не удалось обработать: {escape(str(e))}")
