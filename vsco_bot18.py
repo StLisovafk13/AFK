@@ -1216,8 +1216,18 @@ def _map_html(
             <input id="filterComment" type="search" placeholder="Фильтр по тексту комментария" autocomplete="off"/>
           </div>
           <div class="field">
+            <label for="filterHasComments">Наличие комментариев</label>
+            <select id="filterHasComments">
+              <option value="">Все</option>
+              <option value="with">Только с комментариями</option>
+              <option value="without">Без комментариев</option>
+            </select>
+          </div>
+          <div class="field">
             <label for="filterAdded">Добавивший</label>
-            <input id="filterAdded" type="search" placeholder="Фильтр по добавившему" autocomplete="off"/>
+            <select id="filterAdded">
+              <option value="">Все добавившие</option>
+            </select>
           </div>
           <div class="field field--button">
             <label>&nbsp;</label>
@@ -1303,7 +1313,8 @@ def _map_html(
       var datasetSelect=document.getElementById('filterData');
       var citySelect=document.getElementById('filterCity');
       var commentInput=document.getElementById('filterComment');
-      var addedInput=document.getElementById('filterAdded');
+      var hasCommentsSelect=document.getElementById('filterHasComments');
+      var addedSelect=document.getElementById('filterAdded');
       var resetBtn=document.getElementById('filtersReset');
       var baseText = summary ? (summary.dataset.text || summary.textContent || '') : '';
       var totals = summary ? {{
@@ -1312,6 +1323,7 @@ def _map_html(
       }} : {{ total: rows.length, withCoords: rows.filter(function(r) {{ return r.dataset.hasCoords==='1'; }}).length }};
       var datasetOptions={{}};
       var cityOptions={{}};
+      var addedOptions={{}};
       var changeHandlers=[];
       var lastKeys=[];
       rows.forEach(function(row) {{
@@ -1319,6 +1331,9 @@ def _map_html(
         row._hasCoords=row.dataset.hasCoords==='1';
         row._commentsText=(row.dataset.comments || '').toString();
         row._addedText=(row.dataset.added || '').toString();
+        row._addedKey=(row.dataset.addedKey || '').toString();
+        row._addedLabel=(row.dataset.addedLabel || '').toString();
+        row._commentsCount=parseInt(row.dataset.commentsCount || '0', 10) || 0;
         row._datasets=parseDatasetList(row.dataset.datasets);
         row._cities=parseJsonArray(row.dataset.cities).map(function(city) {{ return city ? city.toString() : ''; }}).filter(function(city) {{ return !!city; }});
         row._datasets.forEach(function(ds) {{
@@ -1330,9 +1345,13 @@ def _map_html(
         row._cities.forEach(function(city) {{
           if (!cityOptions[city]) cityOptions[city]=city;
         }});
+        if (row._addedKey && !addedOptions[row._addedKey]) {{
+          addedOptions[row._addedKey]=row._addedLabel || row._addedKey;
+        }}
       }});
       fillSelectOptions(datasetSelect, datasetOptions, 'Все данные');
       fillSelectOptions(citySelect, cityOptions, 'Все города');
+      fillSelectOptions(addedSelect, addedOptions, 'Все добавившие');
       function notify(keys) {{
         lastKeys=keys.slice();
         changeHandlers.forEach(function(fn) {{
@@ -1346,7 +1365,8 @@ def _map_html(
         var cityValue=citySelect ? citySelect.value : '';
         var cityValueLower=cityValue ? cityValue.toLowerCase() : '';
         var commentValue=(commentInput && commentInput.value ? commentInput.value : '').trim().toLowerCase();
-        var addedValue=(addedInput && addedInput.value ? addedInput.value : '').trim().toLowerCase();
+        var hasCommentsValue=hasCommentsSelect ? hasCommentsSelect.value : '';
+        var addedKey=(addedSelect && addedSelect.value ? addedSelect.value : '');
         var visible=[];
         var visibleKeys=[];
         rows.forEach(function(row) {{
@@ -1367,8 +1387,13 @@ def _map_html(
           if (match && commentValue) {{
             match=row._commentsText.indexOf(commentValue)!==-1;
           }}
-          if (match && addedValue) {{
-            match=row._addedText.indexOf(addedValue)!==-1;
+          if (match && hasCommentsValue==='with') {{
+            match=row._commentsCount>0;
+          }} else if (match && hasCommentsValue==='without') {{
+            match=row._commentsCount===0;
+          }}
+          if (match && addedKey) {{
+            match=row._addedKey===addedKey;
           }}
           row.style.display = match ? '' : 'none';
           if (match) {{
@@ -1377,7 +1402,7 @@ def _map_html(
           }}
         }});
         if (summary) {{
-          if (!q && !dsValue && !cityValue && !commentValue && !addedValue) {{
+          if (!q && !dsValue && !cityValue && !commentValue && !addedKey && !hasCommentsValue) {{
             summary.textContent = baseText;
           }} else {{
             var coordsShown = visible.filter(function(row) {{ return row._hasCoords; }}).length;
@@ -1389,15 +1414,17 @@ def _map_html(
       var debouncedApply=debounce(applyFilter, 150);
       if (input) input.addEventListener('input', debouncedApply);
       if (commentInput) commentInput.addEventListener('input', debouncedApply);
-      if (addedInput) addedInput.addEventListener('input', debouncedApply);
       if (datasetSelect) datasetSelect.addEventListener('change', applyFilter);
       if (citySelect) citySelect.addEventListener('change', applyFilter);
+      if (addedSelect) addedSelect.addEventListener('change', applyFilter);
+      if (hasCommentsSelect) hasCommentsSelect.addEventListener('change', applyFilter);
       if (resetBtn) resetBtn.addEventListener('click', function() {{
         if (input) input.value='';
         if (datasetSelect) datasetSelect.value='';
         if (citySelect) citySelect.value='';
         if (commentInput) commentInput.value='';
-        if (addedInput) addedInput.value='';
+        if (addedSelect) addedSelect.value='';
+        if (hasCommentsSelect) hasCommentsSelect.value='';
         applyFilter();
       }});
       applyFilter();
@@ -1536,6 +1563,7 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
         uname = escape(u.get("username", ""))
         link = escape(u.get("profile_url", ""))
         cm = u.get("comments") or []
+        comment_count = len(cm)
         cm_txt = ""
         if not cm:
             cm_txt = "<div class='c'>нет комментариев</div>"
@@ -1548,6 +1576,7 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
         added_display, _ = added_by_display_and_link(added_raw)
         added_html = added_by_html(added_raw)
         added_block = f"<div class='ab'>Добавил: {added_html or '—'}</div>"
+        added_key = (added_display or "").strip().lower()
 
         raw_datasets = u.get("datasets") or []
         dataset_payload: List[Dict[str, str]] = []
@@ -1586,6 +1615,9 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
             f"data-added=\"{escape(added_filter_text, quote=True)}\"",
             f"data-cities=\"{escape(json.dumps(raw_cities, ensure_ascii=False), quote=True)}\"",
             f"data-datasets=\"{escape(json.dumps(dataset_payload, ensure_ascii=False), quote=True)}\"",
+            f"data-comments-count=\"{comment_count}\"",
+            f"data-added-key=\"{escape(added_key, quote=True)}\"",
+            f"data-added-label=\"{escape(added_display or '', quote=True)}\"",
         ]
         if has_coord:
             attrs.extend(
@@ -1710,6 +1742,7 @@ def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"
             else ""
         )
         cm = r.get("comments") or []
+        comment_count = len(cm)
         cm_txt = ""
         if not cm:
             cm_txt = "<div class='c'>нет комментариев</div>"
@@ -1722,6 +1755,7 @@ def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"
         added_display, _ = added_by_display_and_link(added_raw)
         added_html = added_by_html(added_raw)
         added_block = f"<div class='ab'>Добавил: {added_html or '—'}</div>"
+        added_key = (added_display or "").strip().lower()
 
         raw_datasets = r.get("datasets") or []
         dataset_payload: List[Dict[str, str]] = []
@@ -1760,6 +1794,9 @@ def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"
             f"data-added=\"{escape(added_filter_text, quote=True)}\"",
             f"data-cities=\"{escape(json.dumps(raw_cities, ensure_ascii=False), quote=True)}\"",
             f"data-datasets=\"{escape(json.dumps(dataset_payload, ensure_ascii=False), quote=True)}\"",
+            f"data-comments-count=\"{comment_count}\"",
+            f"data-added-key=\"{escape(added_key, quote=True)}\"",
+            f"data-added-label=\"{escape(added_display or '', quote=True)}\"",
         ]
         if has_coord:
             attrs.extend(
