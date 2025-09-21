@@ -29,6 +29,11 @@ from html import escape
 from enum import Enum
 
 try:
+    import reverse_geocoder  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    reverse_geocoder = None  # type: ignore
+
+try:
     import pandas as pd  # type: ignore
 except Exception:  # pandas is optional
     pd = None  # type: ignore
@@ -82,6 +87,65 @@ def _parse_admin_ids(raw: str) -> set[int]:
 
 
 BOT_ADMIN_IDS = _parse_admin_ids(os.getenv("BOT_ADMIN_IDS", ""))
+
+_CITY_CACHE: Dict[Tuple[int, int], str] = {}
+
+
+def resolve_city_label(lat: Optional[float], lon: Optional[float]) -> Optional[str]:
+    if lat is None or lon is None:
+        return None
+    try:
+        lat_f = float(lat)
+        lon_f = float(lon)
+    except (TypeError, ValueError):
+        return None
+    key = (int(round(lat_f * 1000)), int(round(lon_f * 1000)))
+    cached = _CITY_CACHE.get(key)
+    if cached is not None:
+        return cached or None
+    label = ""
+    if reverse_geocoder is not None:
+        try:
+            result = reverse_geocoder.search((lat_f, lon_f), mode=1, verbose=False)
+            if result:
+                entry = result[0] or {}
+                name = (entry.get("name") or "").strip()
+                admin1 = (entry.get("admin1") or "").strip()
+                country = (entry.get("cc") or "").strip()
+                parts = [p for p in (name, admin1, country) if p]
+                label = ", ".join(parts)
+        except Exception:
+            label = ""
+    if not label:
+        label = f"{lat_f:.3f}, {lon_f:.3f}"
+    _CITY_CACHE[key] = label
+    return label or None
+
+
+def dataset_token_pairs(source: Optional[str], source_file: Optional[str]) -> List[Tuple[str, str]]:
+    tokens: List[Tuple[str, str]] = []
+    src = (source or "").strip()
+    src_file = (source_file or "").strip()
+    if not src and not src_file:
+        return tokens
+    combined_value = f"{src}|{src_file}"
+    label = ""
+    if src_file:
+        try:
+            path = Path(src_file)
+            label = path.name or src_file
+        except Exception:
+            label = src_file
+    if not label and src:
+        label = src
+    if not label:
+        label = combined_value or "данные"
+    tokens.append((combined_value, label))
+    if src:
+        simple_value = f"{src}|"
+        if simple_value != combined_value or src.lower() != label.lower():
+            tokens.append((simple_value, src))
+    return tokens
 
 LOCAL_TZ = timezone(timedelta(hours=3))
 _LOCAL_TZ_OFFSET = LOCAL_TZ.utcoffset(None) or timedelta()
@@ -737,35 +801,53 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     conn = db_connect(); conn.execute("PRAGMA read_uncommitted=1;")
     if scope == "chat":
         rows = conn.execute(
-            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by FROM items WHERE chat_id=?",
+            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,created_at"
+            " FROM items WHERE chat_id=?",
             (chat_id,),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by FROM items"
+            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,created_at FROM items"
         ).fetchall()
     if not rows:
         conn.close(); return []
 
     groups: Dict[str, Dict[str, Any]] = {}
     ids_by_user: Dict[str,List[int]] = {}
-    for iid, uname, purl, lat, lon, img, added_by in rows:
+    for iid, uname, purl, lat, lon, img, added_by, source, source_file, created_at in rows:
         uname = uname or ""
         g = groups.setdefault(uname, {
             "username": uname, "profile_url": purl or (f"https://vsco.co/{uname}" if uname else ""),
             "lat_sum":0.0, "lon_sum":0.0, "lat_n":0, "lon_n":0,
             "images": set(), "added_by": "",
+            "sources": {}, "cities": set(), "first_at": None, "last_at": None,
         })
         if purl and not g["profile_url"]:
             g["profile_url"] = purl
         if img: g["images"].add(img)
         if lat is not None and lon is not None:
             try:
-                g["lat_sum"] += float(lat); g["lon_sum"] += float(lon)
+                lat_f = float(lat); lon_f = float(lon)
+                g["lat_sum"] += lat_f; g["lon_sum"] += lon_f
                 g["lat_n"] += 1; g["lon_n"] += 1
+                city_label = resolve_city_label(lat_f, lon_f)
+                if city_label:
+                    g["cities"].add(city_label)
             except Exception: pass
         if added_by and not g.get("added_by"):
             g["added_by"] = added_by
+        for token_value, token_label in dataset_token_pairs(source, source_file):
+            if token_value:
+                g["sources"][token_value] = token_label
+        if created_at:
+            try:
+                created_at = str(created_at)
+                if not g["first_at"] or created_at < g["first_at"]:
+                    g["first_at"] = created_at
+                if not g["last_at"] or created_at > g["last_at"]:
+                    g["last_at"] = created_at
+            except Exception:
+                pass
         ids_by_user.setdefault(uname, []).append(iid)
 
     all_ids = [iid for lst in ids_by_user.values() for iid in lst]
@@ -789,6 +871,13 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             u_comments = ded
         raw_added = g.get("added_by", "")
         display, link = added_by_display_and_link(raw_added)
+        sources_dict: Dict[str, str] = g.get("sources", {})  # type: ignore
+        datasets = [
+            {"value": key, "label": sources_dict[key]}
+            for key in sorted(sources_dict.keys(), key=lambda k: (sources_dict[k] or "").lower())
+            if key and sources_dict.get(key)
+        ]
+        city_list = sorted(g.get("cities", []))  # type: ignore
         out.append({
             "username": uname,
             "profile_url": g["profile_url"],
@@ -800,6 +889,10 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "added_by": display,
             "added_by_link": link or "",
             "added_by_raw": raw_added,
+            "datasets": datasets,
+            "cities": city_list,
+            "first_created": g.get("first_at"),
+            "last_created": g.get("last_at"),
         })
     conn.close()
     return out
@@ -808,12 +901,13 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     conn = db_connect(); conn.execute("PRAGMA read_uncommitted=1;")
     if scope == "chat":
         rows = conn.execute(
-            "SELECT id,username,profile_url,image_url,latitude,longitude,added_by FROM items WHERE chat_id=?",
+            "SELECT id,username,profile_url,image_url,latitude,longitude,added_by,source,source_file,created_at"
+            " FROM items WHERE chat_id=?",
             (chat_id,),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id,username,profile_url,image_url,latitude,longitude,added_by FROM items"
+            "SELECT id,username,profile_url,image_url,latitude,longitude,added_by,source,source_file,created_at FROM items"
         ).fetchall()
     if not rows:
         conn.close(); return []
@@ -823,12 +917,17 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     for iid, c in conn.execute(f"SELECT item_id,comment FROM comments WHERE item_id IN ({q}) ORDER BY id ASC", ids):
         comments_map.setdefault(iid, []).append(c)
     out = []
-    for iid, uname, purl, img, lat, lon, added_by in rows:
+    for iid, uname, purl, img, lat, lon, added_by, source, source_file, created_at in rows:
         try: lat = float(lat) if lat not in ("", None, "None") else None
         except Exception: lat = None
         try: lon = float(lon) if lon not in ("", None, "None") else None
         except Exception: lon = None
         display, link = added_by_display_and_link(added_by or "")
+        city_label = resolve_city_label(lat, lon) if lat is not None and lon is not None else None
+        dataset_map = {}
+        for token_value, token_label in dataset_token_pairs(source, source_file):
+            if token_value:
+                dataset_map[token_value] = token_label
         out.append({
             "id": iid,
             "username": uname or "",
@@ -839,6 +938,13 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "added_by": display,
             "added_by_link": link or "",
             "added_by_raw": added_by or "",
+            "datasets": [
+                {"value": key, "label": dataset_map[key]}
+                for key in sorted(dataset_map.keys(), key=lambda k: (dataset_map[k] or "").lower())
+                if key and dataset_map.get(key)
+            ],
+            "cities": [city_label] if city_label else [],
+            "created_at": created_at,
         })
     conn.close()
     return out
@@ -1016,8 +1122,22 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
 </html>"""
     return html
 
-def _map_html(title: str, list_html: str, marker_js: List[str]) -> str:
+def _map_html(
+    title: str,
+    list_html: str,
+    marker_js: List[str],
+    stats: Optional[Dict[str, Any]] = None,
+) -> str:
     # Надёжная загрузка Leaflet + MarkerCluster с fallback и инициализацией после DOMContentLoaded
+    stats = stats or {}
+    summary_text = stats.get("summary_text", "")
+    total = int(stats.get("total", 0) or 0)
+    with_coords = int(stats.get("with_coords", 0) or 0)
+    without_coords = int(stats.get("without_coords", max(total - with_coords, 0)))
+    summary_attrs = (
+        f" data-total=\"{total}\" data-withcoords=\"{with_coords}\""
+        f" data-withoutcoords=\"{without_coords}\" data-text=\"{escape(summary_text)}\""
+    )
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -1027,15 +1147,39 @@ def _map_html(title: str, list_html: str, marker_js: List[str]) -> str:
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
   <style>
-    html, body {{ height:100%; margin:0; }}
+    html, body {{ height:100%; margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }}
     .layout {{ display:flex; height:100vh; }}
     #map {{ flex: 1 1 auto; min-height: 320px; }}
-    .panel {{ width: 420px; max-width: 48vw; border-left:1px solid #e5e7eb; background:#fafafa; overflow:auto; }}
-    .panel .head {{ position: sticky; top:0; background:#fff; padding:12px 14px; border-bottom:1px solid #e5e7eb; font-weight:600; }}
-    .panel .row {{ padding:10px 14px; border-bottom:1px dashed #e5e7eb; display:grid; grid-template-columns:auto 80px 1fr; gap:8px; align-items:center; }}
+    .panel {{ width: 420px; max-width: 48vw; border-left:1px solid #e5e7eb; background:#fafafa; overflow:auto; display:flex; flex-direction:column; }}
+    .panel .head {{ position: sticky; top:0; background:#fff; border-bottom:1px solid #e5e7eb; padding:12px 14px 10px; z-index:1; }}
+    .panel .title {{ font-weight:600; margin-bottom:6px; }}
+    .panel .summary {{ font-size:12px; color:#4b5563; margin-bottom:10px; }}
+    .panel .search label {{ display:block; font-size:11px; color:#6b7280; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px; }}
+    .panel .search input {{ width:100%; padding:6px 8px; border:1px solid #d1d5db; border-radius:6px; font-size:14px; }}
+    .panel .filters {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr)); gap:8px; margin-top:12px; }}
+    .panel .filters .field {{ display:flex; flex-direction:column; gap:4px; font-size:12px; }}
+    .panel .filters .field label {{ color:#6b7280; text-transform:uppercase; letter-spacing:0.05em; font-size:11px; }}
+    .panel .filters .field input,
+    .panel .filters .field select {{ padding:6px 8px; border:1px solid #d1d5db; border-radius:6px; font-size:13px; background:#fff; }}
+    .panel .filters .field--button {{ align-self:end; }}
+    .panel .filters .field--button button {{ padding:6px 8px; border:1px solid #bfdbfe; background:#e0f2fe; color:#1d4ed8; border-radius:6px; font-size:13px; cursor:pointer; }}
+    .panel .filters .field--button button:hover {{ background:#bfdbfe; }}
+    .panel .rows {{ flex:1 1 auto; }}
+    .panel .row {{ padding:10px 14px; border-bottom:1px dashed #e5e7eb; display:grid; grid-template-columns:auto 80px 1fr; gap:8px; align-items:center; transition:background 0.2s ease; }}
+    .panel .row.row-user {{ grid-template-columns: 1fr; }}
+    .panel .row[data-key] {{ cursor:pointer; }}
+    .panel .row:hover {{ background:#f3f4f6; }}
+    .panel .row.active {{ background:#e0f2fe; box-shadow:inset 0 0 0 1px #bae6fd; }}
     .panel .row .u a {{ font-weight:600; color:#111; text-decoration:none; }}
-    .panel .row .c {{ font-size: 13px; color:#111; }}
+    .panel .row .c {{ font-size: 13px; color:#111; grid-column:1 / -1; }}
+    .panel .row .meta {{ grid-column:1 / -1; font-size:11px; color:#4b5563; display:flex; flex-wrap:wrap; gap:6px; margin-top:4px; }}
+    .panel .row .meta .chip {{ display:inline-flex; align-items:center; gap:4px; padding:2px 8px; border-radius:999px; background:#e5e7eb; color:#374151; font-size:11px; font-weight:500; }}
+    .panel .row .meta .chip-city {{ background:#dbeafe; color:#1d4ed8; }}
+    .panel .row .meta .chip-city::before {{ content:"📍"; }}
+    .panel .row .meta .chip-data {{ background:#fef3c7; color:#92400e; }}
+    .panel .row .meta .chip-data::before {{ content:"💾"; }}
     .panel .row .ab {{ grid-column:1 / -1; font-size:12px; color:#4b5563; }}
+    .panel .row.row-user .u {{ grid-column:1 / -1; }}
     @media (max-width: 900px) {{
       .layout {{ flex-direction: column; }}
       .panel {{ width: 100%; max-width: 100%; height: 46vh; }}
@@ -1047,8 +1191,51 @@ def _map_html(title: str, list_html: str, marker_js: List[str]) -> str:
   <div class="layout">
     <div id="map"></div>
     <div class="panel">
-      <div class="head">Список / превью</div>
-      {list_html}
+      <div class="head">
+        <div class="title">Список / превью</div>
+        <div class="summary" id="summary"{summary_attrs}>{escape(summary_text)}</div>
+        <div class="search">
+          <label for="filter">Поиск</label>
+          <input id="filter" type="search" placeholder="Поиск по нику, комментариям или добавившему" autocomplete="off"/>
+        </div>
+        <div class="filters">
+          <div class="field">
+            <label for="filterData">Данные</label>
+            <select id="filterData">
+              <option value="">Все данные</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="filterCity">Город</label>
+            <select id="filterCity">
+              <option value="">Все города</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="filterComment">Комментарий</label>
+            <input id="filterComment" type="search" placeholder="Фильтр по тексту комментария" autocomplete="off"/>
+          </div>
+          <div class="field">
+            <label for="filterHasComments">Наличие комментариев</label>
+            <select id="filterHasComments">
+              <option value="">Все</option>
+              <option value="with">Только с комментариями</option>
+              <option value="without">Без комментариев</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="filterAdded">Добавивший</label>
+            <select id="filterAdded">
+              <option value="">Все добавившие</option>
+            </select>
+          </div>
+          <div class="field field--button">
+            <label>&nbsp;</label>
+            <button id="filtersReset" type="button">Сбросить</button>
+          </div>
+        </div>
+      </div>
+      <div class="rows" id="list">{list_html}</div>
     </div>
   </div>
   <script>
@@ -1069,7 +1256,285 @@ def _map_html(title: str, list_html: str, marker_js: List[str]) -> str:
         loadScript("https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js", next);
       }});
     }}
+    function debounce(fn, delay) {{
+      var timer; return function() {{
+        var ctx=this, args=arguments; clearTimeout(timer);
+        timer=setTimeout(function() {{ fn.apply(ctx,args); }}, delay);
+      }};
+    }}
+    function parseJsonArray(raw) {{
+      if (!raw) return [];
+      try {{
+        var parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : [];
+      }} catch (e) {{
+        return [];
+      }}
+    }}
+    function parseDatasetList(raw) {{
+      var result = [];
+      var arr = parseJsonArray(raw);
+      arr.forEach(function(entry) {{
+        if (!entry) return;
+        if (typeof entry === 'string') {{
+          result.push({{ value: entry, label: entry }});
+        }} else if (typeof entry === 'object') {{
+          var value = (entry.value || entry.label || '').toString();
+          if (!value) return;
+          result.push({{ value: value, label: (entry.label || value).toString() }});
+        }}
+      }});
+      return result;
+    }}
+    function fillSelectOptions(select, options, placeholder) {{
+      if (!select) return;
+      var frag=document.createDocumentFragment();
+      var optAll=document.createElement('option');
+      optAll.value='';
+      optAll.textContent=placeholder || 'Все';
+      frag.appendChild(optAll);
+      Object.keys(options).sort(function(a,b) {{
+        var labelA=(options[a]||'').toString();
+        var labelB=(options[b]||'').toString();
+        return labelA.localeCompare(labelB, undefined, {{ sensitivity:'accent' }});
+      }}).forEach(function(value) {{
+        var opt=document.createElement('option');
+        opt.value=value;
+        opt.textContent=options[value];
+        frag.appendChild(opt);
+      }});
+      select.innerHTML='';
+      select.appendChild(frag);
+    }}
+    function setupFiltering() {{
+      var rows=Array.prototype.slice.call(document.querySelectorAll('.panel .row'));
+      var summary=document.getElementById('summary');
+      var input=document.getElementById('filter');
+      var datasetSelect=document.getElementById('filterData');
+      var citySelect=document.getElementById('filterCity');
+      var commentInput=document.getElementById('filterComment');
+      var hasCommentsSelect=document.getElementById('filterHasComments');
+      var addedSelect=document.getElementById('filterAdded');
+      var resetBtn=document.getElementById('filtersReset');
+      var baseText = summary ? (summary.dataset.text || summary.textContent || '') : '';
+      var totals = summary ? {{
+        total: parseInt(summary.dataset.total || rows.length, 10) || rows.length,
+        withCoords: parseInt(summary.dataset.withcoords || 0, 10) || 0
+      }} : {{ total: rows.length, withCoords: rows.filter(function(r) {{ return r.dataset.hasCoords==='1'; }}).length }};
+      var datasetOptions={{}};
+      var cityOptions={{}};
+      var addedOptions={{}};
+      var changeHandlers=[];
+      var lastKeys=[];
+      rows.forEach(function(row) {{
+        row._searchText=(row.dataset.search || '').toString();
+        row._hasCoords=row.dataset.hasCoords==='1';
+        row._commentsText=(row.dataset.comments || '').toString();
+        row._addedText=(row.dataset.added || '').toString();
+        row._addedKey=(row.dataset.addedKey || '').toString();
+        row._addedLabel=(row.dataset.addedLabel || '').toString();
+        row._commentsCount=parseInt(row.dataset.commentsCount || '0', 10) || 0;
+        row._datasets=parseDatasetList(row.dataset.datasets);
+        row._cities=parseJsonArray(row.dataset.cities).map(function(city) {{ return city ? city.toString() : ''; }}).filter(function(city) {{ return !!city; }});
+        row._datasets.forEach(function(ds) {{
+          var value=(ds.value || '').toString();
+          if (!value) return;
+          var label=(ds.label || value).toString();
+          if (!datasetOptions[value]) datasetOptions[value]=label;
+        }});
+        row._cities.forEach(function(city) {{
+          if (!cityOptions[city]) cityOptions[city]=city;
+        }});
+        if (row._addedKey && !addedOptions[row._addedKey]) {{
+          addedOptions[row._addedKey]=row._addedLabel || row._addedKey;
+        }}
+      }});
+      fillSelectOptions(datasetSelect, datasetOptions, 'Все данные');
+      fillSelectOptions(citySelect, cityOptions, 'Все города');
+      fillSelectOptions(addedSelect, addedOptions, 'Все добавившие');
+      function notify(keys) {{
+        lastKeys=keys.slice();
+        changeHandlers.forEach(function(fn) {{
+          try {{ fn(keys.slice()); }} catch (e) {{}}
+        }});
+      }}
+      function applyFilter() {{
+        var q=(input && input.value ? input.value : '').trim().toLowerCase();
+        var dsValue=datasetSelect ? datasetSelect.value : '';
+        var dsValueLower=dsValue ? dsValue.toLowerCase() : '';
+        var cityValue=citySelect ? citySelect.value : '';
+        var cityValueLower=cityValue ? cityValue.toLowerCase() : '';
+        var commentValue=(commentInput && commentInput.value ? commentInput.value : '').trim().toLowerCase();
+        var hasCommentsValue=hasCommentsSelect ? hasCommentsSelect.value : '';
+        var addedKey=(addedSelect && addedSelect.value ? addedSelect.value : '');
+        var visible=[];
+        var visibleKeys=[];
+        rows.forEach(function(row) {{
+          var match=true;
+          if (match && q && row._searchText.indexOf(q)===-1) match=false;
+          if (match && dsValue) {{
+            match=row._datasets && row._datasets.some(function(ds) {{
+              var val=(ds.value || '').toString().toLowerCase();
+              var label=(ds.label || '').toString().toLowerCase();
+              return val===dsValueLower || label===dsValueLower;
+            }});
+          }}
+          if (match && cityValue) {{
+            match=row._cities && row._cities.some(function(city) {{
+              return city.toLowerCase()===cityValueLower;
+            }});
+          }}
+          if (match && commentValue) {{
+            match=row._commentsText.indexOf(commentValue)!==-1;
+          }}
+          if (match && hasCommentsValue==='with') {{
+            match=row._commentsCount>0;
+          }} else if (match && hasCommentsValue==='without') {{
+            match=row._commentsCount===0;
+          }}
+          if (match && addedKey) {{
+            match=row._addedKey===addedKey;
+          }}
+          row.style.display = match ? '' : 'none';
+          if (match) {{
+            visible.push(row);
+            if (row.dataset.key) visibleKeys.push(row.dataset.key);
+          }}
+        }});
+        if (summary) {{
+          if (!q && !dsValue && !cityValue && !commentValue && !addedKey && !hasCommentsValue) {{
+            summary.textContent = baseText;
+          }} else {{
+            var coordsShown = visible.filter(function(row) {{ return row._hasCoords; }}).length;
+            summary.textContent = visible.length + ' из ' + totals.total + ' записей' + ' • С координатами: ' + coordsShown;
+          }}
+        }}
+        notify(visibleKeys);
+      }}
+      var debouncedApply=debounce(applyFilter, 150);
+      if (input) input.addEventListener('input', debouncedApply);
+      if (commentInput) commentInput.addEventListener('input', debouncedApply);
+      if (datasetSelect) datasetSelect.addEventListener('change', applyFilter);
+      if (citySelect) citySelect.addEventListener('change', applyFilter);
+      if (addedSelect) addedSelect.addEventListener('change', applyFilter);
+      if (hasCommentsSelect) hasCommentsSelect.addEventListener('change', applyFilter);
+      if (resetBtn) resetBtn.addEventListener('click', function() {{
+        if (input) input.value='';
+        if (datasetSelect) datasetSelect.value='';
+        if (citySelect) citySelect.value='';
+        if (commentInput) commentInput.value='';
+        if (addedSelect) addedSelect.value='';
+        if (hasCommentsSelect) hasCommentsSelect.value='';
+        applyFilter();
+      }});
+      applyFilter();
+      return {{
+        onChange: function(handler) {{
+          if (typeof handler === 'function') {{
+            changeHandlers.push(handler);
+            handler(lastKeys.slice());
+          }}
+        }},
+        refresh: applyFilter
+      }};
+    }}
+    function setupListInteractions(map, markerByKey, clusterGroup, filteringState) {{
+      var rows=Array.prototype.slice.call(document.querySelectorAll('.panel .row'));
+      var activeRow=null;
+      var TARGET_ZOOM=15;
+      function activate(row) {{
+        if (activeRow && activeRow!==row) activeRow.classList.remove('active');
+        if (row) {{
+          row.classList.add('active');
+          activeRow = row;
+          try {{ row.scrollIntoView({{ behavior:'smooth', block:'center', inline:'nearest' }}); }} catch (e) {{ row.scrollIntoView({{ block:'center' }}); }}
+        }}
+      }}
+      function focusMarker(marker) {{
+        if (!map || !marker) return;
+        var finalize=function() {{
+          var latlng = marker.getLatLng && marker.getLatLng();
+          if (latlng) {{
+            var zoom = map.getZoom ? map.getZoom() : TARGET_ZOOM;
+            if (typeof zoom !== 'number' || zoom < TARGET_ZOOM) zoom = TARGET_ZOOM;
+            if (map.flyTo) map.flyTo(latlng, zoom); else map.setView(latlng, zoom);
+          }}
+          if (marker.openPopup) marker.openPopup();
+        }};
+        if (clusterGroup && clusterGroup.hasLayer && !clusterGroup.hasLayer(marker)) {{
+          clusterGroup.addLayer(marker);
+        }}
+        if (clusterGroup && clusterGroup.zoomToShowLayer) {{
+          clusterGroup.zoomToShowLayer(marker, finalize);
+        }} else {{
+          finalize();
+        }}
+      }}
+      rows.forEach(function(row) {{
+        var key=row.dataset.key;
+        if (!key || !markerByKey || !markerByKey[key]) return;
+        row.addEventListener('click', function() {{
+          focusMarker(markerByKey[key]);
+          activate(row);
+        }});
+      }});
+      if (markerByKey) {{
+        Object.keys(markerByKey).forEach(function(key) {{
+          var marker=markerByKey[key];
+          if (!marker || !marker.on) return;
+          marker.on('click', function() {{
+            focusMarker(marker);
+            var row=document.querySelector('.panel .row[data-key="'+key+'"]');
+            if (row) activate(row);
+          }});
+        }});
+      }}
+      if (filteringState && filteringState.onChange) {{
+        filteringState.onChange(function() {{
+          if (activeRow && activeRow.style.display==='none') {{
+            activeRow.classList.remove('active');
+            activeRow=null;
+          }}
+        }});
+      }}
+    }}
+    function bindFilteringToMarkers(filteringState, map, clusterGroup, markerByKey) {{
+      if (!filteringState || !filteringState.onChange) return;
+      filteringState.onChange(function(visibleKeys) {{
+        if (!markerByKey) return;
+        var visibleSet={{}};
+        (visibleKeys || []).forEach(function(key) {{
+          if (key) visibleSet[key]=true;
+        }});
+        if (clusterGroup && clusterGroup.hasLayer) {{
+          Object.keys(markerByKey).forEach(function(key) {{
+            var marker=markerByKey[key];
+            if (!marker) return;
+            var shouldShow=!!visibleSet[key];
+            var hasLayer=clusterGroup.hasLayer(marker);
+            if (shouldShow && !hasLayer) {{
+              clusterGroup.addLayer(marker);
+            }} else if (!shouldShow && hasLayer) {{
+              clusterGroup.removeLayer(marker);
+            }}
+          }});
+        }} else if (map && map.addLayer && map.removeLayer) {{
+          Object.keys(markerByKey).forEach(function(key) {{
+            var marker=markerByKey[key];
+            if (!marker) return;
+            var shouldShow=!!visibleSet[key];
+            var onMap=map.hasLayer ? map.hasLayer(marker) : false;
+            if (shouldShow && !onMap) {{
+              map.addLayer(marker);
+            }} else if (!shouldShow && onMap) {{
+              map.removeLayer(marker);
+            }}
+          }});
+        }}
+      }});
+    }}
     document.addEventListener('DOMContentLoaded', function() {{
+      var filteringState = setupFiltering();
       ensureLeaflet(function() {{
         ensureCluster(function() {{
           var map=L.map('map');
@@ -1081,13 +1546,24 @@ def _map_html(title: str, list_html: str, marker_js: List[str]) -> str:
   </script>
 </body>
 </html>"""
-
 def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
-    has_coords = any((u.get("lat") is not None and u.get("lon") is not None) for u in users)
-    list_rows = []
-    for u in users:
-        uname = escape(u.get("username","")); link = escape(u.get("profile_url",""))
+    meta: List[Tuple[Dict[str, Any], Optional[float], Optional[float], str, bool]] = []
+    list_rows: List[str] = []
+    for idx, u in enumerate(users):
+        raw_lat = u.get("lat"); raw_lon = u.get("lon")
+        try:
+            lat = float(raw_lat) if raw_lat is not None else None
+            lon = float(raw_lon) if raw_lon is not None else None
+        except (TypeError, ValueError):
+            lat = lon = None
+        has_coord = lat is not None and lon is not None
+        key = f"u{idx}" if has_coord else ""
+        meta.append((u, lat, lon, key, has_coord))
+
+        uname = escape(u.get("username", ""))
+        link = escape(u.get("profile_url", ""))
         cm = u.get("comments") or []
+        comment_count = len(cm)
         cm_txt = ""
         if not cm:
             cm_txt = "<div class='c'>нет комментариев</div>"
@@ -1095,43 +1571,178 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
             head = "".join(f"<li>{escape(x) if x else ''}</li>" for x in cm[:3])
             more = f"<div class='c'>и ещё {len(cm)-3}…</div>" if len(cm) > 3 else ""
             cm_txt = f"<div class='c'><ul>{head}</ul>{more}</div>"
-        added_html = added_by_html(u.get("added_by_raw", ""))
+
+        added_raw = u.get("added_by_raw", "")
+        added_display, _ = added_by_display_and_link(added_raw)
+        added_html = added_by_html(added_raw)
         added_block = f"<div class='ab'>Добавил: {added_html or '—'}</div>"
-        list_rows.append(f"""
-          <div class="row">
-            <div class="u"><a href="{link}" target="_blank">@{uname}</a></div>
+        added_key = (added_display or "").strip().lower()
+
+        raw_datasets = u.get("datasets") or []
+        dataset_payload: List[Dict[str, str]] = []
+        dataset_labels: List[str] = []
+        seen_dataset: set[str] = set()
+        for entry in raw_datasets:
+            if isinstance(entry, dict):
+                value = str(entry.get("value") or "")
+                label = str(entry.get("label") or value)
+            else:
+                value = str(entry or "")
+                label = value
+            if not value or value in seen_dataset:
+                continue
+            seen_dataset.add(value)
+            dataset_labels.append(label)
+            dataset_payload.append({"value": value, "label": label})
+
+        raw_cities = [str(city) for city in (u.get("cities") or []) if city]
+
+        search_parts = [str(u.get("username") or "")]
+        search_parts.extend(str(x or "") for x in cm)
+        if added_display:
+            search_parts.append(added_display)
+        search_parts.extend(dataset_labels)
+        search_parts.extend(raw_cities)
+        search_text = " ".join(p.strip() for p in search_parts if p).lower()
+
+        comment_filter_text = " ".join(str(x or "") for x in cm).lower()
+        added_filter_text = (added_display or "").lower()
+
+        attrs = [
+            f"data-has-coords=\"{1 if has_coord else 0}\"",
+            f"data-search=\"{escape(search_text, quote=True)}\"",
+            f"data-comments=\"{escape(comment_filter_text, quote=True)}\"",
+            f"data-added=\"{escape(added_filter_text, quote=True)}\"",
+            f"data-cities=\"{escape(json.dumps(raw_cities, ensure_ascii=False), quote=True)}\"",
+            f"data-datasets=\"{escape(json.dumps(dataset_payload, ensure_ascii=False), quote=True)}\"",
+            f"data-comments-count=\"{comment_count}\"",
+            f"data-added-key=\"{escape(added_key, quote=True)}\"",
+            f"data-added-label=\"{escape(added_display or '', quote=True)}\"",
+        ]
+        if has_coord:
+            attrs.extend(
+                [
+                    f"data-key=\"{key}\"",
+                    f"data-lat=\"{lat:.6f}\"",
+                    f"data-lon=\"{lon:.6f}\"",
+                ]
+            )
+        meta_chips: List[str] = []
+        for city in raw_cities[:3]:
+            meta_chips.append(f"<span class='chip chip-city'>{escape(city)}</span>")
+        for label in dataset_labels[:3]:
+            meta_chips.append(f"<span class='chip chip-data'>{escape(label)}</span>")
+        meta_block = f"<div class='meta'>{''.join(meta_chips)}</div>" if meta_chips else ""
+
+        attr_html = " " + " ".join(attrs)
+        list_rows.append(
+            f"""
+          <div class=\"row row-user\"{attr_html}>
+            <div class=\"u\"><a href=\"{link}\" target=\"_blank\">@{uname}</a></div>
+            {meta_block}
             {cm_txt}
             {added_block}
-          </div>""")
-    list_html = "".join(list_rows)
+          </div>"""
+        )
 
-    marker_js = []
-    if has_coords:
-        marker_js += ["var bounds=L.latLngBounds();","var markers=L.markerClusterGroup();"]
-        for u in users:
-            lat=u.get("lat"); lon=u.get("lon")
-            if lat is None or lon is None: continue
-            uname=escape(str(u.get("username") or "")); prof=escape(str(u.get("profile_url") or ""))
+    list_html = "".join(list_rows)
+    total = len(users)
+    with_coords = sum(1 for _, _, _, _, hc in meta if hc)
+    summary_text = (
+        "Нет данных"
+        if total == 0
+        else f"Пользователи: {total} • С координатами: {with_coords} • Без координат: {total - with_coords}"
+    )
+
+    marker_js: List[str] = []
+    if with_coords:
+        marker_js += [
+            "var bounds=L.latLngBounds();",
+            "var markers=L.markerClusterGroup();",
+            "var markerByKey={};",
+        ]
+        for u, lat, lon, key, has_coord in meta:
+            if not has_coord:
+                continue
+            uname = escape(str(u.get("username") or ""))
+            prof = escape(str(u.get("profile_url") or ""))
             added_html = added_by_html(u.get("added_by_raw", ""))
+            city_values: List[str] = []
+            for city in u.get("cities") or []:
+                text = str(city)
+                if text:
+                    city_values.append(escape(text))
+            dataset_labels_marker: List[str] = []
+            seen_dataset_labels: set[str] = set()
+            for entry in u.get("datasets") or []:
+                if isinstance(entry, dict):
+                    label = str(entry.get("label") or entry.get("value") or "")
+                else:
+                    label = str(entry or "")
+                if not label or label in seen_dataset_labels:
+                    continue
+                seen_dataset_labels.add(label)
+                dataset_labels_marker.append(escape(label))
+            parts = [f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a>"]
+            if city_values:
+                parts.append("<br/>📍 " + ", ".join(city_values[:3]))
+            if dataset_labels_marker:
+                parts.append("<br/>💾 " + ", ".join(dataset_labels_marker[:3]))
             if added_html:
-                popup=f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a><br/>Добавил: {added_html}</div>"
-            else:
-                popup=f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a></div>"
-            marker_js.append(f"var m=L.marker([{lat},{lon}]).bindPopup({popup!r}); markers.addLayer(m); bounds.extend([{lat},{lon}]);")
-        marker_js += ["map.addLayer(markers);","if(bounds.isValid()){{map.fitBounds(bounds.pad(0.1));}}else{{map.setView([20,0],2);}}"]
+                parts.append(f"<br/>Добавил: {added_html}")
+            parts.append("</div>")
+            popup = "".join(parts)
+            marker_js.append(
+                f"var m=L.marker([{lat},{lon}]).bindPopup({popup!r}); "
+                f"markers.addLayer(m); bounds.extend([{lat},{lon}]); markerByKey[{key!r}]=m;",
+            )
+        marker_js += [
+            "map.addLayer(markers);",
+            "if(bounds.isValid()){map.fitBounds(bounds.pad(0.1));}else{map.setView([20,0],2);}",
+            "setupListInteractions(map, markerByKey, markers, filteringState);",
+            "bindFilteringToMarkers(filteringState, map, markers, markerByKey);",
+        ]
     else:
         marker_js.append("map.setView([20,0],2);")
+        marker_js.append("setupListInteractions(map, {}, null, filteringState);")
+        marker_js.append("bindFilteringToMarkers(filteringState, map, null, {});")
 
-    return _map_html(title, list_html, marker_js)
+    return _map_html(
+        title,
+        list_html,
+        marker_js,
+        stats={
+            "summary_text": summary_text,
+            "total": total,
+            "with_coords": with_coords,
+            "without_coords": total - with_coords,
+        },
+    )
 
 def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"):
-    has_coords = any((r.get("lat") is not None and r.get("lon") is not None) for r in items)
-    rows=[]
-    for r in items:
-        uname=escape(r.get("username","")); link=escape(r.get("profile_url",""))
-        img=r.get("image_url") or ""
-        img_html = f"<img src='{escape(img)}' loading='lazy' style='width:68px;height:68px;object-fit:cover;border-radius:8px;border:1px solid #eee;'/>" if img else ""
+    meta: List[Tuple[Dict[str, Any], Optional[float], Optional[float], str, bool]] = []
+    rows: List[str] = []
+    for idx, r in enumerate(items):
+        raw_lat = r.get("lat"); raw_lon = r.get("lon")
+        try:
+            lat = float(raw_lat) if raw_lat is not None else None
+            lon = float(raw_lon) if raw_lon is not None else None
+        except (TypeError, ValueError):
+            lat = lon = None
+        has_coord = lat is not None and lon is not None
+        key = f"i{idx}" if has_coord else ""
+        meta.append((r, lat, lon, key, has_coord))
+
+        uname = escape(r.get("username", ""))
+        link = escape(r.get("profile_url", ""))
+        img = r.get("image_url") or ""
+        thumb_html = (
+            f"<img src='{escape(img)}' loading='lazy' style='width:68px;height:68px;object-fit:cover;border-radius:8px;border:1px solid #eee;'/>"
+            if img
+            else ""
+        )
         cm = r.get("comments") or []
+        comment_count = len(cm)
         cm_txt = ""
         if not cm:
             cm_txt = "<div class='c'>нет комментариев</div>"
@@ -1139,37 +1750,163 @@ def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"
             head = "".join(f"<li>{escape(x) if x else ''}</li>" for x in cm[:2])
             more = f"<div class='c'>и ещё {len(cm)-2}…</div>" if len(cm) > 2 else ""
             cm_txt = f"<div class='c'><ul>{head}</ul>{more}</div>"
-        added_html = added_by_html(r.get("added_by_raw", ""))
+
+        added_raw = r.get("added_by_raw", "")
+        added_display, _ = added_by_display_and_link(added_raw)
+        added_html = added_by_html(added_raw)
         added_block = f"<div class='ab'>Добавил: {added_html or '—'}</div>"
-        rows.append(f"""
-          <div class="row">
-            <div class="u"><a href="{link}" target="_blank">@{uname}</a></div>
-            <div class="t">{img_html}</div>
+        added_key = (added_display or "").strip().lower()
+
+        raw_datasets = r.get("datasets") or []
+        dataset_payload: List[Dict[str, str]] = []
+        dataset_labels: List[str] = []
+        seen_dataset: set[str] = set()
+        for entry in raw_datasets:
+            if isinstance(entry, dict):
+                value = str(entry.get("value") or "")
+                label = str(entry.get("label") or value)
+            else:
+                value = str(entry or "")
+                label = value
+            if not value or value in seen_dataset:
+                continue
+            seen_dataset.add(value)
+            dataset_labels.append(label)
+            dataset_payload.append({"value": value, "label": label})
+
+        raw_cities = [str(city) for city in (r.get("cities") or []) if city]
+
+        search_parts = [str(r.get("username") or ""), str(img or "")]
+        search_parts.extend(str(x or "") for x in cm)
+        if added_display:
+            search_parts.append(added_display)
+        search_parts.extend(dataset_labels)
+        search_parts.extend(raw_cities)
+        search_text = " ".join(p.strip() for p in search_parts if p).lower()
+
+        comment_filter_text = " ".join(str(x or "") for x in cm).lower()
+        added_filter_text = (added_display or "").lower()
+
+        attrs = [
+            f"data-has-coords=\"{1 if has_coord else 0}\"",
+            f"data-search=\"{escape(search_text, quote=True)}\"",
+            f"data-comments=\"{escape(comment_filter_text, quote=True)}\"",
+            f"data-added=\"{escape(added_filter_text, quote=True)}\"",
+            f"data-cities=\"{escape(json.dumps(raw_cities, ensure_ascii=False), quote=True)}\"",
+            f"data-datasets=\"{escape(json.dumps(dataset_payload, ensure_ascii=False), quote=True)}\"",
+            f"data-comments-count=\"{comment_count}\"",
+            f"data-added-key=\"{escape(added_key, quote=True)}\"",
+            f"data-added-label=\"{escape(added_display or '', quote=True)}\"",
+        ]
+        if has_coord:
+            attrs.extend(
+                [
+                    f"data-key=\"{key}\"",
+                    f"data-lat=\"{lat:.6f}\"",
+                    f"data-lon=\"{lon:.6f}\"",
+                ]
+            )
+        meta_chips: List[str] = []
+        for city in raw_cities[:3]:
+            meta_chips.append(f"<span class='chip chip-city'>{escape(city)}</span>")
+        for label in dataset_labels[:3]:
+            meta_chips.append(f"<span class='chip chip-data'>{escape(label)}</span>")
+        meta_block = f"<div class='meta'>{''.join(meta_chips)}</div>" if meta_chips else ""
+
+        attr_html = " " + " ".join(attrs)
+        rows.append(
+            f"""
+          <div class=\"row row-image\"{attr_html}>
+            <div class=\"u\"><a href=\"{link}\" target=\"_blank\">@{uname}</a></div>
+            <div class=\"t\">{thumb_html}</div>
+            {meta_block}
             {cm_txt}
             {added_block}
-          </div>""")
-    list_html="".join(rows)
+          </div>"""
+        )
 
-    marker_js=[]
-    if has_coords:
-        marker_js += ["var bounds=L.latLngBounds();","var markers=L.markerClusterGroup();"]
-        for r in items:
-            lat=r.get("lat"); lon=r.get("lon")
-            if lat is None or lon is None: continue
-            uname=escape(str(r.get("username") or "")); prof=escape(str(r.get("profile_url") or ""))
-            img=r.get("image_url") or ""
-            img_html = f"<img src='{escape(img)}' loading='lazy' style='width:140px;height:140px;object-fit:cover;border-radius:10px;border:1px solid #eee;'/>" if img else ""
+    list_html = "".join(rows)
+    total = len(items)
+    with_coords = sum(1 for _, _, _, _, hc in meta if hc)
+    unique_users = len({str(r.get("username") or "") for r in items if r.get("username")})
+    summary_text = (
+        "Нет данных"
+        if total == 0
+        else f"Фотографии: {total} • Пользователи: {unique_users} • С координатами: {with_coords}"
+    )
+
+    marker_js: List[str] = []
+    if with_coords:
+        marker_js += [
+            "var bounds=L.latLngBounds();",
+            "var markers=L.markerClusterGroup();",
+            "var markerByKey={};",
+        ]
+        for r, lat, lon, key, has_coord in meta:
+            if not has_coord:
+                continue
+            uname = escape(str(r.get("username") or ""))
+            prof = escape(str(r.get("profile_url") or ""))
+            img = r.get("image_url") or ""
+            img_html = (
+                f"<img src='{escape(img)}' loading='lazy' style='width:140px;height:140px;object-fit:cover;border-radius:10px;border:1px solid #eee;'/>"
+                if img
+                else ""
+            )
             added_html = added_by_html(r.get("added_by_raw", ""))
+            city_values: List[str] = []
+            for city in r.get("cities") or []:
+                text = str(city)
+                if text:
+                    city_values.append(escape(text))
+            dataset_labels_marker: List[str] = []
+            seen_dataset_labels: set[str] = set()
+            for entry in r.get("datasets") or []:
+                if isinstance(entry, dict):
+                    label = str(entry.get("label") or entry.get("value") or "")
+                else:
+                    label = str(entry or "")
+                if not label or label in seen_dataset_labels:
+                    continue
+                seen_dataset_labels.add(label)
+                dataset_labels_marker.append(escape(label))
+            parts = [f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a>"]
+            if city_values:
+                parts.append("<br/>📍 " + ", ".join(city_values[:3]))
+            if dataset_labels_marker:
+                parts.append("<br/>💾 " + ", ".join(dataset_labels_marker[:3]))
+            if img_html:
+                parts.append("<br/>" + img_html)
             if added_html:
-                popup=f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a><br/>{img_html}<br/>Добавил: {added_html}</div>"
-            else:
-                popup=f"<div><b>@{uname}</b><br/><a href='{prof}' target='_blank'>{prof}</a><br/>{img_html}</div>"
-            marker_js.append(f"var m=L.marker([{lat},{lon}]).bindPopup({popup!r}); markers.addLayer(m); bounds.extend([{lat},{lon}]);")
-        marker_js += ["map.addLayer(markers);","if(bounds.isValid()){{map.fitBounds(bounds.pad(0.1));}}else{{map.setView([20,0],2);}}"]
+                parts.append(f"<br/>Добавил: {added_html}")
+            parts.append("</div>")
+            popup = "".join(parts)
+            marker_js.append(
+                f"var m=L.marker([{lat},{lon}]).bindPopup({popup!r}); "
+                f"markers.addLayer(m); bounds.extend([{lat},{lon}]); markerByKey[{key!r}]=m;",
+            )
+        marker_js += [
+            "map.addLayer(markers);",
+            "if(bounds.isValid()){map.fitBounds(bounds.pad(0.1));}else{map.setView([20,0],2);}",
+            "setupListInteractions(map, markerByKey, markers, filteringState);",
+            "bindFilteringToMarkers(filteringState, map, markers, markerByKey);",
+        ]
     else:
         marker_js.append("map.setView([20,0],2);")
+        marker_js.append("setupListInteractions(map, {}, null, filteringState);")
+        marker_js.append("bindFilteringToMarkers(filteringState, map, null, {});")
 
-    return _map_html(title, list_html, marker_js)
+    return _map_html(
+        title,
+        list_html,
+        marker_js,
+        stats={
+            "summary_text": summary_text,
+            "total": total,
+            "with_coords": with_coords,
+            "without_coords": total - with_coords,
+        },
+    )
 
 # ---------------------- Bot ----------------------
 if not TOKEN: raise SystemExit("TELEGRAM_BOT_TOKEN is not set")
