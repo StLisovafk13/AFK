@@ -1,0 +1,9 @@
+aiohttp
+aiogram
+beautifulsoup4
+openpyxl
+pandas
+playwright
+python-dotenv
+pytest
+reverse_geocoder
