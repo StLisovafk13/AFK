@@ -2072,6 +2072,32 @@ def kb_struct(kb: InlineKeyboardMarkup | None):
         for row in kb.inline_keyboard
     )
 
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Главное меню бота с часто используемыми действиями."""
+
+    row1 = [
+        InlineKeyboardButton(text="🛒 Купить", callback_data="menu:buy"),
+        InlineKeyboardButton(text="🥷 Скрыться", callback_data="menu:hide"),
+        InlineKeyboardButton(text="🪙 Монеты", callback_data="menu:coins"),
+    ]
+    row2 = [
+        InlineKeyboardButton(text="⚒️ Пригласить", callback_data="menu:invite"),
+        InlineKeyboardButton(text="🪞 Зеркала", callback_data="menu:mirrors"),
+        InlineKeyboardButton(text="🌐 Топ чатов", callback_data="menu:top_chats"),
+    ]
+    row3 = [
+        InlineKeyboardButton(text="🔭 Слежу", callback_data="menu:watch"),
+        InlineKeyboardButton(text="🕵️ Искал(а)", callback_data="menu:search"),
+    ]
+    row4 = [
+        InlineKeyboardButton(text="💰 Аукцион", callback_data="menu:auction"),
+        InlineKeyboardButton(text="🎣 Рыбалка", callback_data="menu:fishing"),
+    ]
+    row5 = [InlineKeyboardButton(text="❗ Новости / Блог", callback_data="menu:news")]
+
+    return InlineKeyboardMarkup(inline_keyboard=[row1, row2, row3, row4, row5])
+
 @dp.message(Command("export"))
 async def cmd_export(msg: Message):
     if msg.chat.type in ("group", "supergroup"):
@@ -2968,7 +2994,7 @@ async def cmd_tutorial(msg: Message):
         "В дальнейшем будут обновления, если есть предложения по функционалу — пишите в личные сообщения или в группу.\n"
         "Ссылка в группу: <a href='https://t.me/+rsRSoupsg9pkM2Yy'>перейти</a>"
     )
-    await msg.answer(text)
+    await msg.answer(text, reply_markup=main_menu_keyboard())
 
 
 @dp.message(Command("start", "help"))
@@ -2994,7 +3020,28 @@ async def cmd_help(msg: Message):
         "• <code>/dl johndoe</code>\n"
         "• <code>/dl https://vsco.co/johndoe </code>\n\n"
     )
-    await msg.answer(text)
+    await msg.answer(text, reply_markup=main_menu_keyboard())
+
+
+@dp.callback_query(F.data.startswith("menu:"))
+async def main_menu_callback(call: CallbackQuery):
+    mapping = {
+        "menu:buy": "🛒 Раздел покупок пока в разработке.",
+        "menu:hide": "🥷 Функция скрытия скоро появится!",
+        "menu:coins": "🪙 Монеты: скоро можно будет посмотреть баланс.",
+        "menu:invite": "⚒️ Пригласить друзей — поделитесь ссылкой на бота!",
+        "menu:mirrors": "🪞 Список зеркал появится позже.",
+        "menu:top_chats": "🌐 Топ чатов будет доступен в ближайших обновлениях.",
+        "menu:watch": "🔭 Следите за обновлениями бота в этом разделе.",
+        "menu:search": "🕵️ История поисков находится в разработке.",
+        "menu:auction": "💰 Аукцион пока недоступен.",
+        "menu:fishing": "🎣 Режим рыбалки появится позже.",
+        "menu:news": "❗ Новости и блог скоро будут доступны.",
+    }
+
+    reply = mapping.get(call.data, "⚠️ Раздел временно недоступен.")
+    await call.answer()
+    await call.message.answer(reply)
 
 
 async def _start_polling_with_retries(*, max_attempts: Optional[int] = None) -> None:
