@@ -305,8 +305,8 @@ def added_by_html(value: str) -> str:
         return f"<a href=\"{escape(link)}\">{escape(display)}</a>"
     return escape(display)
 
-DAILY_COORDS_LIMIT = 10
-DAILY_NO_COORDS_LIMIT = 5
+DAILY_COORDS_LIMIT = 0
+DAILY_NO_COORDS_LIMIT = 0
 
 
 def _daily_item_counts(chat_id: int) -> Tuple[int, int]:
@@ -2966,7 +2966,6 @@ async def cmd_tutorial(msg: Message):
 
         "✅ Основная цель бота — заполнить полностью карту координатами фоток.\n"
         "В дальнейшем будут обновления, если есть предложения по функционалу — пишите в личные сообщения или в группу.\n"
-        "Ссылка в группу: <a href='https://t.me/+rsRSoupsg9pkM2Yy'>перейти</a>"
     )
     await msg.answer(text)
 
