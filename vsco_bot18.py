@@ -1920,6 +1920,7 @@ class Session:
     uploaded_html: List[Path] = field(default_factory=list)
     uploaded_csv: List[Path] = field(default_factory=list)
     export_scope: str = "chat"  # 'chat' | 'all'
+    pending_action: Optional[str] = None
 _sessions: dict[int, Session] = {}
 
 def get_session(chat_id: int) -> Session:
@@ -2027,6 +2028,26 @@ async def on_document(msg: Message):
 # ---------- plain text ----------
 @dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(msg: Message):
+    ses = get_session(msg.chat.id)
+    if ses.pending_action == "download":
+        text = (msg.text or "").strip()
+        if not text:
+            await msg.answer("Отправьте username или ссылку профиля VSCO для скачивания.")
+            return
+        parts = text.split()
+        target = parts[0]
+        extra_flags = [p for p in parts[1:] if p.startswith("--")]
+        success = await _enqueue_download_request(
+            msg,
+            target,
+            extra_flags,
+            getattr(msg.from_user, "id", None),
+        )
+        ses.pending_action = None
+        if not success:
+            await msg.answer("Если нужно попробовать снова, нажмите кнопку «Скачать профиль» ещё раз.")
+        return
+
     pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_message(msg.text, msg.entities))
     if not pairs:
         return  # без ответа
@@ -2372,6 +2393,51 @@ _DL_WORKER_TASK: asyncio.Task | None = None
 _DL_COUNTER = 0  # монотонный ID джоб
 _CURRENT_JOB: Dict[str, Any] | None = None
 
+
+async def _enqueue_download_request(
+    msg: Message,
+    target: str,
+    extra_flags: Sequence[str],
+    request_user_id: Optional[int],
+) -> bool:
+    if msg.chat.type in ("group", "supergroup"):
+        await msg.answer("🚫 Архив можно скачать только в личных сообщениях. Напишите мне в ЛС.")
+        return False
+
+    clean_target = target.strip()
+    if not clean_target:
+        await msg.answer("Отправьте username или ссылку профиля VSCO для скачивания.")
+        return False
+
+    allowed, info = has_daily_data_access(msg.chat.id, request_user_id)
+    if not allowed:
+        await msg.answer(info)
+        return False
+
+    ses = get_session(msg.chat.id)
+    out_base = ses.dir / "downloads"
+    out_base.mkdir(parents=True, exist_ok=True)
+
+    global _DL_QUEUE, _DL_COUNTER
+    if _DL_QUEUE is None:
+        _DL_QUEUE = asyncio.Queue()
+
+    _DL_COUNTER += 1
+    safe_flags = [f for f in extra_flags if f.startswith("--")]
+    job = DLJob(
+        id=_DL_COUNTER,
+        chat_id=msg.chat.id,
+        target=clean_target,
+        extra_flags=list(safe_flags),
+        out_base=out_base,
+    )
+    await _DL_QUEUE.put(job)
+
+    pos = _DL_QUEUE.qsize()  # позиция «после put»: 1 — значит выполнится следующим
+    await msg.answer(f"🗂️ Задание #{job.id} поставлено в очередь. Позиция: {pos}.")
+    return True
+
+
 @dataclass
 class DLJob:
     id: int
@@ -2388,10 +2454,6 @@ def _dl_script_path() -> Path:
 
 @dp.message(Command("dl"))
 async def cmd_dl_enqueue(msg: Message):
-    # Полный запрет команды /dl в групповых чатах
-    if msg.chat.type in ("group", "supergroup"):
-        await msg.answer("🚫 Архив можно скачать только в личных сообщениях. Напишите мне в ЛС.")
-        return
     """
     /dl <vsco_username | profile_url> [--flags ...]
     Кладёт задание в очередь. Выполняет воркер по одному.
@@ -2402,34 +2464,14 @@ async def cmd_dl_enqueue(msg: Message):
                          "Например: <code>/dl johndoe --max 120 --split-zip-size-mb 45</code>")
         return
 
-    allowed, info = has_daily_data_access(msg.chat.id, getattr(msg.from_user, "id", None))
-    if not allowed:
-        await msg.answer(info)
-        return
-
     target = parts[1]
     extra_flags = [p for p in parts[2:] if p.startswith("--")]  # простой whitelist
-
-    ses = get_session(msg.chat.id)
-    out_base = ses.dir / "downloads"
-    out_base.mkdir(parents=True, exist_ok=True)
-
-    global _DL_QUEUE, _DL_COUNTER
-    if _DL_QUEUE is None:
-        _DL_QUEUE = asyncio.Queue()
-
-    _DL_COUNTER += 1
-    job = DLJob(
-        id=_DL_COUNTER,
-        chat_id=msg.chat.id,
-        target=target,
-        extra_flags=extra_flags,
-        out_base=out_base,
+    await _enqueue_download_request(
+        msg,
+        target,
+        extra_flags,
+        getattr(msg.from_user, "id", None),
     )
-    await _DL_QUEUE.put(job)
-
-    pos = _DL_QUEUE.qsize()  # позиция «после put»: 1 — значит выполнится следующим
-    await msg.answer(f"🗂️ Задание #{job.id} поставлено в очередь. Позиция: {pos}.")
 
 
 @dp.message(Command("qstat"))
@@ -2970,6 +3012,20 @@ async def cmd_tutorial(msg: Message):
     await msg.answer(text)
 
 
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📥 Скачать профиль", callback_data="menu:download")],
+            [
+                InlineKeyboardButton(text="🔗 Ссылки за 24ч", callback_data="menu:links"),
+                InlineKeyboardButton(text="📈 Статистика", callback_data="menu:stats"),
+            ],
+            [InlineKeyboardButton(text="📊 Очередь", callback_data="menu:qstat")],
+            [InlineKeyboardButton(text="📚 Туториал", callback_data="menu:tutorial")],
+        ]
+    )
+
+
 @dp.message(Command("start", "help"))
 async def cmd_help(msg: Message):
     text = (
@@ -2992,8 +3048,54 @@ async def cmd_help(msg: Message):
         "💡 <b>Примеры</b>:\n"
         "• <code>/dl johndoe</code>\n"
         "• <code>/dl https://vsco.co/johndoe </code>\n\n"
+        "👇 Быстрые действия доступны на кнопках ниже."
     )
-    await msg.answer(text)
+    await msg.answer(text, reply_markup=main_menu_keyboard())
+
+
+@dp.callback_query(F.data.startswith("menu:"))
+async def on_menu_click(cq: CallbackQuery):
+    if not cq.data:
+        await cq.answer()
+        return
+
+    action = cq.data.split(":", 1)[1] if ":" in cq.data else ""
+    chat_id = cq.message.chat.id if cq.message else cq.from_user.id
+    ses = get_session(chat_id)
+
+    if action == "download":
+        if cq.message and cq.message.chat.type in ("group", "supergroup"):
+            await cq.answer("Скачивание доступно только в личных сообщениях. Напишите мне в ЛС.", show_alert=True)
+            return
+        ses.pending_action = "download"
+        await cq.message.answer(
+            "Отправьте username или ссылку профиля VSCO, чтобы поставить скачивание в очередь."
+            " Можно добавить флаги, например: <code>username --max 100</code>."
+        )
+        await cq.answer("Ожидаю ввод")
+        return
+
+    if action == "links":
+        await cmd_links(cq.message)
+        await cq.answer("Готово")
+        return
+
+    if action == "stats":
+        await cmd_stats(cq.message)
+        await cq.answer("Готово")
+        return
+
+    if action == "qstat":
+        await cmd_qstat(cq.message)
+        await cq.answer("Готово")
+        return
+
+    if action == "tutorial":
+        await cmd_tutorial(cq.message)
+        await cq.answer()
+        return
+
+    await cq.answer()
 
 
 async def _start_polling_with_retries(*, max_attempts: Optional[int] = None) -> None:
