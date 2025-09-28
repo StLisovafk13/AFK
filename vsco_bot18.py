@@ -2074,29 +2074,24 @@ def kb_struct(kb: InlineKeyboardMarkup | None):
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Главное меню бота с часто используемыми действиями."""
+    """Главное меню бота с быстрым доступом к реальным функциям."""
 
     row1 = [
-        InlineKeyboardButton(text="🛒 Купить", callback_data="menu:buy"),
-        InlineKeyboardButton(text="🥷 Скрыться", callback_data="menu:hide"),
-        InlineKeyboardButton(text="🪙 Монеты", callback_data="menu:coins"),
+        InlineKeyboardButton(text="⬇️ Скачать профиль", callback_data="menu:dl"),
+        InlineKeyboardButton(text="📥 Очередь", callback_data="menu:qstat"),
+        InlineKeyboardButton(text="🔗 Свежие ссылки", callback_data="menu:links"),
     ]
     row2 = [
-        InlineKeyboardButton(text="⚒️ Пригласить", callback_data="menu:invite"),
-        InlineKeyboardButton(text="🪞 Зеркала", callback_data="menu:mirrors"),
-        InlineKeyboardButton(text="🌐 Топ чатов", callback_data="menu:top_chats"),
+        InlineKeyboardButton(text="📤 Экспорт", callback_data="menu:export"),
+        InlineKeyboardButton(text="📊 Статистика", callback_data="menu:stats"),
+        InlineKeyboardButton(text="🧹 Сбросить сессию", callback_data="menu:reset"),
     ]
     row3 = [
-        InlineKeyboardButton(text="🔭 Слежу", callback_data="menu:watch"),
-        InlineKeyboardButton(text="🕵️ Искал(а)", callback_data="menu:search"),
+        InlineKeyboardButton(text="📚 Туториал", callback_data="menu:tutorial"),
+        InlineKeyboardButton(text="ℹ️ Справка", callback_data="menu:help"),
     ]
-    row4 = [
-        InlineKeyboardButton(text="💰 Аукцион", callback_data="menu:auction"),
-        InlineKeyboardButton(text="🎣 Рыбалка", callback_data="menu:fishing"),
-    ]
-    row5 = [InlineKeyboardButton(text="❗ Новости / Блог", callback_data="menu:news")]
 
-    return InlineKeyboardMarkup(inline_keyboard=[row1, row2, row3, row4, row5])
+    return InlineKeyboardMarkup(inline_keyboard=[row1, row2, row3])
 
 @dp.message(Command("export"))
 async def cmd_export(msg: Message):
@@ -3025,23 +3020,47 @@ async def cmd_help(msg: Message):
 
 @dp.callback_query(F.data.startswith("menu:"))
 async def main_menu_callback(call: CallbackQuery):
-    mapping = {
-        "menu:buy": "🛒 Раздел покупок пока в разработке.",
-        "menu:hide": "🥷 Функция скрытия скоро появится!",
-        "menu:coins": "🪙 Монеты: скоро можно будет посмотреть баланс.",
-        "menu:invite": "⚒️ Пригласить друзей — поделитесь ссылкой на бота!",
-        "menu:mirrors": "🪞 Список зеркал появится позже.",
-        "menu:top_chats": "🌐 Топ чатов будет доступен в ближайших обновлениях.",
-        "menu:watch": "🔭 Следите за обновлениями бота в этом разделе.",
-        "menu:search": "🕵️ История поисков находится в разработке.",
-        "menu:auction": "💰 Аукцион пока недоступен.",
-        "menu:fishing": "🎣 Режим рыбалки появится позже.",
-        "menu:news": "❗ Новости и блог скоро будут доступны.",
-    }
-
-    reply = mapping.get(call.data, "⚠️ Раздел временно недоступен.")
+    data = call.data
     await call.answer()
-    await call.message.answer(reply)
+
+    if data == "menu:dl":
+        text = (
+            "⬇️ <b>Скачать профиль</b>\n"
+            "Отправьте команду <code>/dl &lt;username|profile_url&gt;</code> в этом чате.\n"
+            "Можно указать флаги, например: <code>/dl johndoe --max 120</code>."
+        )
+        await call.message.answer(text)
+        return
+
+    if data == "menu:qstat":
+        await cmd_qstat(call.message)
+        return
+
+    if data == "menu:links":
+        await cmd_links(call.message)
+        return
+
+    if data == "menu:export":
+        await cmd_export(call.message)
+        return
+
+    if data == "menu:stats":
+        await cmd_stats(call.message)
+        return
+
+    if data == "menu:reset":
+        await cmd_reset(call.message)
+        return
+
+    if data == "menu:tutorial":
+        await cmd_tutorial(call.message)
+        return
+
+    if data == "menu:help":
+        await cmd_help(call.message)
+        return
+
+    await call.message.answer("⚠️ Действие недоступно.")
 
 
 async def _start_polling_with_retries(*, max_attempts: Optional[int] = None) -> None:
