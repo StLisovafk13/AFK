@@ -71,6 +71,8 @@ WORKDIR = Path(os.getenv("BOT_WORKDIR", "./work")); WORKDIR.mkdir(parents=True, 
 LOGDIR = Path(os.getenv("BOT_LOGDIR", "./logs")); LOGDIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = os.getenv("BOT_DB_PATH", "vsco_links.db")
 SEND_TIMEOUT = int(os.getenv("BOT_SEND_TIMEOUT", "600"))
+ARCHIVE_CHANNEL_ID_ENV = os.getenv("BOT_ARCHIVE_CHANNEL_ID", "").strip()
+ARCHIVE_CHANNEL_ID: Optional[int | str] = None
 
 
 def _parse_admin_ids(raw: str) -> set[int]:
@@ -196,6 +198,16 @@ def setup_logging():
 setup_logging()
 log = logging.getLogger("vsco-bot")
 
+if ARCHIVE_CHANNEL_ID_ENV:
+    if ARCHIVE_CHANNEL_ID_ENV.startswith("@"):
+        ARCHIVE_CHANNEL_ID = ARCHIVE_CHANNEL_ID_ENV
+    else:
+        try:
+            ARCHIVE_CHANNEL_ID = int(ARCHIVE_CHANNEL_ID_ENV)
+        except ValueError:
+            ARCHIVE_CHANNEL_ID = ARCHIVE_CHANNEL_ID_ENV
+            log.warning("BOT_ARCHIVE_CHANNEL_ID is not a numeric id, using raw value: %s", ARCHIVE_CHANNEL_ID_ENV)
+
 if pd is None:
     log.warning("pandas is not installed; CSV features are disabled")
 
@@ -304,6 +316,67 @@ def added_by_html(value: str) -> str:
     if link:
         return f"<a href=\"{escape(link)}\">{escape(display)}</a>"
     return escape(display)
+
+
+@dataclass
+class ProfileArchiveInfo:
+    username: str
+    profile_url: str = ""
+    added_by_raw: str = ""
+    last_created_at: Optional[str] = None
+    comments: List[str] = field(default_factory=list)
+    items_count: int = 0
+
+
+def fetch_profile_archive_info(username: Optional[str], *, max_items: int = 120) -> Optional[ProfileArchiveInfo]:
+    clean = (username or "").strip()
+    if not clean:
+        return None
+
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, profile_url, added_by, created_at
+            FROM items
+            WHERE username = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (clean, max_items),
+        ).fetchall()
+        if not rows:
+            return None
+
+        info = ProfileArchiveInfo(username=clean)
+        info.items_count = len(rows)
+        for _, profile_url, added_by, created_at in rows:
+            if not info.profile_url and isinstance(profile_url, str) and profile_url.strip():
+                info.profile_url = profile_url.strip()
+            if not info.added_by_raw and isinstance(added_by, str) and added_by.strip():
+                info.added_by_raw = added_by.strip()
+            if not info.last_created_at and isinstance(created_at, str) and created_at.strip():
+                info.last_created_at = created_at.strip()
+            if info.profile_url and info.added_by_raw and info.last_created_at:
+                break
+
+        item_ids = [int(row[0]) for row in rows if row and row[0] is not None]
+        if item_ids:
+            placeholders = ",".join("?" for _ in item_ids)
+            seen: set[str] = set()
+            for (comment,) in conn.execute(
+                f"SELECT comment FROM comments WHERE item_id IN ({placeholders}) ORDER BY id ASC",
+                item_ids,
+            ):
+                if not isinstance(comment, str):
+                    continue
+                trimmed = comment.strip()
+                if trimmed and trimmed not in seen:
+                    info.comments.append(trimmed)
+                    seen.add(trimmed)
+        return info
+    finally:
+        conn.close()
 
 DAILY_COORDS_LIMIT = 0
 DAILY_NO_COORDS_LIMIT = 0
@@ -2424,12 +2497,14 @@ async def _enqueue_download_request(
 
     _DL_COUNTER += 1
     safe_flags = [f for f in extra_flags if f.startswith("--")]
+    requested_by = resolve_added_by(msg.from_user)
     job = DLJob(
         id=_DL_COUNTER,
         chat_id=msg.chat.id,
         target=clean_target,
         extra_flags=list(safe_flags),
         out_base=out_base,
+        requested_by=requested_by,
     )
     await _DL_QUEUE.put(job)
 
@@ -2446,6 +2521,7 @@ class DLJob:
     extra_flags: list     # список флагов вида ["--max","100","--no-zip",...]
     out_base: Path        # базовая папка для выдачи
     cancelled: bool = False
+    requested_by: str = ""
 
 def _dl_script_path() -> Path:
     # vsco_downloader.py должен лежать рядом с текущим файлом
@@ -2637,6 +2713,167 @@ def rebuild_urls_extracted(user_dir: Path) -> None:
         out.write_text("\n".join(urls) + "\n", encoding="utf-8")
     except Exception:
         pass
+
+
+def _extract_username_from_target(target: str) -> Optional[str]:
+    text = (target or "").strip()
+    if not text:
+        return None
+    if text.startswith("@"):
+        text = text[1:]
+    if USERNAME_RE.match(text):
+        return text
+    info = classify_vsco_path(text)
+    username = info.get("username") if isinstance(info, dict) else None
+    if isinstance(username, str) and username.strip():
+        return username.strip()
+    if is_vsco_url(text):
+        extracted = username_from_vsco_co(text)
+        if extracted:
+            return extracted
+    return None
+
+
+def _read_manifest_summary(user_dir: Path) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    man = user_dir / "manifest.json"
+    if not man.exists():
+        return result
+    try:
+        data = json.loads(man.read_text(encoding="utf-8"))
+    except Exception:
+        return result
+
+    if isinstance(data, dict):
+        for key in ("username", "profile_url", "display_name", "full_name", "bio"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                result[key] = value.strip()
+        for key in ("media_count", "total", "count", "items_count"):
+            value = data.get(key)
+            if isinstance(value, int) and value > 0:
+                result[key] = value
+        items = data.get("items")
+        if isinstance(items, list) and "items_count" not in result:
+            result["items_count"] = len(items)
+    return result
+
+
+def _format_archive_channel_message(
+    job: "DLJob",
+    *,
+    username: Optional[str],
+    info: Optional[ProfileArchiveInfo],
+    manifest_meta: Dict[str, Any],
+    total_found: Optional[int],
+    zip_count: int,
+) -> str:
+    lines: List[str] = ["📦 <b>Выгрузка профиля VSCO</b>"]
+    lines.append(f"🆔 Задание: <code>#{job.id}</code> • Чат: <code>{job.chat_id}</code>")
+
+    requested = (job.target or "").strip()
+    if requested:
+        lines.append(f"🎯 Запрос: <code>{escape(requested)}</code>")
+
+    resolved_username = username
+    if not resolved_username:
+        candidate = manifest_meta.get("username")
+        if isinstance(candidate, str) and candidate.strip():
+            resolved_username = candidate.strip()
+
+    if resolved_username:
+        lines.append(f"👤 Профиль: <code>{escape(resolved_username)}</code>")
+
+    display_name = manifest_meta.get("display_name") or manifest_meta.get("full_name")
+    if isinstance(display_name, str) and display_name.strip():
+        lines.append(f"📛 Имя в профиле: <b>{escape(display_name.strip())}</b>")
+
+    profile_url = ""
+    if info and info.profile_url:
+        profile_url = info.profile_url
+    elif isinstance(manifest_meta.get("profile_url"), str):
+        profile_url = manifest_meta["profile_url"]
+    elif resolved_username:
+        profile_url = f"https://vsco.co/{resolved_username}"
+    elif requested and is_vsco_url(requested):
+        profile_url = requested
+    if profile_url:
+        lines.append(f"🔗 <a href=\"{escape(profile_url)}\">{escape(profile_url)}</a>")
+
+    total_media: Optional[int] = None
+    if isinstance(total_found, int) and total_found > 0:
+        total_media = total_found
+    else:
+        for key in ("media_count", "total", "count", "items_count"):
+            value = manifest_meta.get(key)
+            if isinstance(value, int) and value > 0:
+                total_media = value
+                break
+    if total_media is None and info and info.items_count:
+        total_media = info.items_count
+    if total_media is not None:
+        lines.append(f"📸 Медиа: <b>{total_media}</b>")
+
+    if info and info.last_created_at:
+        lines.append(f"🕒 Последняя запись в базе: <code>{escape(info.last_created_at)}</code>")
+
+    if info and info.added_by_raw:
+        added_html = added_by_html(info.added_by_raw)
+        if added_html:
+            lines.append(f"📝 В базу добавил: {added_html}")
+
+    if job.requested_by:
+        lines.append(f"🙋 Скачивание запросил: {escape(job.requested_by)}")
+
+    lines.append(f"📁 Архивов: <b>{zip_count}</b>")
+
+    if info and info.comments:
+        lines.append("💬 Комментарии:")
+        preview = info.comments[:5]
+        for comment in preview:
+            lines.append(f"• {escape(comment).replace('\n', ' ')}")
+        if len(info.comments) > len(preview):
+            lines.append(f"… и ещё {len(info.comments) - len(preview)}")
+    else:
+        lines.append("💬 Комментариев в базе не найдено")
+
+    return "\n".join(lines)
+
+
+async def _send_archives_to_channel(
+    job: "DLJob",
+    zips: Sequence[Path],
+    user_dir: Path,
+    total_found: Optional[int],
+) -> None:
+    if not ARCHIVE_CHANNEL_ID:
+        return
+
+    manifest_meta = _read_manifest_summary(user_dir)
+    username = _extract_username_from_target(job.target)
+    if not username:
+        candidate = manifest_meta.get("username")
+        if isinstance(candidate, str) and candidate.strip():
+            username = candidate.strip()
+
+    info = fetch_profile_archive_info(username)
+    text = _format_archive_channel_message(
+        job,
+        username=username,
+        info=info,
+        manifest_meta=manifest_meta,
+        total_found=total_found,
+        zip_count=len(zips),
+    )
+
+    await bot.send_message(ARCHIVE_CHANNEL_ID, text, disable_web_page_preview=True)
+    for z in zips:
+        await bot.send_document(
+            ARCHIVE_CHANNEL_ID,
+            FSInputFile(z, filename=z.name),
+            caption=f"📦 {z.name}",
+            request_timeout=SEND_TIMEOUT,
+        )
 
 
 class Stage(Enum):
@@ -2943,6 +3180,13 @@ async def _dl_worker():
                         except Exception as e:
                             log.warning("Job #%s: failed to send %s: %s", job.id, z, e)
                             await bot.send_message(job.chat_id, f"Не удалось отправить {z.name}: {e}")
+                    if ARCHIVE_CHANNEL_ID:
+                        try:
+                            await _send_archives_to_channel(job, zips, user_dir, total_found)
+                        except Exception as e:
+                            log.warning(
+                                "Job #%s: failed to mirror archives to channel: %s", job.id, e
+                            )
                 else:
                     man = user_dir / "manifest.json"
                     urls = user_dir / "urls_extracted.txt"
