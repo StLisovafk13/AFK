@@ -83,6 +83,8 @@ ARCHIVE_ADMIN_CHANNEL_ID_ENV = os.getenv("BOT_ARCHIVE_ADMIN_CHANNEL_ID", "").str
 ARCHIVE_SUMMARY_CHANNEL_ID_ENV = os.getenv("BOT_ARCHIVE_SUMMARY_CHANNEL_ID", "").strip()
 ARCHIVE_ADMIN_CHANNEL_ID: Optional[int | str] = None
 ARCHIVE_SUMMARY_CHANNEL_ID: Optional[int | str] = None
+BOT_UPLOAD_LIMIT_MB = int(os.getenv("BOT_UPLOAD_LIMIT_MB", "49"))
+BOT_UPLOAD_LIMIT_BYTES = max(1, BOT_UPLOAD_LIMIT_MB) * 1024 * 1024
 
 
 def _parse_admin_ids(raw: str) -> set[int]:
@@ -184,6 +186,19 @@ def require_admin(msg: Message) -> bool:
     user = getattr(msg, "from_user", None)
     user_id = getattr(user, "id", None) if user else None
     return is_admin_id(user_id)
+
+
+def _human_readable_size(num_bytes: int) -> str:
+    step = 1024.0
+    units = ["Б", "КБ", "МБ", "ГБ", "ТБ"]
+    size = float(max(0, num_bytes))
+    for unit in units:
+        if size < step or unit == units[-1]:
+            if unit == "Б":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= step
+    return f"{size:.1f} {units[-1]}"
 
 def setup_logging():
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -3015,23 +3030,70 @@ async def _send_archives_to_channels(
         await bot.send_message(ARCHIVE_SUMMARY_CHANNEL_ID, summary_text, disable_web_page_preview=True)
 
         combined_path: Optional[Path] = None
+        combined_size: Optional[int] = None
         try:
             combined_path = await asyncio.to_thread(_create_single_archive, job, zips, user_dir, summary)
+            if combined_path:
+                try:
+                    combined_size = combined_path.stat().st_size
+                except OSError:
+                    combined_size = None
         except Exception:
             log.exception("Job #%s: failed to build single archive for summary channel", job.id)
 
+        fallback_to_parts = False
         if combined_path:
-            try:
+            if combined_size is not None and combined_size > BOT_UPLOAD_LIMIT_BYTES:
+                fallback_to_parts = True
+                readable = _human_readable_size(combined_size)
+                limit_readable = _human_readable_size(BOT_UPLOAD_LIMIT_BYTES)
+                await bot.send_message(
+                    ARCHIVE_SUMMARY_CHANNEL_ID,
+                    (
+                        "⚠️ Объединённый архив слишком большой для загрузки в Telegram.\n"
+                        f"Размер: <b>{readable}</b> (лимит {limit_readable}).\n"
+                        "Отправляю исходные тома по отдельности."
+                    ),
+                    parse_mode="HTML",
+                )
+            else:
+                try:
+                    await bot.send_document(
+                        ARCHIVE_SUMMARY_CHANNEL_ID,
+                        FSInputFile(combined_path, filename=combined_path.name),
+                        caption=f"📦 {combined_path.name}",
+                        request_timeout=SEND_TIMEOUT,
+                    )
+                except TelegramBadRequest as err:
+                    message = str(err).lower()
+                    if "request entity too large" in message or "file is too big" in message:
+                        fallback_to_parts = True
+                        readable = _human_readable_size(combined_size or 0)
+                        limit_readable = _human_readable_size(BOT_UPLOAD_LIMIT_BYTES)
+                        await bot.send_message(
+                            ARCHIVE_SUMMARY_CHANNEL_ID,
+                            (
+                                "⚠️ Telegram отклонил объединённый архив (слишком большой).\n"
+                                f"Размер: <b>{readable}</b> (лимит {limit_readable}).\n"
+                                "Отправляю исходные тома по отдельности."
+                            ),
+                            parse_mode="HTML",
+                        )
+                    else:
+                        raise
+
+        if combined_path and combined_path not in zips:
+            with contextlib.suppress(Exception):
+                combined_path.unlink(missing_ok=True)
+
+        if fallback_to_parts:
+            for z in zips:
                 await bot.send_document(
                     ARCHIVE_SUMMARY_CHANNEL_ID,
-                    FSInputFile(combined_path, filename=combined_path.name),
-                    caption=f"📦 {combined_path.name}",
+                    FSInputFile(z, filename=z.name),
+                    caption=f"📦 {z.name}",
                     request_timeout=SEND_TIMEOUT,
                 )
-            finally:
-                if combined_path not in zips:
-                    with contextlib.suppress(Exception):
-                        combined_path.unlink(missing_ok=True)
 
 
 class Stage(Enum):
