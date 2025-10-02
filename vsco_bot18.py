@@ -1,7 +1,12 @@
-# Version: 18.4.2 — 2025-09-04
+# Version: 18.4.3 — 2025-10-02
 # Python: 3.11
-# Telegram VSCO Toolkit Bot — v18.4.2
-# Изменения (18.4.2):
+# Telegram VSCO Toolkit Bot — v18.4.3
+# Изменения (18.4.3):
+# - NEW: Добавлены раздельные каналы архива и сводки (BOT_ARCHIVE_ADMIN_CHANNEL_ID, BOT_ARCHIVE_SUMMARY_CHANNEL_ID) с авторассылкой архивов и итогов.
+# - NEW: Для сводочного канала формируется единый ZIP при отправке нескольких частей.
+# - UI: Возвращена клавиатура экспорта /export с выбором области и форматов.
+#
+# Ранее в 18.4.2:
 # - FIX: Telegram HTML parse — экранированы примеры с <user>/<id> в /start (теперь внутри <code> и с &lt; &gt;).
 # - FIX: Заменён неподдерживаемый <span> в сообщениях на <i>.
 # - Map HTML: сохранён предыдущий фикс (DOMContentLoaded + fallback CDN).
