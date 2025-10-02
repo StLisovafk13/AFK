@@ -25,6 +25,8 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 import json
 import time
+import tempfile
+import zipfile
 from html import escape
 from enum import Enum
 
@@ -72,7 +74,10 @@ LOGDIR = Path(os.getenv("BOT_LOGDIR", "./logs")); LOGDIR.mkdir(parents=True, exi
 DB_PATH = os.getenv("BOT_DB_PATH", "vsco_links.db")
 SEND_TIMEOUT = int(os.getenv("BOT_SEND_TIMEOUT", "600"))
 ARCHIVE_CHANNEL_ID_ENV = os.getenv("BOT_ARCHIVE_CHANNEL_ID", "").strip()
-ARCHIVE_CHANNEL_ID: Optional[int | str] = None
+ARCHIVE_ADMIN_CHANNEL_ID_ENV = os.getenv("BOT_ARCHIVE_ADMIN_CHANNEL_ID", "").strip()
+ARCHIVE_SUMMARY_CHANNEL_ID_ENV = os.getenv("BOT_ARCHIVE_SUMMARY_CHANNEL_ID", "").strip()
+ARCHIVE_ADMIN_CHANNEL_ID: Optional[int | str] = None
+ARCHIVE_SUMMARY_CHANNEL_ID: Optional[int | str] = None
 
 
 def _parse_admin_ids(raw: str) -> set[int]:
@@ -198,15 +203,35 @@ def setup_logging():
 setup_logging()
 log = logging.getLogger("vsco-bot")
 
-if ARCHIVE_CHANNEL_ID_ENV:
-    if ARCHIVE_CHANNEL_ID_ENV.startswith("@"):
-        ARCHIVE_CHANNEL_ID = ARCHIVE_CHANNEL_ID_ENV
-    else:
-        try:
-            ARCHIVE_CHANNEL_ID = int(ARCHIVE_CHANNEL_ID_ENV)
-        except ValueError:
-            ARCHIVE_CHANNEL_ID = ARCHIVE_CHANNEL_ID_ENV
-            log.warning("BOT_ARCHIVE_CHANNEL_ID is not a numeric id, using raw value: %s", ARCHIVE_CHANNEL_ID_ENV)
+
+def _parse_channel_id_value(raw: str, *, env_name: str) -> Optional[int | str]:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.startswith("@"):
+        return text
+    try:
+        return int(text)
+    except ValueError:
+        log.warning("%s is not a numeric id, using raw value: %s", env_name, text)
+        return text
+
+
+def _resolve_channel_ids() -> None:
+    global ARCHIVE_ADMIN_CHANNEL_ID, ARCHIVE_SUMMARY_CHANNEL_ID
+
+    admin_raw = ARCHIVE_ADMIN_CHANNEL_ID_ENV or ARCHIVE_CHANNEL_ID_ENV
+    summary_raw = ARCHIVE_SUMMARY_CHANNEL_ID_ENV
+
+    if admin_raw:
+        env_name = "BOT_ARCHIVE_ADMIN_CHANNEL_ID" if ARCHIVE_ADMIN_CHANNEL_ID_ENV else "BOT_ARCHIVE_CHANNEL_ID"
+        ARCHIVE_ADMIN_CHANNEL_ID = _parse_channel_id_value(admin_raw, env_name=env_name)
+
+    if summary_raw:
+        ARCHIVE_SUMMARY_CHANNEL_ID = _parse_channel_id_value(summary_raw, env_name="BOT_ARCHIVE_SUMMARY_CHANNEL_ID")
+
+
+_resolve_channel_ids()
 
 if pd is None:
     log.warning("pandas is not installed; CSV features are disabled")
@@ -326,6 +351,17 @@ class ProfileArchiveInfo:
     last_created_at: Optional[str] = None
     comments: List[str] = field(default_factory=list)
     items_count: int = 0
+
+
+@dataclass
+class ArchiveSummaryData:
+    username: Optional[str] = None
+    display_name: Optional[str] = None
+    profile_url: Optional[str] = None
+    total_media: Optional[int] = None
+    comments: List[str] = field(default_factory=list)
+    added_by_html: Optional[str] = None
+    last_created_at: Optional[str] = None
 
 
 def fetch_profile_archive_info(username: Optional[str], *, max_items: int = 120) -> Optional[ProfileArchiveInfo]:
@@ -2759,34 +2795,25 @@ def _read_manifest_summary(user_dir: Path) -> Dict[str, Any]:
     return result
 
 
-def _format_archive_channel_message(
+def _build_archive_summary(
     job: "DLJob",
-    *,
     username: Optional[str],
     info: Optional[ProfileArchiveInfo],
     manifest_meta: Dict[str, Any],
     total_found: Optional[int],
-    zip_count: int,
-) -> str:
-    lines: List[str] = ["📦 <b>Выгрузка профиля VSCO</b>"]
-    lines.append(f"🆔 Задание: <code>#{job.id}</code> • Чат: <code>{job.chat_id}</code>")
+) -> ArchiveSummaryData:
+    summary = ArchiveSummaryData()
 
-    requested = (job.target or "").strip()
-    if requested:
-        lines.append(f"🎯 Запрос: <code>{escape(requested)}</code>")
-
-    resolved_username = username
+    resolved_username = (username or "").strip()
     if not resolved_username:
         candidate = manifest_meta.get("username")
         if isinstance(candidate, str) and candidate.strip():
             resolved_username = candidate.strip()
-
-    if resolved_username:
-        lines.append(f"👤 Профиль: <code>{escape(resolved_username)}</code>")
+    summary.username = resolved_username or None
 
     display_name = manifest_meta.get("display_name") or manifest_meta.get("full_name")
     if isinstance(display_name, str) and display_name.strip():
-        lines.append(f"📛 Имя в профиле: <b>{escape(display_name.strip())}</b>")
+        summary.display_name = display_name.strip()
 
     profile_url = ""
     if info and info.profile_url:
@@ -2795,10 +2822,9 @@ def _format_archive_channel_message(
         profile_url = manifest_meta["profile_url"]
     elif resolved_username:
         profile_url = f"https://vsco.co/{resolved_username}"
-    elif requested and is_vsco_url(requested):
-        profile_url = requested
-    if profile_url:
-        lines.append(f"🔗 <a href=\"{escape(profile_url)}\">{escape(profile_url)}</a>")
+    elif job.target and is_vsco_url(job.target):
+        profile_url = job.target
+    summary.profile_url = profile_url or None
 
     total_media: Optional[int] = None
     if isinstance(total_found, int) and total_found > 0:
@@ -2811,69 +2837,196 @@ def _format_archive_channel_message(
                 break
     if total_media is None and info and info.items_count:
         total_media = info.items_count
-    if total_media is not None:
-        lines.append(f"📸 Медиа: <b>{total_media}</b>")
+    summary.total_media = total_media
 
-    if info and info.last_created_at:
-        lines.append(f"🕒 Последняя запись в базе: <code>{escape(info.last_created_at)}</code>")
+    if info:
+        summary.comments = list(info.comments)
+        summary.last_created_at = info.last_created_at
+        if info.added_by_raw:
+            summary.added_by_html = added_by_html(info.added_by_raw)
 
-    if info and info.added_by_raw:
-        added_html = added_by_html(info.added_by_raw)
-        if added_html:
-            lines.append(f"📝 В базу добавил: {added_html}")
+    return summary
+
+
+def _format_archive_admin_message(
+    job: "DLJob",
+    *,
+    summary: ArchiveSummaryData,
+    zip_count: int,
+) -> str:
+    lines: List[str] = ["📦 <b>Выгрузка профиля VSCO</b>"]
+    lines.append(f"🆔 Задание: <code>#{job.id}</code> • Чат: <code>{job.chat_id}</code>")
+
+    requested = (job.target or "").strip()
+    if requested:
+        lines.append(f"🎯 Запрос: <code>{escape(requested)}</code>")
+
+    if summary.username:
+        lines.append(f"👤 Профиль: <code>{escape(summary.username)}</code>")
+
+    if summary.display_name:
+        lines.append(f"📛 Имя в профиле: <b>{escape(summary.display_name)}</b>")
+
+    if summary.profile_url:
+        lines.append(f"🔗 <a href=\"{escape(summary.profile_url)}\">{escape(summary.profile_url)}</a>")
+
+    if summary.total_media is not None:
+        lines.append(f"📸 Медиа: <b>{summary.total_media}</b>")
+
+    if summary.last_created_at:
+        lines.append(f"🕒 Последняя запись в базе: <code>{escape(summary.last_created_at)}</code>")
+
+    if summary.added_by_html:
+        lines.append(f"📝 В базу добавил: {summary.added_by_html}")
 
     if job.requested_by:
         lines.append(f"🙋 Скачивание запросил: {escape(job.requested_by)}")
 
     lines.append(f"📁 Архивов: <b>{zip_count}</b>")
 
-    if info and info.comments:
+    if summary.comments:
         lines.append("💬 Комментарии:")
-        preview = info.comments[:5]
+        preview = summary.comments[:5]
         for comment in preview:
             lines.append(f"• {escape(comment).replace('\n', ' ')}")
-        if len(info.comments) > len(preview):
-            lines.append(f"… и ещё {len(info.comments) - len(preview)}")
+        if len(summary.comments) > len(preview):
+            lines.append(f"… и ещё {len(summary.comments) - len(preview)}")
     else:
         lines.append("💬 Комментариев в базе не найдено")
 
     return "\n".join(lines)
 
 
-async def _send_archives_to_channel(
+def _format_archive_summary_message(
+    job: "DLJob",
+    *,
+    summary: ArchiveSummaryData,
+) -> str:
+    lines: List[str] = ["📦 <b>Новая выгрузка VSCO</b>"]
+
+    if summary.username:
+        lines.append(f"👤 Профиль: <code>{escape(summary.username)}</code>")
+
+    if summary.display_name:
+        lines.append(f"📛 Имя: <b>{escape(summary.display_name)}</b>")
+
+    if summary.total_media is not None:
+        lines.append(f"📸 Медиа: <b>{summary.total_media}</b>")
+
+    comments_count = len(summary.comments)
+    if comments_count:
+        lines.append(f"💬 Комментарии ({comments_count}):")
+        preview = summary.comments[:3]
+        for comment in preview:
+            lines.append(f"• {escape(comment).replace('\n', ' ')}")
+        if comments_count > len(preview):
+            lines.append(f"… и ещё {comments_count - len(preview)}")
+    else:
+        lines.append("💬 Комментариев нет")
+
+    if job.requested_by:
+        lines.append(f"🙋 Запросил: {escape(job.requested_by)}")
+
+    return "\n".join(lines)
+
+
+def _create_single_archive(
+    job: "DLJob",
+    zips: Sequence[Path],
+    user_dir: Path,
+    summary: ArchiveSummaryData,
+) -> Optional[Path]:
+    if not zips:
+        return None
+    if len(zips) == 1:
+        return zips[0]
+
+    slug_source = summary.username or user_dir.name or f"profile_{job.id}"
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", slug_source).strip("_ ")
+    if not slug:
+        slug = f"profile_{job.id}"
+
+    dest = user_dir / f"{slug}_full.zip"
+    counter = 1
+    while dest.exists():
+        counter += 1
+        dest = user_dir / f"{slug}_full_{counter}.zip"
+
+    extracted_any = False
+    with tempfile.TemporaryDirectory(dir=user_dir) as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        for part in zips:
+            try:
+                with zipfile.ZipFile(part) as src:
+                    src.extractall(tmp_path)
+                    extracted_any = True
+            except Exception as err:
+                log.warning("Job #%s: failed to extract %s for combined archive: %s", job.id, part, err)
+        if not extracted_any:
+            return None
+
+        with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as dst:
+            for file_path in sorted(tmp_path.rglob("*")):
+                if file_path.is_file():
+                    dst.write(file_path, file_path.relative_to(tmp_path))
+
+    if dest.exists():
+        log.info("Job #%s: combined %d archives into %s", job.id, len(zips), dest)
+        return dest
+    return None
+
+
+async def _send_archives_to_channels(
     job: "DLJob",
     zips: Sequence[Path],
     user_dir: Path,
     total_found: Optional[int],
 ) -> None:
-    if not ARCHIVE_CHANNEL_ID:
+    if not ARCHIVE_ADMIN_CHANNEL_ID and not ARCHIVE_SUMMARY_CHANNEL_ID:
         return
 
     manifest_meta = _read_manifest_summary(user_dir)
     username = _extract_username_from_target(job.target)
-    if not username:
-        candidate = manifest_meta.get("username")
-        if isinstance(candidate, str) and candidate.strip():
-            username = candidate.strip()
-
     info = fetch_profile_archive_info(username)
-    text = _format_archive_channel_message(
-        job,
-        username=username,
-        info=info,
-        manifest_meta=manifest_meta,
-        total_found=total_found,
-        zip_count=len(zips),
-    )
+    summary = _build_archive_summary(job, username, info, manifest_meta, total_found)
 
-    await bot.send_message(ARCHIVE_CHANNEL_ID, text, disable_web_page_preview=True)
-    for z in zips:
-        await bot.send_document(
-            ARCHIVE_CHANNEL_ID,
-            FSInputFile(z, filename=z.name),
-            caption=f"📦 {z.name}",
-            request_timeout=SEND_TIMEOUT,
+    if ARCHIVE_ADMIN_CHANNEL_ID:
+        admin_text = _format_archive_admin_message(
+            job,
+            summary=summary,
+            zip_count=len(zips),
         )
+        await bot.send_message(ARCHIVE_ADMIN_CHANNEL_ID, admin_text, disable_web_page_preview=True)
+        for z in zips:
+            await bot.send_document(
+                ARCHIVE_ADMIN_CHANNEL_ID,
+                FSInputFile(z, filename=z.name),
+                caption=f"📦 {z.name}",
+                request_timeout=SEND_TIMEOUT,
+            )
+
+    if ARCHIVE_SUMMARY_CHANNEL_ID:
+        summary_text = _format_archive_summary_message(job, summary=summary)
+        await bot.send_message(ARCHIVE_SUMMARY_CHANNEL_ID, summary_text, disable_web_page_preview=True)
+
+        combined_path: Optional[Path] = None
+        try:
+            combined_path = await asyncio.to_thread(_create_single_archive, job, zips, user_dir, summary)
+        except Exception:
+            log.exception("Job #%s: failed to build single archive for summary channel", job.id)
+
+        if combined_path:
+            try:
+                await bot.send_document(
+                    ARCHIVE_SUMMARY_CHANNEL_ID,
+                    FSInputFile(combined_path, filename=combined_path.name),
+                    caption=f"📦 {combined_path.name}",
+                    request_timeout=SEND_TIMEOUT,
+                )
+            finally:
+                if combined_path not in zips:
+                    with contextlib.suppress(Exception):
+                        combined_path.unlink(missing_ok=True)
 
 
 class Stage(Enum):
@@ -3180,9 +3333,9 @@ async def _dl_worker():
                         except Exception as e:
                             log.warning("Job #%s: failed to send %s: %s", job.id, z, e)
                             await bot.send_message(job.chat_id, f"Не удалось отправить {z.name}: {e}")
-                    if ARCHIVE_CHANNEL_ID:
+                    if ARCHIVE_ADMIN_CHANNEL_ID or ARCHIVE_SUMMARY_CHANNEL_ID:
                         try:
-                            await _send_archives_to_channel(job, zips, user_dir, total_found)
+                            await _send_archives_to_channels(job, zips, user_dir, total_found)
                         except Exception as e:
                             log.warning(
                                 "Job #%s: failed to mirror archives to channel: %s", job.id, e
