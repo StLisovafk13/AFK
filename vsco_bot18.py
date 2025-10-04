@@ -269,7 +269,14 @@ SHORT_SLUG_RE = re.compile(r"^/([A-Za-z0-9]+)(?:/.*)?$")
 
 OG_IMAGE_RE = re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.I)
 TW_IMAGE_RE = re.compile(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', re.I)
-RESP_URL_RE = re.compile(r'responsive_url"\s*:\s*"([^"]+)"')
+RESP_URL_RE = re.compile(r'"responsive_url"\s*:\s*"(?P<u>[^"]+)"', re.I)
+CDN_FIELD_RE = re.compile(r'"(?:cdn_url|url)"\s*:\s*"(?P<u>https?:[^"\\]+)"', re.I)
+MEDIA_IMG_RE = re.compile(r'https?://[^"\']+\.(?:jpg|jpeg|png|webp)(?:\?[^"\']*)?', re.I)
+SITE_ID_RE_LIST = [
+    re.compile(r'"site_id"\s*:\s*(\d+)', re.I),
+    re.compile(r'data-site-id=["\'](\d+)["\']', re.I),
+    re.compile(r'\bsiteId\s*:\s*(\d+)\b', re.I),
+]
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; VSCO-Bot/1.0; +https://example.org/bot)"
@@ -603,23 +610,144 @@ async def resolve_vsco_short(url: str, session: aiohttp.ClientSession) -> str:
         return _build_perception_url(slug)
     return url
 
-async def fetch_media_image_url(url: str, session: aiohttp.ClientSession) -> Optional[str]:
-    """
-    Пытается достать прямой URL картинки по HTML:
-    - <meta property="og:image">, <meta name="twitter:image">,
-    - responsive_url во встроенном JSON.
-    """
-    try:
-        async with session.get(url, allow_redirects=True, timeout=12, headers=HEADERS) as resp:
-            html = await resp.text(errors="ignore")
-    except Exception as e:
-        log.warning("fetch_media_image_url failed: %s", e)
+def _decode_vsco_media_url(candidate: str) -> Optional[str]:
+    if not candidate:
         return None
+    candidate = candidate.strip()
+    try:
+        decoded = json.loads(f'"{candidate}"')
+    except Exception:
+        decoded = candidate.replace("\\/", "/").replace("\\u002F", "/").replace("\\u002f", "/")
+    decoded = decoded.strip()
+    if decoded.startswith("//"):
+        decoded = "https:" + decoded
+    if decoded.startswith("http://"):
+        decoded = "https://" + decoded[len("http://"):]
+    if decoded.startswith("https://"):
+        return decoded
+    return None
 
-    for rx in (OG_IMAGE_RE, TW_IMAGE_RE, RESP_URL_RE):
+
+def _extract_site_id_from_html(html: str) -> Optional[str]:
+    for rx in SITE_ID_RE_LIST:
         m = rx.search(html)
         if m:
             return m.group(1)
+    return None
+
+
+def _extract_media_candidates_from_html(html: str) -> List[str]:
+    candidates: List[str] = []
+    seen: set[str] = set()
+    for rx in (RESP_URL_RE, CDN_FIELD_RE, TW_IMAGE_RE, OG_IMAGE_RE):
+        for m in rx.finditer(html):
+            raw = m.groupdict().get("u") or m.group(1)
+            url = _decode_vsco_media_url(raw or "")
+            if not url:
+                continue
+            if url not in seen:
+                seen.add(url)
+                candidates.append(url)
+    for m in MEDIA_IMG_RE.finditer(html):
+        url = _decode_vsco_media_url(m.group(0))
+        if url and url not in seen:
+            seen.add(url)
+            candidates.append(url)
+    return candidates
+
+
+async def _fetch_media_url_via_api(
+    session: aiohttp.ClientSession,
+    *,
+    site_id: Optional[str],
+    media_id: Optional[str],
+) -> Optional[str]:
+    if not site_id or not media_id:
+        return None
+
+    page = 1
+    size = 100
+    for _ in range(5):
+        api_url = f"https://vsco.co/api/2.0/medias?site_id={site_id}&page={page}&size={size}"
+        try:
+            async with session.get(api_url, allow_redirects=True, timeout=12, headers=HEADERS) as resp:
+                if resp.status != 200:
+                    break
+                data = await resp.json(content_type=None)
+        except Exception as e:
+            log.warning("fetch_media_image_url api_failed: %s", e)
+            break
+
+        items = (data or {}).get("medias") or (data or {}).get("media") or []
+        if not items:
+            break
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            candidate_id = str(
+                item.get("id")
+                or item.get("media_id")
+                or item.get("hash")
+                or item.get("permalink", "").rsplit("/", 1)[-1]
+            ).strip()
+            if candidate_id and candidate_id.lower() == media_id.lower():
+                for key in ("responsive_url", "cdn_url", "url"):
+                    candidate = item.get(key)
+                    if isinstance(candidate, str):
+                        url = _decode_vsco_media_url(candidate)
+                        if url:
+                            return url
+                image = item.get("image") if isinstance(item.get("image"), dict) else None
+                if isinstance(image, dict):
+                    for key in ("cdn_url", "url", "path"):
+                        candidate = image.get(key)
+                        if isinstance(candidate, str):
+                            url = _decode_vsco_media_url(candidate)
+                            if url:
+                                return url
+                variants = item.get("images") or item.get("variants")
+                if isinstance(variants, list):
+                    for variant in variants:
+                        if not isinstance(variant, dict):
+                            continue
+                        candidate = variant.get("url") or variant.get("cdn_url")
+                        if isinstance(candidate, str):
+                            url = _decode_vsco_media_url(candidate)
+                            if url:
+                                return url
+
+        page += 1
+
+    return None
+
+
+async def fetch_media_image_url(url: str, session: aiohttp.ClientSession) -> Optional[str]:
+    """
+    Пытается достать прямой URL картинки по HTML или через публичный API.
+    """
+    info = classify_vsco_path(url)
+    media_id = (info.get("media_id") or "").strip() if isinstance(info, dict) else ""
+    site_id = None
+
+    try:
+        async with session.get(url, allow_redirects=True, timeout=12, headers=HEADERS) as resp:
+            html = await resp.text(errors="ignore")
+            site_id = _extract_site_id_from_html(html)
+    except Exception as e:
+        log.warning("fetch_media_image_url failed: %s", e)
+        html = ""
+
+    if html:
+        candidates = _extract_media_candidates_from_html(html)
+        for candidate in candidates:
+            if candidate.startswith("https://"):
+                return candidate
+
+    api_candidate = await _fetch_media_url_via_api(session, site_id=site_id, media_id=media_id)
+    if api_candidate:
+        return api_candidate
+
     return None
 
 # === Парсер "ссылка, комментарий до следующей ссылки" ========================

@@ -5,8 +5,13 @@ import asyncio
 import json
 from pathlib import Path
 
+
 import pytest
-from aiogram.types import MessageEntity
+
+try:
+    from aiogram.types import MessageEntity
+except ModuleNotFoundError:  # pragma: no cover - optional dependency in tests
+    pytest.skip("aiogram is required for text link parsing tests", allow_module_level=True)
 
 
 @pytest.fixture()
@@ -134,6 +139,47 @@ def test_insert_full_rows_from_html_returns_new_links(vsco_module):
 
     assert added_again == 0
     assert new_links_again == []
+
+
+def test_normalize_vsco_pairs_extracts_cdn_url(vsco_module, monkeypatch):
+    html = (
+        '<meta name="twitter:image" content="https:\\/\\/im.vsco.co\\/cdn-cgi\\/image\\/format=webp\\/images\\/5f6a.jpg">'
+    )
+
+    class DummyResponse:
+        status = 200
+        url = "https://vsco.co/sampleuser/media/5f6a"
+
+        def __init__(self, body: str):
+            self._body = body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def text(self, errors: str = "ignore"):
+            return self._body
+
+    aiohttp = vsco_module.aiohttp
+
+    async def fake_get(self, url, *args, **kwargs):  # type: ignore[override]
+        return DummyResponse(html)
+
+    monkeypatch.setattr(aiohttp.ClientSession, "get", fake_get, raising=False)
+
+    pairs = [{"url": "https://vsco.co/sampleuser/media/5f6a", "comment": ""}]
+    normalized = asyncio.run(vsco_module.normalize_vsco_pairs(pairs))
+
+    assert normalized == [
+        {
+            "username": "sampleuser",
+            "url": "https://vsco.co/sampleuser",
+            "comment": "",
+            "image_url": "https://im.vsco.co/cdn-cgi/image/format=webp/images/5f6a.jpg",
+        }
+    ]
 
 
 def test_ingest_download_results_adds_media(vsco_module, tmp_path):
