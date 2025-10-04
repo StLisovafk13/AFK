@@ -482,6 +482,7 @@ async def download_all_via_context(
             results.append(meta)
 
     take = urls if max_items == 0 else urls[:max_items]
+    logger.info(f"scan_progress {len(take)}")
     await asyncio.gather(*[fetch(i + 1, u) for i, u in enumerate(take)])
     return results
 
@@ -684,6 +685,7 @@ async def main_async(args: argparse.Namespace) -> int:
         if len(final_urls) != len(urls):
             logger.info(f"Убрали {len(urls) - len(final_urls)} миниатюр (постеры видео) из скачивания по флагу --skip-video-thumbs")
         urls = final_urls
+        logger.info(f"scan_progress {len(urls)}")
 
         short_ok(logger, f"Извлекли {len(urls)} ссылок (до лимита/конца ленты).")
         urls_file = out_dir / "urls_extracted.txt"
