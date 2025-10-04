@@ -184,6 +184,9 @@ async def resolve_vsco_short_or_profile(u: str, stats: ZipStats) -> Optional[str
                         return candidate
 
                     if r.status in (200, 201):
+                        host = (r.url.host or "").lower() if r.url else ""
+                        if slug and host in {"vs.co", "www.vs.co"}:
+                            break
                         norm2 = _normalize_vsco_profile_url(final)
                         stats.normalized_url = norm2
                         return norm2

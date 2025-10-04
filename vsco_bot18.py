@@ -589,10 +589,13 @@ async def resolve_vsco_short(url: str, session: aiohttp.ClientSession) -> str:
                         return _build_perception_url(slug)
                     current = next_url
                     continue
-                if (resp.url.host or "").lower() in VSCO_PERCEPTION_HOSTS and slug:
+                resp_host = (resp.url.host or "").lower() if resp.url else ""
+                if resp_host in VSCO_PERCEPTION_HOSTS and slug:
                     return _build_perception_url(slug)
-                if (resp.url.host or "").lower() == "apps.apple.com" and slug:
+                if resp_host == "apps.apple.com" and slug:
                     return _build_perception_url(slug)
+                if slug and resp_host in VSCO_SHORT_HOSTS:
+                    break
                 return final_url
     except Exception:
         pass
@@ -2807,6 +2810,19 @@ async def _enqueue_download_request(
         await msg.answer("Отправьте username или ссылку профиля VSCO для скачивания.")
         return False
 
+    maybe_url = clean_target if "://" in clean_target else f"https://{clean_target}"
+    slug = _vsco_short_slug(maybe_url)
+    if slug:
+        try:
+            async with aiohttp.ClientSession() as session:
+                resolved = await resolve_vsco_short(maybe_url, session)
+        except Exception:
+            resolved = None
+        if resolved:
+            clean_target = resolved
+        else:
+            clean_target = _build_perception_url(slug)
+
     allowed, info = has_daily_data_access(msg.chat.id, request_user_id)
     if not allowed:
         await msg.answer(info)
@@ -3049,13 +3065,18 @@ def _extract_username_from_target(target: str) -> Optional[str]:
     if USERNAME_RE.match(text):
         return text
     info = classify_vsco_path(text)
-    username = info.get("username") if isinstance(info, dict) else None
+    username = None
+    if isinstance(info, dict):
+        username = info.get("username") or info.get("slug")
     if isinstance(username, str) and username.strip():
         return username.strip()
     if is_vsco_url(text):
         extracted = username_from_vsco_co(text)
         if extracted:
             return extracted
+        slug = _vsco_short_slug(text if "://" in text else f"https://{text}")
+        if slug:
+            return slug
     return None
 
 
