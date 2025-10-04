@@ -81,6 +81,58 @@ def test_text_link_comment_after_space(vsco_module):
     assert pairs == [{"url": "https://vsco.co/anast2010", "comment": "привет"}]
 
 
+def test_media_link_scans_media_assets(monkeypatch, vsco_module):
+    html = """
+    <html>
+      <body>
+        <img src="https://cdn.example.com/media1.jpg?w=640" />
+        <picture>
+          <source srcset="https://cdn.example.com/media2_small.jpg 320w, https://cdn.example.com/media2_large.jpg 1280w" />
+        </picture>
+        <video>
+          <source src="https://cdn.example.com/video.mp4" />
+        </video>
+        <img src="https://static.vsco.co/assets/images/VSCO-logo-white.png" />
+      </body>
+    </html>
+    """
+
+    class DummyResponse:
+        def __init__(self, text: str):
+            self._text = text
+            self.headers = {}
+            self.status = 200
+            self.url = "https://vsco.co/user/media/abc"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def text(self, errors: str = "ignore") -> str:
+            return self._text
+
+    def fake_get(self, url, **kwargs):  # type: ignore[override]
+        return DummyResponse(html)
+
+    monkeypatch.setattr(vsco_module.aiohttp.ClientSession, "get", fake_get, raising=False)
+
+    pairs = [{"url": "https://vsco.co/testuser/media/abc", "comment": "wow"}]
+
+    normalized = asyncio.run(vsco_module.normalize_vsco_pairs(pairs))
+
+    image_urls = [entry["image_url"] for entry in normalized]
+    assert image_urls == [
+        "https://cdn.example.com/media1.jpg?w=2048",
+        "https://cdn.example.com/media2_large.jpg",
+        "https://cdn.example.com/video.mp4",
+    ]
+    assert all(entry["username"] == "testuser" for entry in normalized)
+    assert all(entry["url"] == "https://vsco.co/testuser" for entry in normalized)
+    assert all(entry["comment"] == "wow" for entry in normalized)
+
+
 def test_on_text_replies_with_unique_links(vsco_module):
     msg = DummyMessage(chat_id=123, user_id=555)
     msg.text = "https://vsco.co/uniqueuser"

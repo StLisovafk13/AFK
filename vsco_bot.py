@@ -27,7 +27,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple, Sequence
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse, urljoin
+from urllib.parse import (
+    urlparse,
+    urljoin,
+    urlsplit,
+    urlunsplit,
+    parse_qsl,
+    urlencode,
+)
 import json
 import time
 import tempfile
@@ -62,6 +69,10 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.utils.text_decorations import add_surrogates, remove_surrogates
 import aiohttp
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    BeautifulSoup = None  # type: ignore
 import sys
 import contextlib
 import shlex
@@ -106,6 +117,7 @@ ARCHIVE_ADMIN_CHANNEL_ID_ENV = os.getenv("BOT_ARCHIVE_ADMIN_CHANNEL_ID", "").str
 ARCHIVE_SUMMARY_CHANNEL_ID_ENV = os.getenv("BOT_ARCHIVE_SUMMARY_CHANNEL_ID", "").strip()
 ARCHIVE_ADMIN_CHANNEL_ID: Optional[int | str] = None
 ARCHIVE_SUMMARY_CHANNEL_ID: Optional[int | str] = None
+MEDIA_PAGE_MAX_WIDTH = int(os.getenv("BOT_MEDIA_SCAN_MAX_WIDTH", "2048") or "2048")
 
 
 def _parse_admin_ids(raw: str) -> set[int]:
@@ -553,23 +565,146 @@ async def resolve_vsco_short(url: str, session: aiohttp.ClientSession) -> str:
         request_kwargs={"timeout": 10},
     )
 
-async def fetch_media_image_url(url: str, session: aiohttp.ClientSession) -> Optional[str]:
-    """
-    Пытается достать прямой URL картинки по HTML:
-    - <meta property="og:image">, <meta name="twitter:image">,
-    - responsive_url во встроенном JSON.
-    """
+MEDIA_EXT_RE = re.compile(r"\.(jpg|jpeg|png|webp|mp4|webm|mov)(\?|$)", re.IGNORECASE)
+
+
+def _select_best_from_srcset(srcset: str) -> Optional[str]:
+    try:
+        candidates = []
+        for chunk in srcset.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if " " in chunk:
+                url_part, size_part = chunk.rsplit(" ", 1)
+                try:
+                    width = int(size_part.rstrip("w")) if size_part.endswith("w") else int(size_part)
+                except ValueError:
+                    width = 0
+            else:
+                url_part, width = chunk, 0
+            candidates.append((width, url_part))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda pair: pair[0], reverse=True)
+        return candidates[0][1]
+    except Exception:
+        return None
+
+
+def _normalize_media_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    candidate = url.strip()
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    if candidate.startswith("/"):
+        return urljoin("https://vsco.co/", candidate)
+    return candidate
+
+
+def _is_media_url(url: str) -> bool:
+    if not url:
+        return False
+    return bool(MEDIA_EXT_RE.search(url))
+
+
+def _upscale_w_param(url: str, max_width: int) -> str:
+    if not url or not MEDIA_EXT_RE.search(url):
+        return url
+    if re.search(r"\.(mp4|webm|mov)(\?|$)", url, re.IGNORECASE):
+        return url
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if "w" in query:
+        try:
+            current = int(query["w"])
+        except (ValueError, TypeError):
+            return url
+        if current < max_width:
+            query["w"] = str(max_width)
+            new_query = urlencode(query, doseq=True)
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+    return url
+
+
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def extract_media_urls_from_html(html: str, *, max_width: int) -> List[str]:
+    if not BeautifulSoup:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    urls: List[str] = []
+
+    def push(url: Optional[str]):
+        if not url:
+            return
+        normalized = _normalize_media_url(url)
+        if not normalized or not _is_media_url(normalized):
+            return
+        final_url = _upscale_w_param(normalized, max_width)
+        if not is_vsco_logo_url(final_url):
+            urls.append(final_url)
+
+    for img in soup.find_all("img"):
+        srcset = img.get("srcset")
+        candidate = _select_best_from_srcset(srcset) if srcset else None
+        if not candidate:
+            candidate = img.get("src")
+        push(candidate)
+
+    for picture in soup.find_all("picture"):
+        for source in picture.find_all("source"):
+            candidate = _select_best_from_srcset(source.get("srcset") or "")
+            push(candidate or source.get("src"))
+
+    for video in soup.find_all("video"):
+        push(video.get("src"))
+        for source in video.find_all("source"):
+            push(source.get("src"))
+            srcset = source.get("srcset")
+            if srcset:
+                push(_select_best_from_srcset(srcset))
+
+    return _dedupe_keep_order(urls)
+
+
+async def fetch_media_asset_urls(
+    url: str,
+    session: aiohttp.ClientSession,
+    *,
+    max_width: int = MEDIA_PAGE_MAX_WIDTH,
+) -> List[str]:
+    """Сканирует страницу медиа VSCO и возвращает медиа-URL с апскейлом ?w=."""
+
+    html = ""
     try:
         async with session.get(url, allow_redirects=True, timeout=12, headers=HEADERS) as resp:
             html = await resp.text(errors="ignore")
     except Exception as e:
-        log.warning("fetch_media_image_url failed: %s", e)
-        return None
+        log.warning("fetch_media_asset_urls failed: %s", e)
+        return []
 
-    for candidate in extract_vsco_media_urls(html, sources=("og", "twitter", "responsive")):
-        if candidate:
-            return candidate
-    return None
+    urls = extract_media_urls_from_html(html, max_width=max_width)
+    if not urls:
+        fallback_sources = extract_vsco_media_urls(html, sources=("og", "twitter", "responsive", "inline"))
+        for candidate in fallback_sources:
+            normalized = _normalize_media_url(candidate)
+            if not normalized:
+                continue
+            final_url = _upscale_w_param(normalized, max_width)
+            if not is_vsco_logo_url(final_url) and _is_media_url(final_url):
+                urls.append(final_url)
+
+    return _dedupe_keep_order(urls)
 
 # === Парсер "ссылка, комментарий до следующей ссылки" ========================
 def _expand_text_with_entities(text: Optional[str], entities: Optional[Sequence[MessageEntity]]) -> str:
@@ -697,8 +832,11 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
             elif info["kind"] == "media":
                 usr = info["username"]
                 profile_url = f"https://vsco.co/{usr}"
-                image_url = await fetch_media_image_url(final, s) or final  # fallback: страница медиа
-                res.append({"username": usr, "url": profile_url, "comment": c, "image_url": image_url})
+                asset_urls = await fetch_media_asset_urls(final, s)
+                if not asset_urls:
+                    asset_urls = [final]
+                for asset in asset_urls:
+                    res.append({"username": usr, "url": profile_url, "comment": c, "image_url": asset})
             elif info["kind"] == "perception":
                 slug = info["slug"]
                 res.append({"username": slug, "url": info["final_url"], "comment": c, "image_url": ""})
@@ -2992,10 +3130,22 @@ def rebuild_urls_extracted(user_dir: Path) -> None:
     for item in items:
         if not isinstance(item, dict):
             continue
-        url = item.get("image_url") or item.get("responsive_url")
-        if isinstance(url, str) and not is_vsco_logo_url(url) and url not in seen:
-            urls.append(url)
-            seen.add(url)
+        url: Optional[str] = None
+        ok_flag = item.get("ok")
+        for key in ("image_url", "responsive_url", "url"):
+            candidate = item.get(key)
+            if not isinstance(candidate, str) or not candidate:
+                continue
+            if key == "url" and ok_flag is False:
+                continue
+            url = candidate
+            break
+        if not isinstance(url, str):
+            continue
+        if is_vsco_logo_url(url) or url in seen:
+            continue
+        urls.append(url)
+        seen.add(url)
     if not urls:
         return
     try:
