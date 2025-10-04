@@ -820,14 +820,12 @@ def _count_media(conn: sqlite3.Connection, since_iso: str, chat_id: int, scope: 
         with_c = conn.execute(
             """SELECT COUNT(*) FROM items
                WHERE created_at >= ? AND chat_id = ?
-                 AND image_url IS NOT NULL AND TRIM(image_url) <> ''
                  AND latitude IS NOT NULL AND longitude IS NOT NULL""",
             (since_iso, chat_id)
         ).fetchone()[0]
         without_c = conn.execute(
             """SELECT COUNT(*) FROM items
                WHERE created_at >= ? AND chat_id = ?
-                 AND image_url IS NOT NULL AND TRIM(image_url) <> ''
                  AND (latitude IS NULL OR longitude IS NULL)""",
             (since_iso, chat_id)
         ).fetchone()[0]
@@ -835,14 +833,12 @@ def _count_media(conn: sqlite3.Connection, since_iso: str, chat_id: int, scope: 
         with_c = conn.execute(
             """SELECT COUNT(*) FROM items
                WHERE created_at >= ?
-                 AND image_url IS NOT NULL AND TRIM(image_url) <> ''
                  AND latitude IS NOT NULL AND longitude IS NOT NULL""",
             (since_iso,)
         ).fetchone()[0]
         without_c = conn.execute(
             """SELECT COUNT(*) FROM items
                WHERE created_at >= ?
-                 AND image_url IS NOT NULL AND TRIM(image_url) <> ''
                  AND (latitude IS NULL OR longitude IS NULL)""",
             (since_iso,)
         ).fetchone()[0]
@@ -854,14 +850,12 @@ def _count_totals(conn: sqlite3.Connection, chat_id: int, scope: str) -> Tuple[i
         with_c = conn.execute(
             """SELECT COUNT(*) FROM items
                WHERE chat_id = ?
-                 AND image_url IS NOT NULL AND TRIM(image_url) <> ''
                  AND latitude IS NOT NULL AND longitude IS NOT NULL""",
             (chat_id,)
         ).fetchone()[0]
         without_c = conn.execute(
             """SELECT COUNT(*) FROM items
                WHERE chat_id = ?
-                 AND image_url IS NOT NULL AND TRIM(image_url) <> ''
                  AND (latitude IS NULL OR longitude IS NULL)""",
             (chat_id,)
         ).fetchone()[0]
@@ -869,13 +863,11 @@ def _count_totals(conn: sqlite3.Connection, chat_id: int, scope: str) -> Tuple[i
         u = conn.execute("SELECT COUNT(DISTINCT username) FROM links").fetchone()[0]
         with_c = conn.execute(
             """SELECT COUNT(*) FROM items
-               WHERE image_url IS NOT NULL AND TRIM(image_url) <> ''
-                 AND latitude IS NOT NULL AND longitude IS NOT NULL"""
+               WHERE latitude IS NOT NULL AND longitude IS NOT NULL"""
         ).fetchone()[0]
         without_c = conn.execute(
             """SELECT COUNT(*) FROM items
-               WHERE image_url IS NOT NULL AND TRIM(image_url) <> ''
-                 AND (latitude IS NULL OR longitude IS NULL)"""
+               WHERE latitude IS NULL OR longitude IS NULL"""
         ).fetchone()[0]
     return int(u or 0), int(with_c or 0), int(without_c or 0)
 
