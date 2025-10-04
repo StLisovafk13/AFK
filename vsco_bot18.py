@@ -3280,8 +3280,9 @@ async def _dl_worker():
             async def fs_probe_loop():
                 nonlocal user_dir, total_found, stage, downloaded, zip_parts
                 last_edit = 0.0
-                last_manifest_mtime = 0.0
-                last_urls_mtime = 0.0
+                cutoff = max(job_started - 1.0, 0.0)
+                last_manifest_mtime = cutoff
+                last_urls_mtime = cutoff
                 loop = asyncio.get_running_loop()
                 while not stop_evt.is_set():
                     try:
@@ -3294,7 +3295,7 @@ async def _dl_worker():
                             man = user_dir / "manifest.json"
                             if man.exists():
                                 mtime = man.stat().st_mtime
-                                if mtime > last_manifest_mtime:
+                                if mtime >= cutoff and mtime > last_manifest_mtime:
                                     last_manifest_mtime = mtime
                                     try:
                                         data = json.loads(man.read_text(encoding="utf-8"))
@@ -3315,7 +3316,7 @@ async def _dl_worker():
                                 urls = user_dir / "urls_extracted.txt"
                                 if urls.exists():
                                     mtime = urls.stat().st_mtime
-                                    if mtime > last_urls_mtime:
+                                    if mtime >= cutoff and mtime > last_urls_mtime:
                                         last_urls_mtime = mtime
                                         try:
                                             n = sum(1 for ln in urls.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip())
@@ -3381,8 +3382,7 @@ async def _dl_worker():
                             build_progress_text(stage, job.target, total_found, downloaded, zip_parts),
                             reply_markup=cancel_kb,
                         )
-                        continue
-                    elif any(k in low for k in ("zip", "архив")) and stage is not Stage.ARCHIVE:
+                    if any(k in low for k in ("zip", "архив")) and stage is not Stage.ARCHIVE:
                         stage = Stage.ARCHIVE
                         log.info("Job #%s: stage -> %s", job.id, stage.value)
                         await _safe_edit(
@@ -3391,7 +3391,6 @@ async def _dl_worker():
                             build_progress_text(stage, job.target, total_found, downloaded, zip_parts),
                             reply_markup=cancel_kb,
                         )
-                        continue
 
                     if re.match(r"^\[\d+\]\s+ok", low):
                         downloaded += 1
@@ -3495,7 +3494,14 @@ async def _dl_worker():
                 )
                 if zips:
                     log.info("Job #%s: %d zip(s) ready", job.id, len(zips))
-                    await _safe_edit(job.chat_id, progress.message_id, "📦 Архив(ы) готовы — отправляю…")
+                    stage = Stage.ARCHIVE
+                    zip_parts = len(zips)
+                    await _safe_edit(
+                        job.chat_id,
+                        progress.message_id,
+                        build_progress_text(stage, job.target, total_found, downloaded, zip_parts) + "\n📦 Архивы готовы — отправляю…",
+                        reply_markup=None,
+                    )
                     for z in zips:
                         try:
                             log.info("Job #%s: sending archive %s", job.id, z)
