@@ -273,6 +273,8 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; VSCO-Bot/1.0; +https://example.org/bot)"
 }
 
+VSCO_LOGO_MARKERS = ("vsco-logo-white",)
+
 # ---------------------- DB ----------------------
 def db_connect():
     conn = sqlite3.connect(DB_PATH, timeout=60, check_same_thread=False)
@@ -492,6 +494,12 @@ def is_vsco_url(u: str) -> bool:
         return host in VSCO_HOSTS or host in VSCO_SHORT_HOSTS
     except Exception:
         return False
+
+def is_vsco_logo_url(url: str) -> bool:
+    if not url:
+        return False
+    low = url.lower()
+    return any(marker in low for marker in VSCO_LOGO_MARKERS)
 
 def username_from_vsco_co(url: str) -> Optional[str]:
     try:
@@ -889,7 +897,9 @@ def ingest_download_results(job: "DLJob", user_dir: Path) -> Tuple[int, bool]:
                 if isinstance(value, str) and value.strip():
                     image_url = value.strip()
                     break
-            if not image_url or image_url in seen_urls:
+            if not image_url or is_vsco_logo_url(image_url):
+                continue
+            if image_url in seen_urls:
                 continue
             seen_urls.add(image_url)
             if _get_item_id(conn, username, profile_url, image_url) is None:
@@ -2888,7 +2898,7 @@ def rebuild_urls_extracted(user_dir: Path) -> None:
         if not isinstance(item, dict):
             continue
         url = item.get("image_url") or item.get("responsive_url")
-        if isinstance(url, str) and url not in seen:
+        if isinstance(url, str) and not is_vsco_logo_url(url) and url not in seen:
             urls.append(url)
             seen.add(url)
     if not urls:

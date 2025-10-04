@@ -145,6 +145,7 @@ def test_ingest_download_results_adds_media(vsco_module, tmp_path):
         "items": [
             {"url": "https://cdn.example.com/media1.jpg", "ok": True},
             {"url": "https://cdn.example.com/media2.jpg", "ok": False},
+            {"image_url": "https://cdn.example.com/static/VSCO-logo-white.png", "ok": True},
             {
                 "url": "https://cdn.example.com/media3_small.jpg",
                 "responsive_url": "https://cdn.example.com/media3_large.jpg",
@@ -188,6 +189,13 @@ def test_ingest_download_results_adds_media(vsco_module, tmp_path):
         ),
     ]
     assert link_row == ("sampleuser", "https://vsco.co/sampleuser")
+
+    vsco_module.rebuild_urls_extracted(user_dir)
+    rebuilt_urls = (user_dir / "urls_extracted.txt").read_text(encoding="utf-8").splitlines()
+    assert rebuilt_urls == [
+        "https://cdn.example.com/media1.jpg",
+        "https://cdn.example.com/media3_large.jpg",
+    ]
 
     added_again, link_added_again = vsco_module.ingest_download_results(job, user_dir)
     assert added_again == 0

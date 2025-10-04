@@ -117,6 +117,7 @@ def normalize_profile(username: Optional[str], profile_url: Optional[str]) -> Tu
 # -----------------------------
 MEDIA_EXT_RE = re.compile(r"\.(jpg|jpeg|png|webp|mp4|webm|mov)(\?|$)", re.I)
 POSTER_HINT_RE = re.compile(r"(?i)(poster|thumb|thumbnail|cover|preview|frame)")
+VSCO_LOGO_MARKERS = ("vsco-logo-white",)
 
 def select_best_from_srcset(srcset: str) -> Optional[str]:
     try:
@@ -146,6 +147,12 @@ def normalize_url(u: Optional[str], base: str = "https://") -> Optional[str]:
 def is_media_url(u: str) -> bool:
     if not u: return False
     return bool(MEDIA_EXT_RE.search(u))
+
+def is_vsco_logo_url(url: Optional[str]) -> bool:
+    if not url:
+        return False
+    low = url.lower()
+    return any(marker in low for marker in VSCO_LOGO_MARKERS)
 
 def upscale_w_param(u: str, max_w: int) -> str:
     """
@@ -304,6 +311,11 @@ async def collect_image_urls(
     html = await page.content()
     urls = dedup_keep_order(extract_from_html(html))
     if urls:
+        filtered = [u for u in urls if not is_vsco_logo_url(u)]
+        if len(filtered) != len(urls):
+            logger.info(f"Пропущено {len(urls) - len(filtered)} служебных изображений VSCO-logo-white")
+        urls = filtered
+    if urls:
         logger.info(f"scan_progress {len(urls)}")
     else:
         logger.warning("На первом экране не нашли img/picture. Пробуем прокрутку и кнопку Load More…")
@@ -353,7 +365,13 @@ async def collect_image_urls(
 
         # Повторное извлечение
         html = await page.content()
-        urls = dedup_keep_order(urls + extract_from_html(html))
+        extracted = extract_from_html(html)
+        if extracted:
+            filtered = [u for u in extracted if not is_vsco_logo_url(u)]
+            if len(filtered) != len(extracted):
+                logger.info(f"Пропущено {len(extracted) - len(filtered)} служебных изображений VSCO-logo-white")
+            extracted = filtered
+        urls = dedup_keep_order(urls + extracted)
         if len(urls) > prev_count:
             logger.info(f"scan_progress {len(urls)}")
 
@@ -482,8 +500,13 @@ async def download_all_via_context(
             results.append(meta)
 
     take = urls if max_items == 0 else urls[:max_items]
+    skipped = sum(1 for u in take if is_vsco_logo_url(u))
+    if skipped:
+        logger.info(f"Пропущено {skipped} служебных изображений VSCO-logo-white перед скачиванием")
+        take = [u for u in take if not is_vsco_logo_url(u)]
     logger.info(f"scan_progress {len(take)}")
-    await asyncio.gather(*[fetch(i + 1, u) for i, u in enumerate(take)])
+    if take:
+        await asyncio.gather(*[fetch(i + 1, u) for i, u in enumerate(take)])
     return results
 
 # -----------------------------
