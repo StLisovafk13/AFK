@@ -3279,6 +3279,8 @@ async def _dl_worker():
         txt = f"{icon} <b>{stage.value}</b>: <code>{target}</code>"
         if total_found is not None:
             txt += f"\n🔎 Найдено медиа: <b>{total_found}</b>"
+        elif stage in {Stage.SCAN, Stage.DOWNLOAD}:
+            txt += "\n🔎 Найдено медиа: <b>0</b>"
         if stage is Stage.DOWNLOAD and total_found is not None:
             txt += f"\n📥 Загрузка: <b>{downloaded}/{total_found}</b>"
         if stage is Stage.ARCHIVE and zip_parts is not None:
@@ -3426,15 +3428,16 @@ async def _dl_worker():
                     txt = line.decode("utf-8", "ignore").rstrip()
                     low = txt.lower()
 
-                    if txt.startswith("scan_progress"):
+                    m = re.search(r"\bscan_progress\s+(\d+)", txt)
+                    if not m and txt.startswith("scan_progress"):
                         m = re.search(r"(\d+)", txt)
-                        if m and bump_total(int(m.group(1)), "stdout:scan_progress"):
-                            await _safe_edit(
-                                job.chat_id,
-                                progress.message_id,
-                                build_progress_text(stage, job.target, total_found, downloaded, zip_parts),
-                                reply_markup=cancel_kb,
-                            )
+                    if m and bump_total(int(m.group(1)), "stdout:scan_progress"):
+                        await _safe_edit(
+                            job.chat_id,
+                            progress.message_id,
+                            build_progress_text(stage, job.target, total_found, downloaded, zip_parts),
+                            reply_markup=cancel_kb,
+                        )
                         continue
 
                     if any(k in low for k in ("download", "загрузка", "скачива")) and stage is not Stage.DOWNLOAD:
