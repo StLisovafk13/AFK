@@ -268,8 +268,11 @@ MEDIA_PATH_RE = re.compile(r"^/([^/]+)/media/([A-Za-z0-9]+)")
 SHORT_SLUG_RE = re.compile(r"^/([A-Za-z0-9]+)(?:/.*)?$")
 
 OG_IMAGE_RE = re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.I)
+OG_IMAGE_SECURE_RE = re.compile(r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']', re.I)
 TW_IMAGE_RE = re.compile(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', re.I)
 RESP_URL_RE = re.compile(r'responsive_url"\s*:\s*"([^"]+)"')
+RESP_URL_CAMEL_RE = re.compile(r'responsiveUrl"\s*:\s*"([^"]+)"')
+DOWNLOAD_URL_RE = re.compile(r'download_url"\s*:\s*"([^"]+)"', re.I)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; VSCO-Bot/1.0; +https://example.org/bot)"
@@ -603,11 +606,50 @@ async def resolve_vsco_short(url: str, session: aiohttp.ClientSession) -> str:
         return _build_perception_url(slug)
     return url
 
+def _decode_vsco_media_url(raw: str) -> str:
+    candidate = (raw or "").strip()
+    if not candidate:
+        return ""
+    try:
+        candidate = candidate.encode("utf-8").decode("unicode_escape")
+    except Exception:
+        pass
+    candidate = candidate.replace("\\/", "/").strip()
+    if candidate.startswith("//"):
+        candidate = "https:" + candidate
+    elif candidate.startswith("im.vsco.co") or candidate.startswith("img.vsco.co") or candidate.startswith("image.vsco.co"):
+        candidate = "https://" + candidate
+    return candidate
+
+
+MEDIA_URL_PATTERNS: Tuple[re.Pattern[str], ...] = (
+    OG_IMAGE_RE,
+    OG_IMAGE_SECURE_RE,
+    TW_IMAGE_RE,
+    RESP_URL_RE,
+    RESP_URL_CAMEL_RE,
+    DOWNLOAD_URL_RE,
+)
+
+
+def extract_media_url_from_html(html: str) -> Optional[str]:
+    if not html:
+        return None
+    for rx in MEDIA_URL_PATTERNS:
+        m = rx.search(html)
+        if not m:
+            continue
+        decoded = _decode_vsco_media_url(m.group(1))
+        if decoded and not is_vsco_logo_url(decoded):
+            return decoded
+    return None
+
+
 async def fetch_media_image_url(url: str, session: aiohttp.ClientSession) -> Optional[str]:
     """
     Пытается достать прямой URL картинки по HTML:
     - <meta property="og:image">, <meta name="twitter:image">,
-    - responsive_url во встроенном JSON.
+    - responsive_url / responsiveUrl во встроенном JSON.
     """
     try:
         async with session.get(url, allow_redirects=True, timeout=12, headers=HEADERS) as resp:
@@ -616,11 +658,7 @@ async def fetch_media_image_url(url: str, session: aiohttp.ClientSession) -> Opt
         log.warning("fetch_media_image_url failed: %s", e)
         return None
 
-    for rx in (OG_IMAGE_RE, TW_IMAGE_RE, RESP_URL_RE):
-        m = rx.search(html)
-        if m:
-            return m.group(1)
-    return None
+    return extract_media_url_from_html(html)
 
 # === Парсер "ссылка, комментарий до следующей ссылки" ========================
 def _expand_text_with_entities(text: Optional[str], entities: Optional[Sequence[MessageEntity]]) -> str:

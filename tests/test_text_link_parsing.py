@@ -27,6 +27,26 @@ def vsco_module(tmp_path, monkeypatch):
     asyncio.run(vsco_bot18.bot.session.close())
 
 
+def test_extract_media_url_from_html_meta(vsco_module):
+    html = "<meta property='og:image' content='https://im.vsco.co/path/to/image.jpg?w=1200'/>"
+    extracted = vsco_module.extract_media_url_from_html(html)
+    assert extracted == "https://im.vsco.co/path/to/image.jpg?w=1200"
+
+
+def test_extract_media_url_from_html_responsive_url(vsco_module):
+    raw = 'https:\\/\\/img.vsco.co\\u002Fbucket\\u002Fitem.jpg'
+    html = f"<script>window.__VSCO__ = {{\"responsiveUrl\":\"{raw}\"}}</script>"
+    extracted = vsco_module.extract_media_url_from_html(html)
+    assert extracted == "https://img.vsco.co/bucket/item.jpg"
+
+
+def test_extract_media_url_from_html_scheme_less(vsco_module):
+    raw = 'im.vsco.co\\u002Faws-us-west-2\\u002Fmedia_id.jpg'
+    html = f"<script>window.__VSCO__ = {{\"responsiveUrl\":\"{raw}\"}}</script>"
+    extracted = vsco_module.extract_media_url_from_html(html)
+    assert extracted == "https://im.vsco.co/aws-us-west-2/media_id.jpg"
+
+
 def test_text_link_message_inserts_profile(vsco_module):
     text = "anast2010, hi"
     entity = MessageEntity(type="text_link", offset=0, length=9, url="https://vsco.co/anast2010")
