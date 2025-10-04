@@ -12,12 +12,19 @@ import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
-from urllib.parse import urlparse, urlunparse, urljoin
 
 import aiohttp
 from aiogram import Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, BufferedInputFile
+
+from vsco_utils import (
+    build_perception_gallery_url,
+    extract_vsco_media_urls,
+    normalize_vsco_profile_url,
+    resolve_vsco_short_link,
+    vsco_short_slug,
+)
 
 zip_router = Router(name="zip_profile")
 
@@ -90,10 +97,6 @@ async def _http_simple(headers: Optional[dict] = None):
         yield s
 
 # ------------ VSCO parsing ------------
-_IMG_RE = re.compile(r'https://[^"\']+\.(?:jpg|jpeg|png|webp)(?:\?[^"\']*)?', re.IGNORECASE)
-_RESP_URL_RE = re.compile(r'"responsive_url"\s*:\s*"(?P<u>https://[^"]+)"', re.IGNORECASE)
-_TWITTER_IMG_RE = re.compile(r'<meta\s+name=["\']twitter:image["\']\s+content=["\'](?P<u>https://[^"\']+)["\']', re.IGNORECASE)
-
 # NEW: site_id finders
 _SITE_ID_RE_LIST = [
     re.compile(r'"site_id"\s*:\s*(\d+)', re.IGNORECASE),
@@ -101,103 +104,44 @@ _SITE_ID_RE_LIST = [
     re.compile(r'\bsiteId\s*:\s*(\d+)\b', re.IGNORECASE),
 ]
 
-def _normalize_vsco_profile_url(u: str) -> Optional[str]:
-    if not u:
-        return None
-    u = u.strip()
-    if u.startswith("http://"):
-        u = "https://" + u[len("http://"):]
-    try:
-        p = urlparse(u if "://" in u else "https://" + u)
-        host = (p.netloc or "").lower()
-        if "vsco.co" in host:
-            parts = [seg for seg in (p.path or "").split("/") if seg]
-            if not parts:
-                return None
-            # normalize to /<user>/gallery
-            new_path = f"/{parts[0]}/gallery"
-            return urlunparse(("https", "vsco.co", new_path, "", "", ""))
-        elif host == "vs.co":
-            return u  # resolve later
-        elif host == "perception.vsco.co":
-            parts = [seg for seg in (p.path or "").split("/") if seg]
-            if parts:
-                slug = parts[0]
-                return f"https://perception.vsco.co/{slug}/gallery"
-    except Exception:
-        return None
-    return None
 
 async def resolve_vsco_short_or_profile(u: str, stats: ZipStats) -> Optional[str]:
-    """Accepts vs.co or vsco.co/* — returns normalized https://vsco.co/<user>/gallery"""
-    norm = _normalize_vsco_profile_url(u)
-    if norm and "vs.co" not in norm:
+    """Return a normalized VSCO profile URL for vs.co/vsco.co inputs."""
+
+    raw = (u or "").strip()
+    if not raw:
+        return None
+
+    norm = normalize_vsco_profile_url(raw)
+    if norm and not norm.lower().startswith("https://vs.co"):
         stats.normalized_url = norm
         return norm
-    # resolve vs.co short link
+
+    candidate = norm or raw
+    slug = vsco_short_slug(candidate)
+
     async with _http_simple() as s:
         try:
-            current = u
-            slug = None
-            try:
-                p = urlparse(u)
-                if (p.netloc or "").lower() == "vs.co":
-                    parts = [seg for seg in (p.path or "").split("/") if seg]
-                    if parts:
-                        slug = parts[0]
-            except Exception:
-                slug = None
-
-            for _ in range(5):
-                async with s.get(current, allow_redirects=False) as r:
-                    status = r.status
-                    final = str(r.url)
-                    if status in (301, 302, 303, 307, 308):
-                        location = r.headers.get("Location")
-                        if not location:
-                            break
-                        next_url = urljoin(final, location)
-                        try:
-                            parsed = urlparse(next_url)
-                        except Exception:
-                            parsed = None
-                        host = (parsed.netloc or "").lower() if parsed else ""
-                        if host == "apps.apple.com" and slug:
-                            candidate = f"https://perception.vsco.co/{slug}/gallery"
-                            stats.normalized_url = candidate
-                            return candidate
-                        if host == "perception.vsco.co" and slug:
-                            candidate = f"https://perception.vsco.co/{slug}/gallery"
-                            stats.normalized_url = candidate
-                            return candidate
-                        current = next_url
-                        continue
-
-                    host = (r.url.host or "").lower() if r.url else ""
-                    if host == "apps.apple.com" and slug:
-                        candidate = f"https://perception.vsco.co/{slug}/gallery"
-                        stats.normalized_url = candidate
-                        return candidate
-                    if host == "perception.vsco.co" and slug:
-                        candidate = f"https://perception.vsco.co/{slug}/gallery"
-                        stats.normalized_url = candidate
-                        return candidate
-
-                    if r.status in (200, 201):
-                        host = (r.url.host or "").lower() if r.url else ""
-                        if slug and host in {"vs.co", "www.vs.co"}:
-                            break
-                        norm2 = _normalize_vsco_profile_url(final)
-                        stats.normalized_url = norm2
-                        return norm2
-                    break
-            log.warning("resolve_vsco_short: redirect resolution failed", extra=stats.asdict())
+            resolved = await resolve_vsco_short_link(candidate, s)
         except Exception:
             log.exception("resolve_vsco_short: exception", extra=stats.asdict())
+            resolved = None
+
+    normalized = normalize_vsco_profile_url(resolved) if resolved else None
+    if normalized:
+        stats.normalized_url = normalized
+        return normalized
+
+    if resolved:
+        stats.normalized_url = resolved
+        return resolved
+
     if slug:
-        candidate = f"https://perception.vsco.co/{slug}/gallery"
-        stats.normalized_url = candidate
-        return candidate
+        fallback = build_perception_gallery_url(slug)
+        stats.normalized_url = fallback
+        return fallback
+
+    log.warning("resolve_vsco_short: redirect resolution failed", extra=stats.asdict())
     return None
 
 def _extract_site_id(html: str) -> Optional[str]:
@@ -289,13 +233,7 @@ async def fetch_vsco_profile_image_urls(profile_url: str, stats: ZipStats, max_u
             log.exception("profile_fetch: exception", extra=stats.asdict())
             return []
 
-    urls: List[str] = []
-    # 1) responsive_url from embedded JSON
-    urls += [m.group("u") for m in _RESP_URL_RE.finditer(html)]
-    # 2) twitter:image meta
-    urls += [m.group("u") for m in _TWITTER_IMG_RE.finditer(html)]
-    # 3) any *.jpg|png|webp in HTML
-    urls += _IMG_RE.findall(html)
+    urls = extract_vsco_media_urls(html, sources=("responsive", "twitter", "inline"))
 
     stats.urls_found = len(urls)
     urls = _dedup_preserve_order(urls)

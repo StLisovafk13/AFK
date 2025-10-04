@@ -67,10 +67,21 @@ import contextlib
 import shlex
 
 # ---- external utils (optional HTML export parser) ----
-from vsco_parser3 import parse_html_file, dedupe_rows
+from vsco_parser import parse_html_file, dedupe_rows
 
 from zip_profile import zip_router
-from vsco_utils import is_vsco_logo_url
+from vsco_utils import (
+    VSCO_HOSTS,
+    VSCO_PERCEPTION_HOSTS,
+    VSCO_SHORT_HOSTS,
+    SHORT_SLUG_RE,
+    extract_vsco_media_urls,
+    normalize_vsco_profile_url,
+    resolve_vsco_short_link,
+    vsco_short_slug,
+    build_perception_gallery_url,
+    is_vsco_logo_url,
+)
 
 # ---------------------- setup & logging ----------------------
 load_dotenv()
@@ -254,9 +265,6 @@ if pd is None:
     log.warning("pandas is not installed; CSV features are disabled")
 
 # ---------------------- VSCO constants ----------------------
-VSCO_HOSTS = {"vsco.co", "www.vsco.co"}
-VSCO_SHORT_HOSTS = {"vs.co", "www.vs.co"}
-VSCO_PERCEPTION_HOSTS = {"perception.vsco.co", "www.perception.vsco.co"}
 VSCO_RESERVED = {
     "", "discover", "search", "images", "image", "media", "terms", "privacy",
     "about", "gallery", "videos", "press", "company", "legal", "pricing",
@@ -266,11 +274,6 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 TG_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
 URL_RE = re.compile(r'(https?://[^\s<>"\'\]\)]+)', re.IGNORECASE)
 MEDIA_PATH_RE = re.compile(r"^/([^/]+)/media/([A-Za-z0-9]+)")
-SHORT_SLUG_RE = re.compile(r"^/([A-Za-z0-9]+)(?:/.*)?$")
-
-OG_IMAGE_RE = re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.I)
-TW_IMAGE_RE = re.compile(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', re.I)
-RESP_URL_RE = re.compile(r'responsive_url"\s*:\s*"([^"]+)"')
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; VSCO-Bot/1.0; +https://example.org/bot)"
@@ -527,7 +530,7 @@ def classify_vsco_path(url: str) -> Dict[str, Any]:
                     return {
                         "kind": "perception",
                         "slug": slug,
-                        "final_url": f"https://perception.vsco.co/{slug}/gallery"
+                        "final_url": build_perception_gallery_url(slug),
                     }
         m = MEDIA_PATH_RE.match(path)
         if m:
@@ -542,59 +545,13 @@ def classify_vsco_path(url: str) -> Dict[str, Any]:
         pass
     return {}
 
-def _build_perception_url(slug: str) -> str:
-    return f"https://perception.vsco.co/{slug}/gallery"
-
-
-def _vsco_short_slug(url: str) -> Optional[str]:
-    try:
-        p = urlparse(url)
-        if (p.netloc or "").lower() not in VSCO_SHORT_HOSTS:
-            return None
-        m = SHORT_SLUG_RE.match(p.path or "")
-        if m:
-            return m.group(1)
-    except Exception:
-        return None
-    return None
-
-
 async def resolve_vsco_short(url: str, session: aiohttp.ClientSession) -> str:
-    slug = _vsco_short_slug(url)
-    current = url
-    try:
-        for _ in range(5):
-            async with session.get(current, allow_redirects=False, timeout=10, headers=HEADERS) as resp:
-                final_url = str(resp.url)
-                status = resp.status
-                if status in (301, 302, 303, 307, 308):
-                    location = resp.headers.get("Location")
-                    if not location:
-                        break
-                    next_url = urljoin(final_url, location)
-                    try:
-                        parsed = urlparse(next_url)
-                    except Exception:
-                        parsed = None
-                    if parsed and (parsed.netloc or "").lower() in VSCO_PERCEPTION_HOSTS and slug:
-                        return _build_perception_url(slug)
-                    if parsed and (parsed.netloc or "").lower() == "apps.apple.com" and slug:
-                        return _build_perception_url(slug)
-                    current = next_url
-                    continue
-                resp_host = (resp.url.host or "").lower() if resp.url else ""
-                if resp_host in VSCO_PERCEPTION_HOSTS and slug:
-                    return _build_perception_url(slug)
-                if resp_host == "apps.apple.com" and slug:
-                    return _build_perception_url(slug)
-                if slug and resp_host in VSCO_SHORT_HOSTS:
-                    break
-                return final_url
-    except Exception:
-        pass
-    if slug:
-        return _build_perception_url(slug)
-    return url
+    return await resolve_vsco_short_link(
+        url,
+        session,
+        headers=HEADERS,
+        request_kwargs={"timeout": 10},
+    )
 
 async def fetch_media_image_url(url: str, session: aiohttp.ClientSession) -> Optional[str]:
     """
@@ -609,10 +566,9 @@ async def fetch_media_image_url(url: str, session: aiohttp.ClientSession) -> Opt
         log.warning("fetch_media_image_url failed: %s", e)
         return None
 
-    for rx in (OG_IMAGE_RE, TW_IMAGE_RE, RESP_URL_RE):
-        m = rx.search(html)
-        if m:
-            return m.group(1)
+    for candidate in extract_vsco_media_urls(html, sources=("og", "twitter", "responsive")):
+        if candidate:
+            return candidate
     return None
 
 # === Парсер "ссылка, комментарий до следующей ссылки" ========================
@@ -2804,7 +2760,7 @@ async def _enqueue_download_request(
         return False
 
     maybe_url = clean_target if "://" in clean_target else f"https://{clean_target}"
-    slug = _vsco_short_slug(maybe_url)
+    slug = vsco_short_slug(maybe_url)
     if slug:
         try:
             async with aiohttp.ClientSession() as session:
@@ -2812,9 +2768,9 @@ async def _enqueue_download_request(
         except Exception:
             resolved = None
         if resolved:
-            clean_target = resolved
+            clean_target = normalize_vsco_profile_url(resolved) or resolved
         else:
-            clean_target = _build_perception_url(slug)
+            clean_target = build_perception_gallery_url(slug)
 
     allowed, info = has_daily_data_access(msg.chat.id, request_user_id)
     if not allowed:
@@ -3067,7 +3023,7 @@ def _extract_username_from_target(target: str) -> Optional[str]:
         extracted = username_from_vsco_co(text)
         if extracted:
             return extracted
-        slug = _vsco_short_slug(text if "://" in text else f"https://{text}")
+        slug = vsco_short_slug(text if "://" in text else f"https://{text}")
         if slug:
             return slug
     return None

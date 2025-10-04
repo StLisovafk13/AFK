@@ -19,12 +19,12 @@ def vsco_module(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_LOGDIR", str(tmp_path / "logs"))
     monkeypatch.setenv("BOT_ADMIN_IDS", "42, 99")
 
-    sys.modules.pop("vsco_bot18", None)
+    sys.modules.pop("vsco_bot", None)
     sys.modules.pop("zip_profile", None)
-    vsco_bot18 = importlib.import_module("vsco_bot18")
-    vsco_bot18.init_db()
-    yield vsco_bot18
-    asyncio.run(vsco_bot18.bot.session.close())
+    vsco_bot = importlib.import_module("vsco_bot")
+    vsco_bot.init_db()
+    yield vsco_bot
+    asyncio.run(vsco_bot.bot.session.close())
 
 
 def test_text_link_message_inserts_profile(vsco_module):
