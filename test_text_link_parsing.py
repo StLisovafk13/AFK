@@ -27,13 +27,26 @@ def vsco_module(tmp_path, monkeypatch):
     asyncio.run(vsco_bot.bot.session.close())
 
 
-def test_text_link_message_inserts_profile(vsco_module):
+def test_text_link_message_inserts_profile(monkeypatch, vsco_module):
     text = "anast2010, hi"
     entity = MessageEntity(type="text_link", offset=0, length=9, url="https://vsco.co/anast2010")
     pairs = vsco_module.parse_vsco_pairs_from_message(text, [entity])
     assert pairs == [{"url": "https://vsco.co/anast2010", "comment": "hi"}]
 
+    async def fake_profile_media(url, session, *, max_urls=None):
+        return ["https://cdn.example.com/anast2010/photo1.jpg"]
+
+    monkeypatch.setattr(vsco_module, "fetch_profile_media_urls", fake_profile_media)
+
     normalized = asyncio.run(vsco_module.normalize_vsco_pairs(pairs))
+    assert normalized == [
+        {
+            "username": "anast2010",
+            "url": "https://vsco.co/anast2010",
+            "comment": "hi",
+            "image_url": "https://cdn.example.com/anast2010/photo1.jpg",
+        }
+    ]
     items_added, comments_added, new_links = vsco_module.upsert_items_with_comments(
         chat_id=100,
         pairs=normalized,
@@ -49,13 +62,17 @@ def test_text_link_message_inserts_profile(vsco_module):
     conn = vsco_module.db_connect()
     try:
         link_row = conn.execute("SELECT username, url FROM links").fetchone()
-        item_row = conn.execute("SELECT username, profile_url FROM items").fetchone()
+        item_row = conn.execute("SELECT username, profile_url, image_url FROM items").fetchone()
         comment_row = conn.execute("SELECT comment FROM comments").fetchone()
     finally:
         conn.close()
 
     assert link_row == ("anast2010", "https://vsco.co/anast2010")
-    assert item_row == ("anast2010", "https://vsco.co/anast2010")
+    assert item_row == (
+        "anast2010",
+        "https://vsco.co/anast2010",
+        "https://cdn.example.com/anast2010/photo1.jpg",
+    )
     assert comment_row == ("hi",)
 
 
@@ -133,7 +150,12 @@ def test_media_link_scans_media_assets(monkeypatch, vsco_module):
     assert all(entry["comment"] == "wow" for entry in normalized)
 
 
-def test_on_text_replies_with_unique_links(vsco_module):
+def test_on_text_replies_with_unique_links(monkeypatch, vsco_module):
+    async def fake_profile_media(url, session, *, max_urls=None):
+        return []
+
+    monkeypatch.setattr(vsco_module, "fetch_profile_media_urls", fake_profile_media)
+
     msg = DummyMessage(chat_id=123, user_id=555)
     msg.text = "https://vsco.co/uniqueuser"
     msg.entities = None

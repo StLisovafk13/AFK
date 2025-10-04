@@ -118,6 +118,7 @@ ARCHIVE_SUMMARY_CHANNEL_ID_ENV = os.getenv("BOT_ARCHIVE_SUMMARY_CHANNEL_ID", "")
 ARCHIVE_ADMIN_CHANNEL_ID: Optional[int | str] = None
 ARCHIVE_SUMMARY_CHANNEL_ID: Optional[int | str] = None
 MEDIA_PAGE_MAX_WIDTH = int(os.getenv("BOT_MEDIA_SCAN_MAX_WIDTH", "2048") or "2048")
+PROFILE_SCAN_MAX_MEDIA = int(os.getenv("BOT_PROFILE_SCAN_MAX_MEDIA", "0") or "0")
 
 
 def _parse_admin_ids(raw: str) -> set[int]:
@@ -638,6 +639,13 @@ def _dedupe_keep_order(items: List[str]) -> List[str]:
     return out
 
 
+_PROFILE_SITE_ID_RE_LIST = [
+    re.compile(r'"site_id"\s*:\s*(\d+)', re.IGNORECASE),
+    re.compile(r'data-site-id=["\'](\d+)["\']', re.IGNORECASE),
+    re.compile(r'\bsiteId\s*:\s*(\d+)\b', re.IGNORECASE),
+]
+
+
 def extract_media_urls_from_html(html: str, *, max_width: int) -> List[str]:
     if not BeautifulSoup:
         return []
@@ -675,6 +683,157 @@ def extract_media_urls_from_html(html: str, *, max_width: int) -> List[str]:
                 push(_select_best_from_srcset(srcset))
 
     return _dedupe_keep_order(urls)
+
+
+def _normalize_profile_media_candidate(candidate: Optional[str]) -> Optional[str]:
+    normalized = _normalize_media_url(candidate)
+    if not normalized or not _is_media_url(normalized):
+        return None
+    final_url = _upscale_w_param(normalized, MEDIA_PAGE_MAX_WIDTH)
+    if not is_vsco_logo_url(final_url):
+        return final_url
+    return None
+
+
+def _extract_site_id_from_html(html: str) -> Optional[str]:
+    for rx in _PROFILE_SITE_ID_RE_LIST:
+        m = rx.search(html)
+        if m:
+            return m.group(1)
+    return None
+
+
+async def _fetch_profile_media_urls_from_api(
+    session: aiohttp.ClientSession,
+    site_id: str,
+    *,
+    max_urls: Optional[int] = None,
+) -> List[str]:
+    if not site_id:
+        return []
+
+    urls: List[str] = []
+    page = 1
+    size = 100
+    limit = max_urls if max_urls and max_urls > 0 else None
+
+    def push(candidate: Optional[str]) -> None:
+        final = _normalize_profile_media_candidate(candidate)
+        if final:
+            urls.append(final)
+
+    while True:
+        if limit is not None and len(urls) >= limit:
+            break
+        api_url = f"https://vsco.co/api/2.0/medias?site_id={site_id}&page={page}&size={size}"
+        try:
+            async with session.get(
+                api_url,
+                allow_redirects=True,
+                headers=HEADERS,
+            ) as resp:
+                if resp.status != 200:
+                    log.debug(
+                        "profile_api_fetch_non_200 status=%s site_id=%s page=%s",
+                        resp.status,
+                        site_id,
+                        page,
+                    )
+                    break
+                data = await resp.json(content_type=None)
+        except Exception as e:
+            log.warning(
+                "profile_api_fetch_failed site_id=%s page=%s error=%s",
+                site_id,
+                page,
+                e,
+            )
+            break
+
+        items = (data or {}).get("medias") or (data or {}).get("media") or []
+        if not isinstance(items, list) or not items:
+            break
+
+        for item in items:
+            if limit is not None and len(urls) >= limit:
+                break
+            if not isinstance(item, dict):
+                continue
+            for key in ("responsive_url", "image_url", "url"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    push(value.strip())
+            image_block = item.get("image")
+            if isinstance(image_block, dict):
+                for key in ("cdn_url", "url", "path"):
+                    value = image_block.get(key)
+                    if isinstance(value, str) and value.strip():
+                        push(value.strip())
+            variants = item.get("images") or item.get("variants") or []
+            if isinstance(variants, list):
+                for variant in variants:
+                    if limit is not None and len(urls) >= limit:
+                        break
+                    if not isinstance(variant, dict):
+                        continue
+                    for key in ("url", "cdn_url"):
+                        value = variant.get(key)
+                        if isinstance(value, str) and value.strip():
+                            push(value.strip())
+
+        page += 1
+
+    deduped = _dedupe_keep_order(urls)
+    if limit is not None and len(deduped) > limit:
+        deduped = deduped[:limit]
+    return deduped
+
+
+async def fetch_profile_media_urls(
+    profile_url: str,
+    session: aiohttp.ClientSession,
+    *,
+    max_urls: Optional[int] = None,
+) -> List[str]:
+    normalized = normalize_vsco_profile_url(profile_url) or profile_url
+    html = ""
+    try:
+        async with session.get(
+            normalized,
+            allow_redirects=True,
+            headers=HEADERS,
+        ) as resp:
+            if resp.status != 200:
+                log.debug(
+                    "profile_fetch_non_200 status=%s url=%s",
+                    resp.status,
+                    normalized,
+                )
+                return []
+            html = await resp.text(errors="ignore")
+    except Exception as e:
+        log.warning("profile_fetch_failed url=%s error=%s", normalized, e)
+        return []
+
+    urls = extract_media_urls_from_html(html, max_width=MEDIA_PAGE_MAX_WIDTH)
+    if not urls:
+        fallback_candidates = extract_vsco_media_urls(html, sources=("responsive", "twitter", "inline", "og"))
+        for candidate in fallback_candidates:
+            final = _normalize_profile_media_candidate(candidate)
+            if final:
+                urls.append(final)
+
+    deduped = _dedupe_keep_order(urls)
+    limit = max_urls if max_urls and max_urls > 0 else None
+    if deduped:
+        if limit is not None and len(deduped) > limit:
+            deduped = deduped[:limit]
+        return deduped
+
+    site_id = _extract_site_id_from_html(html)
+    if not site_id:
+        return []
+    return await _fetch_profile_media_urls_from_api(session, site_id, max_urls=max_urls)
 
 
 async def fetch_media_asset_urls(
@@ -807,9 +966,11 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
     Возвращает элементы:
       {'username':..., 'url': <profile_url>, 'comment':..., 'image_url': <'' или ссылка на картинку>}
     """
-    if not pairs: return []
+    if not pairs:
+        return []
     res: List[Dict[str, str]] = []
-    async with aiohttp.ClientSession() as s:
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout, headers=HEADERS) as s:
         for pair in pairs:
             u = pair.get("url", ""); c = (pair.get("comment") or "").strip()
             if not is_vsco_url(u):
@@ -828,7 +989,37 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
                 continue
 
             if info["kind"] == "profile":
-                res.append({"username": info["username"], "url": info["final_url"], "comment": c, "image_url": ""})
+                username = info["username"]
+                profile_url = info["final_url"]
+                max_urls = PROFILE_SCAN_MAX_MEDIA if PROFILE_SCAN_MAX_MEDIA > 0 else None
+                media_urls: List[str] = []
+                try:
+                    media_urls = await fetch_profile_media_urls(
+                        profile_url,
+                        s,
+                        max_urls=max_urls,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "profile_media_fetch_failed username=%s error=%s",
+                        username,
+                        e,
+                    )
+                if media_urls:
+                    for asset in media_urls:
+                        res.append({
+                            "username": username,
+                            "url": profile_url,
+                            "comment": c,
+                            "image_url": asset,
+                        })
+                else:
+                    res.append({
+                        "username": username,
+                        "url": profile_url,
+                        "comment": c,
+                        "image_url": "",
+                    })
             elif info["kind"] == "media":
                 usr = info["username"]
                 profile_url = f"https://vsco.co/{usr}"
