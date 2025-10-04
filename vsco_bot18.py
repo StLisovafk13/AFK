@@ -273,6 +273,8 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; VSCO-Bot/1.0; +https://example.org/bot)"
 }
 
+VSCO_LOGO_MARKERS = ("vsco-logo-white",)
+
 # ---------------------- DB ----------------------
 def db_connect():
     conn = sqlite3.connect(DB_PATH, timeout=60, check_same_thread=False)
@@ -492,6 +494,12 @@ def is_vsco_url(u: str) -> bool:
         return host in VSCO_HOSTS or host in VSCO_SHORT_HOSTS
     except Exception:
         return False
+
+def is_vsco_logo_url(url: str) -> bool:
+    if not url:
+        return False
+    low = url.lower()
+    return any(marker in low for marker in VSCO_LOGO_MARKERS)
 
 def username_from_vsco_co(url: str) -> Optional[str]:
     try:
@@ -800,6 +808,193 @@ def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_f
         return (added, new_links)
     finally:
         conn.close()
+
+
+def ingest_download_results(job: "DLJob", user_dir: Path) -> Tuple[int, bool]:
+    """Ingest downloaded VSCO media links from the downloader manifest into the DB.
+
+    Returns a tuple ``(items_added, profile_link_added)``.
+    """
+
+    manifest_path = user_dir / "manifest.json"
+    manifest_meta: Dict[str, Any] = {}
+    items_data: List[Dict[str, Any]] = []
+
+    if manifest_path.exists():
+        try:
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            log.warning("Job #%s: failed to read manifest %s", job.id, manifest_path)
+        else:
+            if isinstance(raw, dict):
+                manifest_meta = raw
+                maybe_items = raw.get("items")
+                if isinstance(maybe_items, list):
+                    items_data = [x for x in maybe_items if isinstance(x, dict)]
+            elif isinstance(raw, list):
+                items_data = [x for x in raw if isinstance(x, dict)]
+
+    if not items_data:
+        urls_path = user_dir / "urls_extracted.txt"
+        if urls_path.exists():
+            try:
+                urls = [line.strip() for line in urls_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            except Exception:
+                urls = []
+            if urls:
+                items_data = [{"url": u, "ok": True} for u in urls]
+
+    username = _extract_username_from_target(job.target)
+    if not username:
+        candidate = manifest_meta.get("username") if isinstance(manifest_meta, dict) else None
+        if isinstance(candidate, str) and candidate.strip():
+            username = candidate.strip()
+
+    profile_url = ""
+    manifest_profile = manifest_meta.get("profile_url") if isinstance(manifest_meta, dict) else None
+    if isinstance(manifest_profile, str) and manifest_profile.strip():
+        info = classify_vsco_path(manifest_profile.strip())
+        if info.get("kind") == "profile" and isinstance(info.get("final_url"), str):
+            profile_url = info["final_url"].strip()
+        elif is_vsco_url(manifest_profile):
+            profile_url = manifest_profile.strip()
+
+    if not username and profile_url:
+        extracted = username_from_vsco_co(profile_url)
+        if extracted:
+            username = extracted
+
+    if not profile_url and username:
+        profile_url = f"https://vsco.co/{username}"
+
+    if not profile_url and job.target and is_vsco_url(job.target):
+        info = classify_vsco_path(job.target)
+        if info.get("kind") == "profile" and isinstance(info.get("final_url"), str):
+            profile_url = info["final_url"].strip()
+        else:
+            profile_url = job.target.strip()
+
+    username = (username or "").strip().lstrip("@")
+    profile_url = (profile_url or "").strip()
+
+    if not username and not profile_url:
+        log.info("Job #%s: skipped DB ingest — username/profile unresolved", job.id)
+        return (0, False)
+
+    conn = db_connect()
+    added_items = 0
+    link_added = False
+    try:
+        seen_urls: set[str] = set()
+        for item in items_data:
+            if not isinstance(item, dict):
+                continue
+            if "ok" in item and not item.get("ok"):
+                continue
+            image_url = ""
+            for key in ("image_url", "responsive_url", "url"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    image_url = value.strip()
+                    break
+            if not image_url or is_vsco_logo_url(image_url):
+                continue
+            if image_url in seen_urls:
+                continue
+            seen_urls.add(image_url)
+            if _get_item_id(conn, username, profile_url, image_url) is None:
+                _insert_item(
+                    conn,
+                    chat_id=job.chat_id,
+                    username=username,
+                    profile_url=profile_url,
+                    image_url=image_url,
+                    latitude=None,
+                    longitude=None,
+                    source="download",
+                    source_file=user_dir.name,
+                    added_by=job.requested_by,
+                )
+                added_items += 1
+
+        if username and profile_url:
+            link_added = add_vsco_link_legacy(username, profile_url, job.chat_id, conn)
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    return (added_items, link_added)
+
+
+def _manifest_item_has_media(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if item.get("ok") is False:
+        return False
+    for key in ("image_url", "responsive_url", "url"):
+        value = item.get(key)
+        if isinstance(value, str):
+            value = value.strip()
+            if value and not is_vsco_logo_url(value):
+                return True
+    return False
+
+
+def infer_media_total_from_manifest(raw: Any) -> Optional[int]:
+    total: Optional[int] = None
+
+    def _bump(candidate: Optional[int]) -> None:
+        nonlocal total
+        if isinstance(candidate, int) and candidate > 0:
+            total = candidate if total is None else max(total, candidate)
+
+    if isinstance(raw, dict):
+        for key in ("count", "total", "items_count", "media_count"):
+            _bump(raw.get(key))
+        items = raw.get("items")
+        if isinstance(items, list):
+            count = sum(1 for item in items if _manifest_item_has_media(item))
+            _bump(count)
+    elif isinstance(raw, list):
+        count = sum(1 for item in raw if _manifest_item_has_media(item))
+        _bump(count)
+
+    return total
+
+
+def infer_media_total_from_urls_file(path: Path) -> Optional[int]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return None
+    total = 0
+    for line in text.splitlines():
+        url = line.strip()
+        if not url or is_vsco_logo_url(url):
+            continue
+        total += 1
+    return total or None
+
+
+def infer_media_total(user_dir: Path) -> Optional[int]:
+    manifest = user_dir / "manifest.json"
+    if manifest.exists():
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except Exception:
+            data = None
+        total = infer_media_total_from_manifest(data)
+        if total is not None:
+            return total
+
+    urls_file = user_dir / "urls_extracted.txt"
+    if urls_file.exists():
+        total = infer_media_total_from_urls_file(urls_file)
+        if total is not None:
+            return total
+
+    return None
 
 # ---------------------- Stats ----------------------
 _USERNAME_KEY_SQL = "LOWER(TRIM(COALESCE(username,'')))"
@@ -2773,7 +2968,7 @@ def rebuild_urls_extracted(user_dir: Path) -> None:
         if not isinstance(item, dict):
             continue
         url = item.get("image_url") or item.get("responsive_url")
-        if isinstance(url, str) and url not in seen:
+        if isinstance(url, str) and not is_vsco_logo_url(url) and url not in seen:
             urls.append(url)
             seen.add(url)
     if not urls:
@@ -3090,6 +3285,22 @@ async def _dl_worker():
             txt += f"\n🗜️ Архив: будет {zip_parts} томов"
         return txt
 
+    def bump_total(candidate: Optional[int], origin: str) -> bool:
+        nonlocal total_found
+        if candidate is None:
+            return False
+        try:
+            candidate_int = int(candidate)
+        except (TypeError, ValueError):
+            return False
+        if candidate_int <= 0:
+            return False
+        if total_found is None or candidate_int > total_found:
+            total_found = candidate_int
+            log.info("Job #%s: media total updated to %d via %s", job.id, total_found, origin)
+            return True
+        return False
+
     async def _safe_edit(chat_id: int, message_id: int, text: str, reply_markup=None):
         try:
             await bot.edit_message_text(
@@ -3155,8 +3366,9 @@ async def _dl_worker():
             async def fs_probe_loop():
                 nonlocal user_dir, total_found, stage, downloaded, zip_parts
                 last_edit = 0.0
-                last_manifest_mtime = 0.0
-                last_urls_mtime = 0.0
+                cutoff = max(job_started - 1.0, 0.0)
+                last_manifest_mtime = cutoff
+                last_urls_mtime = cutoff
                 loop = asyncio.get_running_loop()
                 while not stop_evt.is_set():
                     try:
@@ -3165,44 +3377,29 @@ async def _dl_worker():
                             if cand:
                                 user_dir = max(cand, key=lambda p: p.stat().st_mtime)
                                 log.debug("Job #%s: working directory %s", job.id, user_dir)
-                        if user_dir and total_found is None:
+                        progress_dirty = False
+                        if user_dir:
                             man = user_dir / "manifest.json"
                             if man.exists():
                                 mtime = man.stat().st_mtime
-                                if mtime > last_manifest_mtime:
+                                if mtime >= cutoff and mtime > last_manifest_mtime:
                                     last_manifest_mtime = mtime
                                     try:
                                         data = json.loads(man.read_text(encoding="utf-8"))
-                                        if isinstance(data, dict):
-                                            for k in ("count","total","items_count","media_count"):
-                                                v = data.get(k)
-                                                if isinstance(v, int):
-                                                    total_found = v; break
-                                            if total_found is None and isinstance(data.get("items"), list):
-                                                total_found = len(data["items"])
-                                        elif isinstance(data, list):
-                                            total_found = len(data)
                                     except Exception:
-                                        pass
-                            if total_found is not None:
-                                log.info("Job #%s: media count determined: %d", job.id, total_found)
-                            if total_found is None:
-                                urls = user_dir / "urls_extracted.txt"
-                                if urls.exists():
-                                    mtime = urls.stat().st_mtime
-                                    if mtime > last_urls_mtime:
-                                        last_urls_mtime = mtime
-                                        try:
-                                            n = sum(1 for ln in urls.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip())
-                                            if n > 0:
-                                                total_found = n
-                                        except Exception:
-                                            pass
-                            if total_found is not None and stage is Stage.SCAN:
-                                log.info("Job #%s: media found so far %d", job.id, total_found)
+                                        data = None
+                                    if bump_total(infer_media_total_from_manifest(data), "manifest"):
+                                        progress_dirty = True
+                            urls = user_dir / "urls_extracted.txt"
+                            if urls.exists():
+                                mtime = urls.stat().st_mtime
+                                if mtime >= cutoff and mtime > last_urls_mtime:
+                                    last_urls_mtime = mtime
+                                    if bump_total(infer_media_total_from_urls_file(urls), "urls_extracted"):
+                                        progress_dirty = True
                         txt = build_progress_text(stage, job.target, total_found, downloaded, zip_parts)
                         now = loop.time()
-                        if now - last_edit >= 2.0:
+                        if progress_dirty or now - last_edit >= 2.0:
                             await _safe_edit(job.chat_id, progress.message_id, txt, reply_markup=cancel_kb)
                             last_edit = now
                     except Exception:
@@ -3230,20 +3427,14 @@ async def _dl_worker():
                     low = txt.lower()
 
                     if txt.startswith("scan_progress"):
-                        parts = txt.split()
-                        if len(parts) >= 2:
-                            try:
-                                total_found = int(parts[1])
-                                log.info("Job #%s: scan progress %d", job.id, total_found)
-                                if stage is Stage.SCAN:
-                                    await _safe_edit(
-                                        job.chat_id,
-                                        progress.message_id,
-                                        build_progress_text(stage, job.target, total_found, downloaded, zip_parts),
-                                        reply_markup=cancel_kb,
-                                    )
-                            except Exception:
-                                pass
+                        m = re.search(r"(\d+)", txt)
+                        if m and bump_total(int(m.group(1)), "stdout:scan_progress"):
+                            await _safe_edit(
+                                job.chat_id,
+                                progress.message_id,
+                                build_progress_text(stage, job.target, total_found, downloaded, zip_parts),
+                                reply_markup=cancel_kb,
+                            )
                         continue
 
                     if any(k in low for k in ("download", "загрузка", "скачива")) and stage is not Stage.DOWNLOAD:
@@ -3256,8 +3447,7 @@ async def _dl_worker():
                             build_progress_text(stage, job.target, total_found, downloaded, zip_parts),
                             reply_markup=cancel_kb,
                         )
-                        continue
-                    elif any(k in low for k in ("zip", "архив")) and stage is not Stage.ARCHIVE:
+                    if any(k in low for k in ("zip", "архив")) and stage is not Stage.ARCHIVE:
                         stage = Stage.ARCHIVE
                         log.info("Job #%s: stage -> %s", job.id, stage.value)
                         await _safe_edit(
@@ -3266,7 +3456,6 @@ async def _dl_worker():
                             build_progress_text(stage, job.target, total_found, downloaded, zip_parts),
                             reply_markup=cancel_kb,
                         )
-                        continue
 
                     if re.match(r"^\[\d+\]\s+ok", low):
                         downloaded += 1
@@ -3292,20 +3481,14 @@ async def _dl_worker():
                                 )
                         continue
 
-                    if total_found is None:
-                        m = re.search(r"(?:found|найден[оа])\D+(\d+)\D+(?:media|items|files|медиа|ссыл)", low)
-                        if m:
-                            try:
-                                total_found = int(m.group(1))
-                                log.info("Job #%s: media count from stdout %d", job.id, total_found)
-                                await _safe_edit(
-                                    job.chat_id,
-                                    progress.message_id,
-                                    build_progress_text(stage, job.target, total_found, downloaded, zip_parts),
-                                    reply_markup=cancel_kb,
-                                )
-                            except Exception:
-                                pass
+                    m = re.search(r"(?:found|найден[оа])\D+(\d+)\D+(?:media|items|files|медиа|ссыл)", low)
+                    if m and bump_total(int(m.group(1)), "stdout:found"):
+                        await _safe_edit(
+                            job.chat_id,
+                            progress.message_id,
+                            build_progress_text(stage, job.target, total_found, downloaded, zip_parts),
+                            reply_markup=cancel_kb,
+                        )
                         continue
 
                     now = asyncio.get_running_loop().time()
@@ -3344,8 +3527,30 @@ async def _dl_worker():
             user_dirs = [p for p in job.out_base.glob("*") if p.is_dir()]
             user_dir = max(user_dirs, key=lambda p: p.stat().st_mtime, default=None)
 
+            db_items_added = 0
+            db_link_added = False
+
             if user_dir is not None:
                 rebuild_urls_extracted(user_dir)
+                try:
+                    db_items_added, db_link_added = ingest_download_results(job, user_dir)
+                    if db_items_added or db_link_added:
+                        log.info(
+                            "Job #%s: ingested %d items%s into DB",
+                            job.id,
+                            db_items_added,
+                            " + profile link" if db_link_added else "",
+                        )
+                except Exception:
+                    log.exception("Job #%s: failed to ingest download results", job.id)
+
+                if bump_total(infer_media_total(user_dir), "final_artifacts"):
+                    await _safe_edit(
+                        job.chat_id,
+                        progress.message_id,
+                        build_progress_text(stage, job.target, total_found, downloaded, zip_parts),
+                        reply_markup=cancel_kb,
+                    )
 
             if user_dir is None:
                 log.warning("Job #%s: completed but no results found", job.id)
@@ -3356,7 +3561,14 @@ async def _dl_worker():
                 )
                 if zips:
                     log.info("Job #%s: %d zip(s) ready", job.id, len(zips))
-                    await _safe_edit(job.chat_id, progress.message_id, "📦 Архив(ы) готовы — отправляю…")
+                    stage = Stage.ARCHIVE
+                    zip_parts = len(zips)
+                    await _safe_edit(
+                        job.chat_id,
+                        progress.message_id,
+                        build_progress_text(stage, job.target, total_found, downloaded, zip_parts) + "\n📦 Архивы готовы — отправляю…",
+                        reply_markup=None,
+                    )
                     for z in zips:
                         try:
                             log.info("Job #%s: sending archive %s", job.id, z)
