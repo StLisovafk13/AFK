@@ -3279,6 +3279,8 @@ async def _dl_worker():
         txt = f"{icon} <b>{stage.value}</b>: <code>{target}</code>"
         if total_found is not None:
             txt += f"\n🔎 Найдено медиа: <b>{total_found}</b>"
+        elif stage in {Stage.SCAN, Stage.DOWNLOAD}:
+            txt += "\n🔎 Найдено медиа: <b>0</b>"
         if stage is Stage.DOWNLOAD and total_found is not None:
             txt += f"\n📥 Загрузка: <b>{downloaded}/{total_found}</b>"
         if stage is Stage.ARCHIVE and zip_parts is not None:
