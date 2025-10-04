@@ -820,14 +820,12 @@ def _count_media(conn: sqlite3.Connection, since_iso: str, chat_id: int, scope: 
         with_c = conn.execute(
             """SELECT COUNT(*) FROM items
                WHERE created_at >= ? AND chat_id = ?
-                 AND image_url IS NOT NULL AND TRIM(image_url) <> ''
                  AND latitude IS NOT NULL AND longitude IS NOT NULL""",
             (since_iso, chat_id)
         ).fetchone()[0]
         without_c = conn.execute(
             """SELECT COUNT(*) FROM items
                WHERE created_at >= ? AND chat_id = ?
-                 AND image_url IS NOT NULL AND TRIM(image_url) <> ''
                  AND (latitude IS NULL OR longitude IS NULL)""",
             (since_iso, chat_id)
         ).fetchone()[0]
@@ -835,14 +833,12 @@ def _count_media(conn: sqlite3.Connection, since_iso: str, chat_id: int, scope: 
         with_c = conn.execute(
             """SELECT COUNT(*) FROM items
                WHERE created_at >= ?
-                 AND image_url IS NOT NULL AND TRIM(image_url) <> ''
                  AND latitude IS NOT NULL AND longitude IS NOT NULL""",
             (since_iso,)
         ).fetchone()[0]
         without_c = conn.execute(
             """SELECT COUNT(*) FROM items
                WHERE created_at >= ?
-                 AND image_url IS NOT NULL AND TRIM(image_url) <> ''
                  AND (latitude IS NULL OR longitude IS NULL)""",
             (since_iso,)
         ).fetchone()[0]
@@ -854,14 +850,12 @@ def _count_totals(conn: sqlite3.Connection, chat_id: int, scope: str) -> Tuple[i
         with_c = conn.execute(
             """SELECT COUNT(*) FROM items
                WHERE chat_id = ?
-                 AND image_url IS NOT NULL AND TRIM(image_url) <> ''
                  AND latitude IS NOT NULL AND longitude IS NOT NULL""",
             (chat_id,)
         ).fetchone()[0]
         without_c = conn.execute(
             """SELECT COUNT(*) FROM items
                WHERE chat_id = ?
-                 AND image_url IS NOT NULL AND TRIM(image_url) <> ''
                  AND (latitude IS NULL OR longitude IS NULL)""",
             (chat_id,)
         ).fetchone()[0]
@@ -869,13 +863,11 @@ def _count_totals(conn: sqlite3.Connection, chat_id: int, scope: str) -> Tuple[i
         u = conn.execute("SELECT COUNT(DISTINCT username) FROM links").fetchone()[0]
         with_c = conn.execute(
             """SELECT COUNT(*) FROM items
-               WHERE image_url IS NOT NULL AND TRIM(image_url) <> ''
-                 AND latitude IS NOT NULL AND longitude IS NOT NULL"""
+               WHERE latitude IS NOT NULL AND longitude IS NOT NULL"""
         ).fetchone()[0]
         without_c = conn.execute(
             """SELECT COUNT(*) FROM items
-               WHERE image_url IS NOT NULL AND TRIM(image_url) <> ''
-                 AND (latitude IS NULL OR longitude IS NULL)"""
+               WHERE latitude IS NULL OR longitude IS NULL"""
         ).fetchone()[0]
     return int(u or 0), int(with_c or 0), int(without_c or 0)
 
@@ -886,18 +878,22 @@ def get_stats(chat_id: int, scope: str) -> Dict[str, Dict[str, int]]:
         out: Dict[str, Dict[str, int]] = {}
         for key, days in days_map.items():
             since = _since_utc_iso(days)
-            unames = _count_new_usernames(conn, since, chat_id, scope)
+            profiles = _count_new_usernames(conn, since, chat_id, scope)
             with_c, without_c = _count_media(conn, since, chat_id, scope)
             out[key] = {
-                'usernames': unames,
+                'profiles': profiles,
+                'usernames': profiles,
+                'media_total': with_c + without_c,
                 'media_with_coords': with_c,
                 'media_without_coords': without_c,
             }
-        tu, twc, two = _count_totals(conn, chat_id, scope)
+        profiles_total, with_coords_total, without_coords_total = _count_totals(conn, chat_id, scope)
         out['total'] = {
-            'usernames': tu,
-            'media_with_coords': twc,
-            'media_without_coords': two,
+            'profiles': profiles_total,
+            'usernames': profiles_total,
+            'media_total': with_coords_total + without_coords_total,
+            'media_with_coords': with_coords_total,
+            'media_without_coords': without_coords_total,
         }
         return out
     finally:
@@ -909,9 +905,9 @@ def format_stats_text(stats: Dict[str, Dict[str, int]], scope: str) -> str:
         s = stats[key]
         return (
             f"<b>{name}</b>\n"
-            f"— Уникальные username: <b>{s['usernames']}</b>\n"
-            f"— Media с координатами: <b>{s['media_with_coords']}</b>\n"
-            f"— Media без координат: <b>{s['media_without_coords']}</b>\n"
+            f"— Профилей: <b>{s['profiles']}</b>\n"
+            f"— Медиа в базе: <b>{s['media_total']}</b> "
+            f"(с координатами: <b>{s['media_with_coords']}</b>, без координат: <b>{s['media_without_coords']}</b>)\n"
         )
     return (
         f"{title}\n\n"
