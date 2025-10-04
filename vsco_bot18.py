@@ -3428,15 +3428,16 @@ async def _dl_worker():
                     txt = line.decode("utf-8", "ignore").rstrip()
                     low = txt.lower()
 
-                    if txt.startswith("scan_progress"):
+                    m = re.search(r"\bscan_progress\s+(\d+)", txt)
+                    if not m and txt.startswith("scan_progress"):
                         m = re.search(r"(\d+)", txt)
-                        if m and bump_total(int(m.group(1)), "stdout:scan_progress"):
-                            await _safe_edit(
-                                job.chat_id,
-                                progress.message_id,
-                                build_progress_text(stage, job.target, total_found, downloaded, zip_parts),
-                                reply_markup=cancel_kb,
-                            )
+                    if m and bump_total(int(m.group(1)), "stdout:scan_progress"):
+                        await _safe_edit(
+                            job.chat_id,
+                            progress.message_id,
+                            build_progress_text(stage, job.target, total_found, downloaded, zip_parts),
+                            reply_markup=cancel_kb,
+                        )
                         continue
 
                     if any(k in low for k in ("download", "загрузка", "скачива")) and stage is not Stage.DOWNLOAD:
