@@ -802,74 +802,84 @@ def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_f
         conn.close()
 
 # ---------------------- Stats ----------------------
-def _count_new_usernames(conn: sqlite3.Connection, since_iso: str, chat_id: int, scope: str) -> int:
+_USERNAME_KEY_SQL = "LOWER(TRIM(COALESCE(username,'')))"
+_MEDIA_KEY_SQL = "COALESCE(NULLIF(TRIM(image_url),''), printf('item:%011d', id))"
+
+
+def _items_where_clause(since_iso: Optional[str], chat_id: int, scope: str) -> Tuple[str, List[Any]]:
+    clauses: List[str] = []
+    params: List[Any] = []
+    if since_iso:
+        clauses.append("created_at >= ?")
+        params.append(since_iso)
     if scope == "chat":
-        row = conn.execute(
-            "SELECT COUNT(DISTINCT username) FROM links WHERE created_at >= ? AND chat_id = ?",
-            (since_iso, chat_id)
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT COUNT(DISTINCT username) FROM links WHERE created_at >= ?",
-            (since_iso,)
-        ).fetchone()
+        clauses.append("chat_id = ?")
+        params.append(chat_id)
+    if not clauses:
+        clauses.append("1=1")
+    return " AND ".join(clauses), params
+
+
+def _count_new_usernames(conn: sqlite3.Connection, since_iso: str, chat_id: int, scope: str) -> int:
+    where_sql, params = _items_where_clause(since_iso, chat_id, scope)
+    row = conn.execute(
+        f"SELECT COUNT(DISTINCT {_USERNAME_KEY_SQL}) FROM items "
+        f"WHERE {where_sql} AND {_USERNAME_KEY_SQL} <> ''",
+        tuple(params),
+    ).fetchone()
     return int(row[0] or 0)
 
 def _count_media(conn: sqlite3.Connection, since_iso: str, chat_id: int, scope: str) -> Tuple[int, int]:
-    if scope == "chat":
-        with_c = conn.execute(
-            """SELECT COUNT(*) FROM items
-               WHERE created_at >= ? AND chat_id = ?
-                 AND latitude IS NOT NULL AND longitude IS NOT NULL""",
-            (since_iso, chat_id)
-        ).fetchone()[0]
-        without_c = conn.execute(
-            """SELECT COUNT(*) FROM items
-               WHERE created_at >= ? AND chat_id = ?
-                 AND (latitude IS NULL OR longitude IS NULL)""",
-            (since_iso, chat_id)
-        ).fetchone()[0]
-    else:
-        with_c = conn.execute(
-            """SELECT COUNT(*) FROM items
-               WHERE created_at >= ?
-                 AND latitude IS NOT NULL AND longitude IS NOT NULL""",
-            (since_iso,)
-        ).fetchone()[0]
-        without_c = conn.execute(
-            """SELECT COUNT(*) FROM items
-               WHERE created_at >= ?
-                 AND (latitude IS NULL OR longitude IS NULL)""",
-            (since_iso,)
-        ).fetchone()[0]
-    return int(with_c or 0), int(without_c or 0)
+    where_sql, params = _items_where_clause(since_iso, chat_id, scope)
+    row = conn.execute(
+        f"""
+        WITH media AS (
+            SELECT
+                {_MEDIA_KEY_SQL} AS media_key,
+                MAX(CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL THEN 1 ELSE 0 END) AS has_coords
+            FROM items
+            WHERE {where_sql}
+            GROUP BY media_key
+        )
+        SELECT
+            SUM(CASE WHEN has_coords = 1 THEN 1 ELSE 0 END) AS with_coords,
+            SUM(CASE WHEN has_coords = 0 THEN 1 ELSE 0 END) AS without_coords
+        FROM media
+        """,
+        tuple(params),
+    ).fetchone() or (0, 0)
+    with_coords = int((row[0] or 0))
+    without_coords = int((row[1] or 0))
+    return with_coords, without_coords
 
-def _count_totals(conn: sqlite3.Connection, chat_id: int, scope: str) -> Tuple[int,int,int]:
-    if scope == "chat":
-        u = conn.execute("SELECT COUNT(DISTINCT username) FROM links WHERE chat_id = ?", (chat_id,)).fetchone()[0]
-        with_c = conn.execute(
-            """SELECT COUNT(*) FROM items
-               WHERE chat_id = ?
-                 AND latitude IS NOT NULL AND longitude IS NOT NULL""",
-            (chat_id,)
-        ).fetchone()[0]
-        without_c = conn.execute(
-            """SELECT COUNT(*) FROM items
-               WHERE chat_id = ?
-                 AND (latitude IS NULL OR longitude IS NULL)""",
-            (chat_id,)
-        ).fetchone()[0]
-    else:
-        u = conn.execute("SELECT COUNT(DISTINCT username) FROM links").fetchone()[0]
-        with_c = conn.execute(
-            """SELECT COUNT(*) FROM items
-               WHERE latitude IS NOT NULL AND longitude IS NOT NULL"""
-        ).fetchone()[0]
-        without_c = conn.execute(
-            """SELECT COUNT(*) FROM items
-               WHERE latitude IS NULL OR longitude IS NULL"""
-        ).fetchone()[0]
-    return int(u or 0), int(with_c or 0), int(without_c or 0)
+def _count_totals(conn: sqlite3.Connection, chat_id: int, scope: str) -> Tuple[int, int, int]:
+    where_sql, params = _items_where_clause(None, chat_id, scope)
+    username_row = conn.execute(
+        f"SELECT COUNT(DISTINCT {_USERNAME_KEY_SQL}) FROM items "
+        f"WHERE {where_sql} AND {_USERNAME_KEY_SQL} <> ''",
+        tuple(params),
+    ).fetchone()
+    media_row = conn.execute(
+        f"""
+        WITH media AS (
+            SELECT
+                {_MEDIA_KEY_SQL} AS media_key,
+                MAX(CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL THEN 1 ELSE 0 END) AS has_coords
+            FROM items
+            WHERE {where_sql}
+            GROUP BY media_key
+        )
+        SELECT
+            SUM(CASE WHEN has_coords = 1 THEN 1 ELSE 0 END) AS with_coords,
+            SUM(CASE WHEN has_coords = 0 THEN 1 ELSE 0 END) AS without_coords
+        FROM media
+        """,
+        tuple(params),
+    ).fetchone() or (0, 0)
+    profiles = int((username_row[0] or 0) if username_row else 0)
+    with_coords = int((media_row[0] or 0))
+    without_coords = int((media_row[1] or 0))
+    return profiles, with_coords, without_coords
 
 def get_stats(chat_id: int, scope: str) -> Dict[str, Dict[str, int]]:
     days_map = {'day': 1, 'week': 7, 'month': 30}
@@ -878,18 +888,22 @@ def get_stats(chat_id: int, scope: str) -> Dict[str, Dict[str, int]]:
         out: Dict[str, Dict[str, int]] = {}
         for key, days in days_map.items():
             since = _since_utc_iso(days)
-            unames = _count_new_usernames(conn, since, chat_id, scope)
+            profiles = _count_new_usernames(conn, since, chat_id, scope)
             with_c, without_c = _count_media(conn, since, chat_id, scope)
             out[key] = {
-                'usernames': unames,
+                'profiles': profiles,
+                'usernames': profiles,
+                'media_total': with_c + without_c,
                 'media_with_coords': with_c,
                 'media_without_coords': without_c,
             }
-        tu, twc, two = _count_totals(conn, chat_id, scope)
+        profiles_total, with_coords_total, without_coords_total = _count_totals(conn, chat_id, scope)
         out['total'] = {
-            'usernames': tu,
-            'media_with_coords': twc,
-            'media_without_coords': two,
+            'profiles': profiles_total,
+            'usernames': profiles_total,
+            'media_total': with_coords_total + without_coords_total,
+            'media_with_coords': with_coords_total,
+            'media_without_coords': without_coords_total,
         }
         return out
     finally:
@@ -901,9 +915,9 @@ def format_stats_text(stats: Dict[str, Dict[str, int]], scope: str) -> str:
         s = stats[key]
         return (
             f"<b>{name}</b>\n"
-            f"— Уникальные username: <b>{s['usernames']}</b>\n"
-            f"— Media с координатами: <b>{s['media_with_coords']}</b>\n"
-            f"— Media без координат: <b>{s['media_without_coords']}</b>\n"
+            f"— Профилей: <b>{s['profiles']}</b>\n"
+            f"— Медиа в базе: <b>{s['media_total']}</b> "
+            f"(с координатами: <b>{s['media_with_coords']}</b>, без координат: <b>{s['media_without_coords']}</b>)\n"
         )
     return (
         f"{title}\n\n"
@@ -2908,7 +2922,8 @@ def _format_archive_admin_message(
         lines.append("💬 Комментарии:")
         preview = summary.comments[:5]
         for comment in preview:
-            lines.append(f"• {escape(comment).replace('\n', ' ')}")
+            sanitized = escape(comment).replace("\n", " ")
+            lines.append(f"• {sanitized}")
         if len(summary.comments) > len(preview):
             lines.append(f"… и ещё {len(summary.comments) - len(preview)}")
     else:
@@ -2938,7 +2953,8 @@ def _format_archive_summary_message(
         lines.append(f"💬 Комментарии ({comments_count}):")
         preview = summary.comments[:3]
         for comment in preview:
-            lines.append(f"• {escape(comment).replace('\n', ' ')}")
+            sanitized = escape(comment).replace("\n", " ")
+            lines.append(f"• {sanitized}")
         if comments_count > len(preview):
             lines.append(f"… и ещё {comments_count - len(preview)}")
     else:
