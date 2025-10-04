@@ -803,16 +803,44 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
                 continue
 
             if info["kind"] == "profile":
-                res.append({"username": info["username"], "url": info["final_url"], "comment": c, "image_url": ""})
+                res.append({
+                    "username": info["username"],
+                    "url": info["final_url"],
+                    "comment": c,
+                    "image_url": "",
+                    "profile_url": info["final_url"],
+                })
             elif info["kind"] == "media":
                 usr = info["username"]
                 profile_url = f"https://vsco.co/{usr}"
                 image_url = await fetch_media_image_url(final, s) or ""
-                res.append({"username": usr, "url": profile_url, "comment": c, "image_url": image_url})
+                res.append({
+                    "username": usr,
+                    "url": profile_url,
+                    "comment": c,
+                    "image_url": image_url,
+                    "profile_url": profile_url,
+                    "media_url": final,
+                })
             elif info["kind"] == "perception":
                 slug = info["slug"]
-                res.append({"username": slug, "url": info["final_url"], "comment": c, "image_url": ""})
-    uniq = {(r["username"], r["url"], r["comment"], r.get("image_url","")): r for r in res}
+                res.append({
+                    "username": slug,
+                    "url": info["final_url"],
+                    "comment": c,
+                    "image_url": "",
+                    "profile_url": info["final_url"],
+                })
+    uniq = {
+        (
+            r.get("username", ""),
+            r.get("url", ""),
+            r.get("comment", ""),
+            r.get("image_url", ""),
+            r.get("media_url", ""),
+        ): r
+        for r in res
+    }
     return list(uniq.values())
 
 # ---------------------- DB ops ----------------------
@@ -875,8 +903,10 @@ def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source:
     try:
         for r in pairs:
             username = (r.get("username") or "").lstrip("@")
-            profile_url = r.get("url") or ""
-            image_url = (r.get("image_url") or "").strip()
+            profile_url = r.get("profile_url") or r.get("url") or ""
+            image_url_raw = (r.get("image_url") or "").strip()
+            media_url = (r.get("media_url") or "").strip()
+            image_url = image_url_raw or media_url
             comment = (r.get("comment") or "").strip()
             if not username or not profile_url: continue
 

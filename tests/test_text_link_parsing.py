@@ -372,5 +372,54 @@ async def test_normalize_vsco_pairs_media_without_direct_image(monkeypatch, vsco
             "url": "https://vsco.co/testuser",
             "comment": "",
             "image_url": "",
+            "profile_url": "https://vsco.co/testuser",
+            "media_url": "https://vsco.co/testuser/media/abc123",
         }
+    ]
+
+
+def test_upsert_items_with_media_fallback(vsco_module):
+    pairs = [
+        {
+            "username": "testuser",
+            "url": "https://vsco.co/testuser",
+            "profile_url": "https://vsco.co/testuser",
+            "media_url": "https://vsco.co/testuser/media/first",
+            "image_url": "",
+            "comment": "",
+        },
+        {
+            "username": "testuser",
+            "url": "https://vsco.co/testuser",
+            "profile_url": "https://vsco.co/testuser",
+            "media_url": "https://vsco.co/testuser/media/second",
+            "image_url": "",
+            "comment": "",
+        },
+    ]
+
+    added, comments_added, new_links = vsco_module.upsert_items_with_comments(
+        chat_id=123,
+        pairs=pairs,
+        source="text",
+        source_file="message",
+        added_by="tester",
+    )
+
+    assert added == 2
+    assert comments_added == 0
+    assert new_links == ["https://vsco.co/testuser"]
+
+    conn = vsco_module.db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT image_url FROM items WHERE username=? ORDER BY image_url",
+            ("testuser",),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert rows == [
+        ("https://vsco.co/testuser/media/first",),
+        ("https://vsco.co/testuser/media/second",),
     ]
