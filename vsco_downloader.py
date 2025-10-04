@@ -43,6 +43,8 @@ from typing import List, Dict, Any, Optional, Tuple
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
 
+from vsco_utils import VSCO_LOGO_MARKERS, is_vsco_logo_url
+
 # -----------------------------
 # ЛОГИ
 # -----------------------------
@@ -117,8 +119,6 @@ def normalize_profile(username: Optional[str], profile_url: Optional[str]) -> Tu
 # -----------------------------
 MEDIA_EXT_RE = re.compile(r"\.(jpg|jpeg|png|webp|mp4|webm|mov)(\?|$)", re.I)
 POSTER_HINT_RE = re.compile(r"(?i)(poster|thumb|thumbnail|cover|preview|frame)")
-VSCO_LOGO_MARKERS = ("vsco-logo-white",)
-
 def select_best_from_srcset(srcset: str) -> Optional[str]:
     try:
         cand = []
@@ -147,12 +147,6 @@ def normalize_url(u: Optional[str], base: str = "https://") -> Optional[str]:
 def is_media_url(u: str) -> bool:
     if not u: return False
     return bool(MEDIA_EXT_RE.search(u))
-
-def is_vsco_logo_url(url: Optional[str]) -> bool:
-    if not url:
-        return False
-    low = url.lower()
-    return any(marker in low for marker in VSCO_LOGO_MARKERS)
 
 def upscale_w_param(u: str, max_w: int) -> str:
     """
