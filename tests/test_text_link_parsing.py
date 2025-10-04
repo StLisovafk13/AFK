@@ -351,6 +351,24 @@ def test_extract_direct_vsco_image_url_unescapes(vsco_module):
     assert result == "https://im.vsco.co/aws-us-west-2/path/asset.jpg"
 
 
+def test_extract_direct_vsco_image_url_protocol_relative(vsco_module):
+    html = (
+        '<script>window.__PRELOADED_STATE__ = {"responsive_url":'
+        '"//im.vsco.co/aws/path/asset.jpg?w=1200 1200w"};</script>'
+    )
+    result = vsco_module.extract_direct_vsco_image_url(html)
+    assert result == "https://im.vsco.co/aws/path/asset.jpg?w=1200"
+
+
+def test_extract_direct_vsco_image_url_trims_trailing_tokens(vsco_module):
+    html = (
+        '<meta property="og:image" '
+        'content="https://img.vsco.co/aws/path/asset.jpg?w=800 800w">'
+    )
+    result = vsco_module.extract_direct_vsco_image_url(html)
+    assert result == "https://img.vsco.co/aws/path/asset.jpg?w=800"
+
+
 def test_extract_direct_vsco_image_url_skips_non_direct(vsco_module):
     html = '<meta property="og:image" content="https://vsco.co/someuser/media/abc">'
     assert vsco_module.extract_direct_vsco_image_url(html) is None

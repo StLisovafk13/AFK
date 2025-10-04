@@ -618,8 +618,20 @@ def _cleanup_vsco_image_candidate(url: str) -> str:
     cleaned = cleaned.replace("\\u002F", "/").replace("\\u002f", "/")
     cleaned = cleaned.replace("\\u003A", ":").replace("\\u003a", ":")
     cleaned = cleaned.replace("\\u0026", "&")
-    cleaned = unescape(cleaned)
-    return cleaned.strip()
+    cleaned = unescape(cleaned).strip()
+
+    if cleaned.startswith("//"):
+        cleaned = "https:" + cleaned
+    elif cleaned.startswith("img.vsco.co") or cleaned.startswith("im.vsco.co"):
+        cleaned = "https://" + cleaned
+
+    # srcset entries can include width descriptors (" 1200w") — keep only the URL
+    cleaned = cleaned.split()[0]
+
+    # Drop stray trailing punctuation that may follow JSON/HTML tokens
+    cleaned = cleaned.rstrip(",);")
+
+    return cleaned
 
 
 def _is_direct_vsco_image_url(url: str) -> bool:
