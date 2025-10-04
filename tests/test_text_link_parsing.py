@@ -143,7 +143,7 @@ def test_insert_full_rows_from_html_returns_new_links(vsco_module):
 
 def test_normalize_vsco_pairs_extracts_cdn_url(vsco_module, monkeypatch):
     html = (
-        '<meta name="twitter:image" content="https:\\/\\/im.vsco.co\\/cdn-cgi\\/image\\/format=webp\\/images\\/5f6a.jpg">'
+        '<meta name="twitter:image" content="https:\\/\\/im.vsco.co\\/cdn-cgi\\/image\\/format=webp\\/images\\/5f6a.jpg?w=1200&amp;dpr=2">'
     )
 
     class DummyResponse:
@@ -178,6 +178,47 @@ def test_normalize_vsco_pairs_extracts_cdn_url(vsco_module, monkeypatch):
             "url": "https://vsco.co/sampleuser",
             "comment": "",
             "image_url": "https://im.vsco.co/cdn-cgi/image/format=webp/images/5f6a.jpg",
+        }
+    ]
+
+
+def test_normalize_vsco_pairs_prefers_fullsize_media(vsco_module, monkeypatch):
+    html = (
+        '<meta property="og:image" content="https:\\/\\/im.vsco.co\\/aws-us-west-2\\/54f8e4\\/31120599\\/abc123\\/vsco_image.jpg?w=1200&amp;dpr=2">'
+    )
+
+    class DummyResponse:
+        status = 200
+        url = "https://vsco.co/sampleuser/media/abc123"
+
+        def __init__(self, body: str):
+            self._body = body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def text(self, errors: str = "ignore"):
+            return self._body
+
+    aiohttp = vsco_module.aiohttp
+
+    async def fake_get(self, url, *args, **kwargs):  # type: ignore[override]
+        return DummyResponse(html)
+
+    monkeypatch.setattr(aiohttp.ClientSession, "get", fake_get, raising=False)
+
+    pairs = [{"url": "https://vsco.co/sampleuser/media/abc123", "comment": ""}]
+    normalized = asyncio.run(vsco_module.normalize_vsco_pairs(pairs))
+
+    assert normalized == [
+        {
+            "username": "sampleuser",
+            "url": "https://vsco.co/sampleuser",
+            "comment": "",
+            "image_url": "https://im.vsco.co/aws-us-west-2/54f8e4/31120599/abc123/vsco_image.jpg",
         }
     ]
 

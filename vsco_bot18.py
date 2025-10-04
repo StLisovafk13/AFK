@@ -27,12 +27,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple, Sequence, TypedDict
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, urlunparse
 import json
 import time
 import tempfile
 import zipfile
-from html import escape
+from html import escape, unescape
 from enum import Enum
 
 try:
@@ -275,7 +275,7 @@ MEDIA_IMG_RE = re.compile(r'https?://[^"\']+\.(?:jpg|jpeg|png|webp)(?:\?[^"\']*)
 SITE_ID_RE_LIST = [
     re.compile(r'"site_id"\s*:\s*(\d+)', re.I),
     re.compile(r'data-site-id=["\'](\d+)["\']', re.I),
-    re.compile(r'\bsiteId\s*:\s*(\d+)\b', re.I),
+    re.compile(r'\bsiteId"?\s*:\s*(\d+)\b', re.I),
 ]
 
 HEADERS = {
@@ -610,10 +610,29 @@ async def resolve_vsco_short(url: str, session: aiohttp.ClientSession) -> str:
         return _build_perception_url(slug)
     return url
 
+def _normalize_vsco_cdn_url(url: str) -> str:
+    if not url:
+        return url
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+
+    if parsed.scheme not in ("http", "https"):
+        return url
+
+    host = (parsed.netloc or "").lower()
+    if host.endswith("vsco.co") and parsed.query:
+        parsed = parsed._replace(query="")
+        return urlunparse(parsed)
+
+    return url
+
+
 def _decode_vsco_media_url(candidate: str) -> Optional[str]:
     if not candidate:
         return None
-    candidate = candidate.strip()
+    candidate = unescape(candidate.strip())
     try:
         decoded = json.loads(f'"{candidate}"')
     except Exception:
@@ -624,7 +643,8 @@ def _decode_vsco_media_url(candidate: str) -> Optional[str]:
     if decoded.startswith("http://"):
         decoded = "https://" + decoded[len("http://"):]
     if decoded.startswith("https://"):
-        return decoded
+        normalized = _normalize_vsco_cdn_url(decoded)
+        return normalized
     return None
 
 
