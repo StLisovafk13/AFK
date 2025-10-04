@@ -12,7 +12,7 @@ import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urlparse, urlunparse, urljoin
 
 import aiohttp
 from aiogram import Router
@@ -119,6 +119,11 @@ def _normalize_vsco_profile_url(u: str) -> Optional[str]:
             return urlunparse(("https", "vsco.co", new_path, "", "", ""))
         elif host == "vs.co":
             return u  # resolve later
+        elif host == "perception.vsco.co":
+            parts = [seg for seg in (p.path or "").split("/") if seg]
+            if parts:
+                slug = parts[0]
+                return f"https://perception.vsco.co/{slug}/gallery"
     except Exception:
         return None
     return None
@@ -132,15 +137,64 @@ async def resolve_vsco_short_or_profile(u: str, stats: ZipStats) -> Optional[str
     # resolve vs.co short link
     async with _http_simple() as s:
         try:
-            async with s.get(u, allow_redirects=True) as r:
-                if r.status in (200, 301, 302, 303, 307, 308):
+            current = u
+            slug = None
+            try:
+                p = urlparse(u)
+                if (p.netloc or "").lower() == "vs.co":
+                    parts = [seg for seg in (p.path or "").split("/") if seg]
+                    if parts:
+                        slug = parts[0]
+            except Exception:
+                slug = None
+
+            for _ in range(5):
+                async with s.get(current, allow_redirects=False) as r:
+                    status = r.status
                     final = str(r.url)
-                    norm2 = _normalize_vsco_profile_url(final)
-                    stats.normalized_url = norm2
-                    return norm2
-                log.warning("resolve_vsco_short: non-200 status", extra=stats.asdict())
+                    if status in (301, 302, 303, 307, 308):
+                        location = r.headers.get("Location")
+                        if not location:
+                            break
+                        next_url = urljoin(final, location)
+                        try:
+                            parsed = urlparse(next_url)
+                        except Exception:
+                            parsed = None
+                        host = (parsed.netloc or "").lower() if parsed else ""
+                        if host == "apps.apple.com" and slug:
+                            candidate = f"https://perception.vsco.co/{slug}/gallery"
+                            stats.normalized_url = candidate
+                            return candidate
+                        if host == "perception.vsco.co" and slug:
+                            candidate = f"https://perception.vsco.co/{slug}/gallery"
+                            stats.normalized_url = candidate
+                            return candidate
+                        current = next_url
+                        continue
+
+                    host = (r.url.host or "").lower() if r.url else ""
+                    if host == "apps.apple.com" and slug:
+                        candidate = f"https://perception.vsco.co/{slug}/gallery"
+                        stats.normalized_url = candidate
+                        return candidate
+                    if host == "perception.vsco.co" and slug:
+                        candidate = f"https://perception.vsco.co/{slug}/gallery"
+                        stats.normalized_url = candidate
+                        return candidate
+
+                    if r.status in (200, 201):
+                        norm2 = _normalize_vsco_profile_url(final)
+                        stats.normalized_url = norm2
+                        return norm2
+                    break
+            log.warning("resolve_vsco_short: redirect resolution failed", extra=stats.asdict())
         except Exception:
             log.exception("resolve_vsco_short: exception", extra=stats.asdict())
+    if slug:
+        candidate = f"https://perception.vsco.co/{slug}/gallery"
+        stats.normalized_url = candidate
+        return candidate
     return None
 
 def _extract_site_id(html: str) -> Optional[str]:

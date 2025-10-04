@@ -23,7 +23,7 @@ Usage:
 
 Requirements:
   Python 3.10+
-  pip install playwright beautifulsoup4
+  pip install playwright beautifulsoup4 aiohttp
   python -m playwright install chromium
 """
 
@@ -40,6 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
+import aiohttp
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -86,6 +87,19 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 # -----------------------------
+# КОНСТАНТЫ ДЛЯ НОРМАЛИЗАЦИИ ССЫЛОК
+# -----------------------------
+REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15)
+VSCO_SHORT_HOSTS = {"vs.co", "www.vs.co"}
+VSCO_PERCEPTION_HOSTS = {"perception.vsco.co", "www.perception.vsco.co"}
+SHORT_SLUG_RE = re.compile(r"^/([A-Za-z0-9]{4,64})/?$")
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+RESOLVE_HEADERS = {
+    "User-Agent": "VSCO-Downloader/1.0 (+playwright)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+# -----------------------------
 # ВАЛИДАЦИЯ ОКРУЖЕНИЯ
 # -----------------------------
 def validate_environment(logger: logging.Logger) -> bool:
@@ -103,13 +117,112 @@ def validate_environment(logger: logging.Logger) -> bool:
         short_ok(logger, "Этап 1 (инициализация): библиотеки найдены")
     return ok
 
-def normalize_profile(username: Optional[str], profile_url: Optional[str]) -> Tuple[str, str]:
+def _build_perception_url(slug: str) -> str:
+    return f"https://perception.vsco.co/{slug}/gallery"
+
+
+def _normalize_vsco_profile_candidate(u: str) -> Optional[Tuple[str, str]]:
+    try:
+        parsed = urlparse(u)
+    except Exception:
+        return None
+    host = (parsed.netloc or "").lower()
+    path = parsed.path or ""
+    parts = [seg for seg in path.split("/") if seg]
+    if not parts:
+        return None
+
+    if host in VSCO_PERCEPTION_HOSTS:
+        slug = parts[0]
+        if slug:
+            return slug, _build_perception_url(slug)
+
+    if "vsco.co" in host:
+        username = parts[0]
+        if USERNAME_RE.match(username):
+            return username, f"https://vsco.co/{username}/gallery"
+    return None
+
+
+def _vsco_short_slug(u: str) -> Optional[str]:
+    try:
+        parsed = urlparse(u)
+    except Exception:
+        return None
+    host = (parsed.netloc or "").lower()
+    if host not in VSCO_SHORT_HOSTS:
+        return None
+    m = SHORT_SLUG_RE.match(parsed.path or "")
+    if m:
+        slug = m.group(1)
+        if slug:
+            return slug
+    return None
+
+
+async def _resolve_vsco_short(u: str) -> Optional[str]:
+    slug = _vsco_short_slug(u)
+    current = u
+    try:
+        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT, headers=RESOLVE_HEADERS) as session:
+            for _ in range(5):
+                async with session.get(current, allow_redirects=False) as resp:
+                    final_url = str(resp.url)
+                    status = resp.status
+                    if status in (301, 302, 303, 307, 308):
+                        location = resp.headers.get("Location")
+                        if not location:
+                            break
+                        next_url = urljoin(final_url, location)
+                        try:
+                            parsed = urlparse(next_url)
+                        except Exception:
+                            parsed = None
+                        host = (parsed.netloc or "").lower() if parsed else ""
+                        if host == "apps.apple.com" and slug:
+                            return _build_perception_url(slug)
+                        if host in VSCO_PERCEPTION_HOSTS and slug:
+                            return _build_perception_url(slug)
+                        current = next_url
+                        continue
+
+                    host = (resp.url.host or "").lower() if resp.url else ""
+                    if host == "apps.apple.com" and slug:
+                        return _build_perception_url(slug)
+                    if host in VSCO_PERCEPTION_HOSTS and slug:
+                        return _build_perception_url(slug)
+                    return final_url
+    except Exception:
+        pass
+    if slug:
+        return _build_perception_url(slug)
+    return None
+
+
+async def _normalize_profile_url(profile_url: str) -> Optional[Tuple[str, str]]:
+    candidate = _normalize_vsco_profile_candidate(profile_url)
+    if candidate:
+        return candidate
+    slug = _vsco_short_slug(profile_url)
+    if not slug:
+        return None
+    resolved = await _resolve_vsco_short(profile_url)
+    if not resolved:
+        return slug, _build_perception_url(slug)
+    normalized = _normalize_vsco_profile_candidate(resolved)
+    if normalized:
+        return normalized
+    return slug, _build_perception_url(slug)
+
+
+async def normalize_profile(username: Optional[str], profile_url: Optional[str]) -> Tuple[str, str]:
     if profile_url:
-        m = re.search(r"vsco\.co/([^/]+)/", profile_url) or re.search(r"vsco\.co/([^/]+)", profile_url)
-        user = m.group(1) if m else "unknown"
-        url = profile_url if profile_url.endswith("/gallery") else profile_url.rstrip("/") + "/gallery"
-        return user, url
-    assert username
+        normalized = await _normalize_profile_url(profile_url)
+        if not normalized:
+            raise ValueError("Не удалось распознать ссылку профиля VSCO.")
+        return normalized
+    if not username:
+        raise ValueError("Не указан username VSCO.")
     return username, f"https://vsco.co/{username}/gallery"
 
 # -----------------------------
@@ -676,7 +789,11 @@ def build_zip_single(
 async def main_async(args: argparse.Namespace) -> int:
     from playwright.async_api import async_playwright
 
-    user, profile_url = normalize_profile(args.username, args.profile_url)
+    try:
+        user, profile_url = await normalize_profile(args.username, args.profile_url)
+    except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 2
     logger, logpath, ts = setup_logger(user)
     logger.info("== Этап 1: Инициализация и мини-тест окружения ==")
     if not validate_environment(logger): return 2

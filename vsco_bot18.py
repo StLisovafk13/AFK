@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple, Sequence
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 import json
 import time
 import tempfile
@@ -255,6 +255,7 @@ if pd is None:
 # ---------------------- VSCO constants ----------------------
 VSCO_HOSTS = {"vsco.co", "www.vsco.co"}
 VSCO_SHORT_HOSTS = {"vs.co", "www.vs.co"}
+VSCO_PERCEPTION_HOSTS = {"perception.vsco.co", "www.perception.vsco.co"}
 VSCO_RESERVED = {
     "", "discover", "search", "images", "image", "media", "terms", "privacy",
     "about", "gallery", "videos", "press", "company", "legal", "pricing",
@@ -264,6 +265,7 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 TG_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
 URL_RE = re.compile(r'(https?://[^\s<>"\'\]\)]+)', re.IGNORECASE)
 MEDIA_PATH_RE = re.compile(r"^/([^/]+)/media/([A-Za-z0-9]+)")
+SHORT_SLUG_RE = re.compile(r"^/([A-Za-z0-9]+)(?:/.*)?$")
 
 OG_IMAGE_RE = re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.I)
 TW_IMAGE_RE = re.compile(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', re.I)
@@ -491,7 +493,7 @@ def has_daily_data_access(chat_id: int, user_id: Optional[int] = None) -> Tuple[
 def is_vsco_url(u: str) -> bool:
     try:
         p = urlparse(u); host = (p.netloc or "").lower()
-        return host in VSCO_HOSTS or host in VSCO_SHORT_HOSTS
+        return host in VSCO_HOSTS or host in VSCO_SHORT_HOSTS or host in VSCO_PERCEPTION_HOSTS
     except Exception:
         return False
 
@@ -523,6 +525,17 @@ def classify_vsco_path(url: str) -> Dict[str, Any]:
     try:
         p = urlparse(url)
         path = p.path or ""
+        host = (p.netloc or "").lower()
+        if host in VSCO_PERCEPTION_HOSTS:
+            m = SHORT_SLUG_RE.match(path)
+            if m:
+                slug = m.group(1)
+                if slug:
+                    return {
+                        "kind": "perception",
+                        "slug": slug,
+                        "final_url": f"https://perception.vsco.co/{slug}/gallery"
+                    }
         m = MEDIA_PATH_RE.match(path)
         if m:
             u, mid = m.group(1), m.group(2)
@@ -536,12 +549,56 @@ def classify_vsco_path(url: str) -> Dict[str, Any]:
         pass
     return {}
 
-async def resolve_vsco_short(url: str, session: aiohttp.ClientSession) -> str:
+def _build_perception_url(slug: str) -> str:
+    return f"https://perception.vsco.co/{slug}/gallery"
+
+
+def _vsco_short_slug(url: str) -> Optional[str]:
     try:
-        async with session.get(url, allow_redirects=True, timeout=10, headers=HEADERS) as resp:
-            return str(resp.url)
+        p = urlparse(url)
+        if (p.netloc or "").lower() not in VSCO_SHORT_HOSTS:
+            return None
+        m = SHORT_SLUG_RE.match(p.path or "")
+        if m:
+            return m.group(1)
     except Exception:
-        return url
+        return None
+    return None
+
+
+async def resolve_vsco_short(url: str, session: aiohttp.ClientSession) -> str:
+    slug = _vsco_short_slug(url)
+    current = url
+    try:
+        for _ in range(5):
+            async with session.get(current, allow_redirects=False, timeout=10, headers=HEADERS) as resp:
+                final_url = str(resp.url)
+                status = resp.status
+                if status in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("Location")
+                    if not location:
+                        break
+                    next_url = urljoin(final_url, location)
+                    try:
+                        parsed = urlparse(next_url)
+                    except Exception:
+                        parsed = None
+                    if parsed and (parsed.netloc or "").lower() in VSCO_PERCEPTION_HOSTS and slug:
+                        return _build_perception_url(slug)
+                    if parsed and (parsed.netloc or "").lower() == "apps.apple.com" and slug:
+                        return _build_perception_url(slug)
+                    current = next_url
+                    continue
+                if (resp.url.host or "").lower() in VSCO_PERCEPTION_HOSTS and slug:
+                    return _build_perception_url(slug)
+                if (resp.url.host or "").lower() == "apps.apple.com" and slug:
+                    return _build_perception_url(slug)
+                return final_url
+    except Exception:
+        pass
+    if slug:
+        return _build_perception_url(slug)
+    return url
 
 async def fetch_media_image_url(url: str, session: aiohttp.ClientSession) -> Optional[str]:
     """
@@ -690,6 +747,9 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
                 profile_url = f"https://vsco.co/{usr}"
                 image_url = await fetch_media_image_url(final, s) or final  # fallback: страница медиа
                 res.append({"username": usr, "url": profile_url, "comment": c, "image_url": image_url})
+            elif info["kind"] == "perception":
+                slug = info["slug"]
+                res.append({"username": slug, "url": info["final_url"], "comment": c, "image_url": ""})
     uniq = {(r["username"], r["url"], r["comment"], r.get("image_url","")): r for r in res}
     return list(uniq.values())
 
@@ -3279,6 +3339,8 @@ async def _dl_worker():
         txt = f"{icon} <b>{stage.value}</b>: <code>{target}</code>"
         if total_found is not None:
             txt += f"\n🔎 Найдено медиа: <b>{total_found}</b>"
+        elif stage in {Stage.SCAN, Stage.DOWNLOAD}:
+            txt += "\n🔎 Найдено медиа: <b>0</b>"
         if stage is Stage.DOWNLOAD and total_found is not None:
             txt += f"\n📥 Загрузка: <b>{downloaded}/{total_found}</b>"
         if stage is Stage.ARCHIVE and zip_parts is not None:
@@ -3426,15 +3488,16 @@ async def _dl_worker():
                     txt = line.decode("utf-8", "ignore").rstrip()
                     low = txt.lower()
 
-                    if txt.startswith("scan_progress"):
+                    m = re.search(r"\bscan_progress\s+(\d+)", txt)
+                    if not m and txt.startswith("scan_progress"):
                         m = re.search(r"(\d+)", txt)
-                        if m and bump_total(int(m.group(1)), "stdout:scan_progress"):
-                            await _safe_edit(
-                                job.chat_id,
-                                progress.message_id,
-                                build_progress_text(stage, job.target, total_found, downloaded, zip_parts),
-                                reply_markup=cancel_kb,
-                            )
+                    if m and bump_total(int(m.group(1)), "stdout:scan_progress"):
+                        await _safe_edit(
+                            job.chat_id,
+                            progress.message_id,
+                            build_progress_text(stage, job.target, total_found, downloaded, zip_parts),
+                            reply_markup=cancel_kb,
+                        )
                         continue
 
                     if any(k in low for k in ("download", "загрузка", "скачива")) and stage is not Stage.DOWNLOAD:
