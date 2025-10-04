@@ -74,8 +74,19 @@ from zip_profile import zip_router
 # ---------------------- setup & logging ----------------------
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-WORKDIR = Path(os.getenv("BOT_WORKDIR", "./work")); WORKDIR.mkdir(parents=True, exist_ok=True)
-LOGDIR = Path(os.getenv("BOT_LOGDIR", "./logs")); LOGDIR.mkdir(parents=True, exist_ok=True)
+
+
+def _prepare_storage_dir(env_var: str, default: Path) -> Path:
+    raw = os.getenv(env_var, "").strip()
+    path = Path(raw).expanduser() if raw else default
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+DEFAULT_WORKDIR = Path(tempfile.gettempdir()) / "vsco-bot" / "work"
+DEFAULT_LOGDIR = Path("./logs")
+WORKDIR = _prepare_storage_dir("BOT_WORKDIR", DEFAULT_WORKDIR)
+LOGDIR = _prepare_storage_dir("BOT_LOGDIR", DEFAULT_LOGDIR)
 DB_PATH = os.getenv("BOT_DB_PATH", "vsco_links.db")
 SEND_TIMEOUT = int(os.getenv("BOT_SEND_TIMEOUT", "600"))
 ARCHIVE_CHANNEL_ID_ENV = os.getenv("BOT_ARCHIVE_CHANNEL_ID", "").strip()
@@ -2262,7 +2273,10 @@ async def on_export_click(cq: CallbackQuery):
                 await cq.answer("Экспорт CSV недоступен: не установлен pandas", show_alert=True)
                 return
             users = fetch_gallery_users(ses.export_scope, chat_id)
-            if not users: await cq.answer("Нет данных", show_alert=True); return
+            if not users:
+                await cq.answer("Нет данных", show_alert=True)
+                return
+            await cq.answer("Готовлю экспорт…", cache_time=0)
             flat = [{
                 "username": u["username"], "profile_url": u["profile_url"],
                 "lat": u["lat"], "lon": u["lon"],
@@ -2276,35 +2290,44 @@ async def on_export_click(cq: CallbackQuery):
             pd.DataFrame(flat).to_csv(out, index=False, encoding="utf-8")
             await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
                 caption=f"CSV ({'вся база' if ses.export_scope=='all' else 'текущий чат'})")
-            await cq.answer(); return
+            return
 
         if fmt == "gallery":
             users = fetch_gallery_users(ses.export_scope, chat_id)
-            if not users: await cq.answer("Нет данных", show_alert=True); return
+            if not users:
+                await cq.answer("Нет данных", show_alert=True)
+                return
+            await cq.answer("Готовлю экспорт…", cache_time=0)
             html = build_rich_gallery(users, title="VSCO Gallery",
                 subtitle=("All DB" if ses.export_scope=='all' else "Current Chat"))
             out = ses.dir / f"export_gallery_{ses.export_scope}.html"
             out.write_text(html, encoding="utf-8")
             await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
                 caption=f"Галерея ({'вся база' if ses.export_scope=='all' else 'текущий чат'})")
-            await cq.answer(); return
+            return
 
         if fmt in ("map_users","map","map_images"):
             if fmt in ("map","map_users"):
                 users = fetch_gallery_users(ses.export_scope, chat_id)
-                if not users: await cq.answer("Нет данных", show_alert=True); return
+                if not users:
+                    await cq.answer("Нет данных", show_alert=True)
+                    return
+                await cq.answer("Готовлю экспорт…", cache_time=0)
                 html = build_map_users(users, title=f"VSCO Profiles — {'Users' if fmt!='map_images' else 'Images'}")
                 out = ses.dir / f"export_map_users_{ses.export_scope}.html"
             else:
                 items = fetch_items_for_map(ses.export_scope, chat_id)
-                if not items: await cq.answer("Нет данных", show_alert=True); return
+                if not items:
+                    await cq.answer("Нет данных", show_alert=True)
+                    return
+                await cq.answer("Готовлю экспорт…", cache_time=0)
                 html = build_map_images(items, title="VSCO Profiles — Images")
                 out = ses.dir / f"export_map_images_{ses.export_scope}.html"
 
             out.write_text(html, encoding="utf-8")
             await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
                 caption=f"Карта ({'вся база' if ses.export_scope=='all' else 'текущий чат'})")
-            await cq.answer(); return
+            return
 
         await cq.answer("Неизвестный формат", show_alert=True); return
 
@@ -3418,6 +3441,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📥 Скачать профиль", callback_data="menu:download")],
+            [InlineKeyboardButton(text="📤 Экспорт", callback_data="menu:export")],
             [
                 InlineKeyboardButton(text="🔗 Ссылки за 24ч", callback_data="menu:links"),
                 InlineKeyboardButton(text="📈 Статистика", callback_data="menu:stats"),
@@ -3485,6 +3509,14 @@ async def on_menu_click(cq: CallbackQuery):
     if action == "stats":
         await cmd_stats(cq.message)
         await cq.answer("Готово")
+        return
+
+    if action == "export":
+        if cq.message and cq.message.chat.type in ("group", "supergroup"):
+            await cq.answer("Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.", show_alert=True)
+            return
+        await cmd_export(cq.message)
+        await cq.answer("Открываю экспорт")
         return
 
     if action == "qstat":
