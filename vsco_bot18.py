@@ -70,6 +70,7 @@ import shlex
 from vsco_parser3 import parse_html_file, dedupe_rows
 
 from zip_profile import zip_router
+from vsco_utils import is_vsco_logo_url
 
 # ---------------------- setup & logging ----------------------
 load_dotenv()
@@ -274,8 +275,6 @@ RESP_URL_RE = re.compile(r'responsive_url"\s*:\s*"([^"]+)"')
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; VSCO-Bot/1.0; +https://example.org/bot)"
 }
-
-VSCO_LOGO_MARKERS = ("vsco-logo-white",)
 
 # ---------------------- DB ----------------------
 def db_connect():
@@ -496,12 +495,6 @@ def is_vsco_url(u: str) -> bool:
         return host in VSCO_HOSTS or host in VSCO_SHORT_HOSTS or host in VSCO_PERCEPTION_HOSTS
     except Exception:
         return False
-
-def is_vsco_logo_url(url: str) -> bool:
-    if not url:
-        return False
-    low = url.lower()
-    return any(marker in low for marker in VSCO_LOGO_MARKERS)
 
 def username_from_vsco_co(url: str) -> Optional[str]:
     try:
