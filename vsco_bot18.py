@@ -2262,7 +2262,10 @@ async def on_export_click(cq: CallbackQuery):
                 await cq.answer("Экспорт CSV недоступен: не установлен pandas", show_alert=True)
                 return
             users = fetch_gallery_users(ses.export_scope, chat_id)
-            if not users: await cq.answer("Нет данных", show_alert=True); return
+            if not users:
+                await cq.answer("Нет данных", show_alert=True)
+                return
+            await cq.answer("Готовлю экспорт…", cache_time=0)
             flat = [{
                 "username": u["username"], "profile_url": u["profile_url"],
                 "lat": u["lat"], "lon": u["lon"],
@@ -2276,35 +2279,44 @@ async def on_export_click(cq: CallbackQuery):
             pd.DataFrame(flat).to_csv(out, index=False, encoding="utf-8")
             await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
                 caption=f"CSV ({'вся база' if ses.export_scope=='all' else 'текущий чат'})")
-            await cq.answer(); return
+            return
 
         if fmt == "gallery":
             users = fetch_gallery_users(ses.export_scope, chat_id)
-            if not users: await cq.answer("Нет данных", show_alert=True); return
+            if not users:
+                await cq.answer("Нет данных", show_alert=True)
+                return
+            await cq.answer("Готовлю экспорт…", cache_time=0)
             html = build_rich_gallery(users, title="VSCO Gallery",
                 subtitle=("All DB" if ses.export_scope=='all' else "Current Chat"))
             out = ses.dir / f"export_gallery_{ses.export_scope}.html"
             out.write_text(html, encoding="utf-8")
             await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
                 caption=f"Галерея ({'вся база' if ses.export_scope=='all' else 'текущий чат'})")
-            await cq.answer(); return
+            return
 
         if fmt in ("map_users","map","map_images"):
             if fmt in ("map","map_users"):
                 users = fetch_gallery_users(ses.export_scope, chat_id)
-                if not users: await cq.answer("Нет данных", show_alert=True); return
+                if not users:
+                    await cq.answer("Нет данных", show_alert=True)
+                    return
+                await cq.answer("Готовлю экспорт…", cache_time=0)
                 html = build_map_users(users, title=f"VSCO Profiles — {'Users' if fmt!='map_images' else 'Images'}")
                 out = ses.dir / f"export_map_users_{ses.export_scope}.html"
             else:
                 items = fetch_items_for_map(ses.export_scope, chat_id)
-                if not items: await cq.answer("Нет данных", show_alert=True); return
+                if not items:
+                    await cq.answer("Нет данных", show_alert=True)
+                    return
+                await cq.answer("Готовлю экспорт…", cache_time=0)
                 html = build_map_images(items, title="VSCO Profiles — Images")
                 out = ses.dir / f"export_map_images_{ses.export_scope}.html"
 
             out.write_text(html, encoding="utf-8")
             await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
                 caption=f"Карта ({'вся база' if ses.export_scope=='all' else 'текущий чат'})")
-            await cq.answer(); return
+            return
 
         await cq.answer("Неизвестный формат", show_alert=True); return
 
