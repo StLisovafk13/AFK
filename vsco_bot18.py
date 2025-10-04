@@ -801,6 +801,121 @@ def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_f
     finally:
         conn.close()
 
+
+def ingest_download_results(job: "DLJob", user_dir: Path) -> Tuple[int, bool]:
+    """Ingest downloaded VSCO media links from the downloader manifest into the DB.
+
+    Returns a tuple ``(items_added, profile_link_added)``.
+    """
+
+    manifest_path = user_dir / "manifest.json"
+    manifest_meta: Dict[str, Any] = {}
+    items_data: List[Dict[str, Any]] = []
+
+    if manifest_path.exists():
+        try:
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            log.warning("Job #%s: failed to read manifest %s", job.id, manifest_path)
+        else:
+            if isinstance(raw, dict):
+                manifest_meta = raw
+                maybe_items = raw.get("items")
+                if isinstance(maybe_items, list):
+                    items_data = [x for x in maybe_items if isinstance(x, dict)]
+            elif isinstance(raw, list):
+                items_data = [x for x in raw if isinstance(x, dict)]
+
+    if not items_data:
+        urls_path = user_dir / "urls_extracted.txt"
+        if urls_path.exists():
+            try:
+                urls = [line.strip() for line in urls_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            except Exception:
+                urls = []
+            if urls:
+                items_data = [{"url": u, "ok": True} for u in urls]
+
+    username = _extract_username_from_target(job.target)
+    if not username:
+        candidate = manifest_meta.get("username") if isinstance(manifest_meta, dict) else None
+        if isinstance(candidate, str) and candidate.strip():
+            username = candidate.strip()
+
+    profile_url = ""
+    manifest_profile = manifest_meta.get("profile_url") if isinstance(manifest_meta, dict) else None
+    if isinstance(manifest_profile, str) and manifest_profile.strip():
+        info = classify_vsco_path(manifest_profile.strip())
+        if info.get("kind") == "profile" and isinstance(info.get("final_url"), str):
+            profile_url = info["final_url"].strip()
+        elif is_vsco_url(manifest_profile):
+            profile_url = manifest_profile.strip()
+
+    if not username and profile_url:
+        extracted = username_from_vsco_co(profile_url)
+        if extracted:
+            username = extracted
+
+    if not profile_url and username:
+        profile_url = f"https://vsco.co/{username}"
+
+    if not profile_url and job.target and is_vsco_url(job.target):
+        info = classify_vsco_path(job.target)
+        if info.get("kind") == "profile" and isinstance(info.get("final_url"), str):
+            profile_url = info["final_url"].strip()
+        else:
+            profile_url = job.target.strip()
+
+    username = (username or "").strip().lstrip("@")
+    profile_url = (profile_url or "").strip()
+
+    if not username and not profile_url:
+        log.info("Job #%s: skipped DB ingest — username/profile unresolved", job.id)
+        return (0, False)
+
+    conn = db_connect()
+    added_items = 0
+    link_added = False
+    try:
+        seen_urls: set[str] = set()
+        for item in items_data:
+            if not isinstance(item, dict):
+                continue
+            if "ok" in item and not item.get("ok"):
+                continue
+            image_url = ""
+            for key in ("image_url", "responsive_url", "url"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    image_url = value.strip()
+                    break
+            if not image_url or image_url in seen_urls:
+                continue
+            seen_urls.add(image_url)
+            if _get_item_id(conn, username, profile_url, image_url) is None:
+                _insert_item(
+                    conn,
+                    chat_id=job.chat_id,
+                    username=username,
+                    profile_url=profile_url,
+                    image_url=image_url,
+                    latitude=None,
+                    longitude=None,
+                    source="download",
+                    source_file=user_dir.name,
+                    added_by=job.requested_by,
+                )
+                added_items += 1
+
+        if username and profile_url:
+            link_added = add_vsco_link_legacy(username, profile_url, job.chat_id, conn)
+
+        conn.commit()
+    finally:
+        conn.close()
+
+    return (added_items, link_added)
+
 # ---------------------- Stats ----------------------
 _USERNAME_KEY_SQL = "LOWER(TRIM(COALESCE(username,'')))"
 _MEDIA_KEY_SQL = "COALESCE(NULLIF(TRIM(image_url),''), printf('item:%011d', id))"
@@ -3344,8 +3459,22 @@ async def _dl_worker():
             user_dirs = [p for p in job.out_base.glob("*") if p.is_dir()]
             user_dir = max(user_dirs, key=lambda p: p.stat().st_mtime, default=None)
 
+            db_items_added = 0
+            db_link_added = False
+
             if user_dir is not None:
                 rebuild_urls_extracted(user_dir)
+                try:
+                    db_items_added, db_link_added = ingest_download_results(job, user_dir)
+                    if db_items_added or db_link_added:
+                        log.info(
+                            "Job #%s: ingested %d items%s into DB",
+                            job.id,
+                            db_items_added,
+                            " + profile link" if db_link_added else "",
+                        )
+                except Exception:
+                    log.exception("Job #%s: failed to ingest download results", job.id)
 
             if user_dir is None:
                 log.warning("Job #%s: completed but no results found", job.id)

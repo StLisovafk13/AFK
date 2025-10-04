@@ -2,6 +2,7 @@ import importlib
 import sys
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -133,6 +134,64 @@ def test_insert_full_rows_from_html_returns_new_links(vsco_module):
 
     assert added_again == 0
     assert new_links_again == []
+
+
+def test_ingest_download_results_adds_media(vsco_module, tmp_path):
+    user_dir = tmp_path / "sampleuser"
+    user_dir.mkdir()
+    manifest = {
+        "username": "sampleuser",
+        "profile_url": "https://vsco.co/sampleuser/gallery",
+        "items": [
+            {"url": "https://cdn.example.com/media1.jpg", "ok": True},
+            {"url": "https://cdn.example.com/media2.jpg", "ok": False},
+            {
+                "url": "https://cdn.example.com/media3_small.jpg",
+                "responsive_url": "https://cdn.example.com/media3_large.jpg",
+                "ok": True,
+            },
+        ],
+    }
+    (user_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    job = vsco_module.DLJob(
+        id=1,
+        chat_id=555,
+        target="sampleuser",
+        extra_flags=[],
+        out_base=tmp_path,
+        requested_by="@requester",
+    )
+
+    added, link_added = vsco_module.ingest_download_results(job, user_dir)
+    assert added == 2
+    assert link_added is True
+
+    conn = vsco_module.db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT username, profile_url, image_url, source, source_file, added_by FROM items ORDER BY image_url"
+        ).fetchall()
+        link_row = conn.execute("SELECT username, url FROM links").fetchone()
+    finally:
+        conn.close()
+
+    assert rows == [
+        ("sampleuser", "https://vsco.co/sampleuser", "https://cdn.example.com/media1.jpg", "download", "sampleuser", "@requester"),
+        (
+            "sampleuser",
+            "https://vsco.co/sampleuser",
+            "https://cdn.example.com/media3_large.jpg",
+            "download",
+            "sampleuser",
+            "@requester",
+        ),
+    ]
+    assert link_row == ("sampleuser", "https://vsco.co/sampleuser")
+
+    added_again, link_added_again = vsco_module.ingest_download_results(job, user_dir)
+    assert added_again == 0
+    assert link_added_again is False
 
 
 class DummyChat:
