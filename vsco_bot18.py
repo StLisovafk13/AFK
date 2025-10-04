@@ -17,6 +17,7 @@
 # - /links: ссылки за последние 24ч + пагинация + CSV.
 # - Парсинг комментария: сразу после ссылки через запятую до следующей ссылки.
 
+import codecs
 import os
 import re
 import sqlite3
@@ -32,7 +33,7 @@ import json
 import time
 import tempfile
 import zipfile
-from html import escape
+from html import escape, unescape
 from enum import Enum
 
 try:
@@ -270,6 +271,8 @@ SHORT_SLUG_RE = re.compile(r"^/([A-Za-z0-9]+)(?:/.*)?$")
 OG_IMAGE_RE = re.compile(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', re.I)
 TW_IMAGE_RE = re.compile(r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']', re.I)
 RESP_URL_RE = re.compile(r'responsive_url"\s*:\s*"([^"]+)"')
+DIRECT_IMG_RE = re.compile(r'https?://(?:img|im)\.vsco\.co[^\s"\\<>]+', re.I)
+DIRECT_IMG_ESC_RE = re.compile(r'https?:\\/\\/(?:img|im)\.vsco\.co[^"\s<>]+', re.I)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; VSCO-Bot/1.0; +https://example.org/bot)"
@@ -603,6 +606,66 @@ async def resolve_vsco_short(url: str, session: aiohttp.ClientSession) -> str:
         return _build_perception_url(slug)
     return url
 
+
+def _cleanup_vsco_image_candidate(url: str) -> str:
+    if not url:
+        return ""
+    cleaned = url.strip().strip('\"').strip("'")
+    try:
+        cleaned = codecs.decode(cleaned, "unicode_escape")
+    except Exception:
+        cleaned = cleaned.replace("\\/", "/")
+    cleaned = cleaned.replace("\\u002F", "/").replace("\\u002f", "/")
+    cleaned = cleaned.replace("\\u003A", ":").replace("\\u003a", ":")
+    cleaned = cleaned.replace("\\u0026", "&")
+    cleaned = unescape(cleaned)
+    return cleaned.strip()
+
+
+def _is_direct_vsco_image_url(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    return host in {"img.vsco.co", "im.vsco.co"}
+
+
+def extract_direct_vsco_image_url(html: str) -> Optional[str]:
+    if not html:
+        return None
+
+    normalized = unescape(html)
+    normalized = normalized.replace("\\/", "/")
+    normalized = normalized.replace("\\u002F", "/").replace("\\u002f", "/")
+    normalized = normalized.replace("\\u003A", ":").replace("\\u003a", ":")
+    normalized = normalized.replace("\\u0026", "&")
+
+    candidates: List[str] = []
+    for rx in (RESP_URL_RE, OG_IMAGE_RE, TW_IMAGE_RE):
+        for match in rx.finditer(normalized):
+            raw = match.group(1)
+            candidate = _cleanup_vsco_image_candidate(raw)
+            if _is_direct_vsco_image_url(candidate):
+                return candidate
+            if candidate:
+                candidates.append(candidate)
+
+    for rx in (DIRECT_IMG_RE, DIRECT_IMG_ESC_RE):
+        for match in rx.finditer(normalized):
+            raw = match.group(0)
+            candidate = _cleanup_vsco_image_candidate(raw)
+            if _is_direct_vsco_image_url(candidate):
+                return candidate
+
+    for candidate in candidates:
+        if _is_direct_vsco_image_url(candidate):
+            return candidate
+
+    return None
+
+
 async def fetch_media_image_url(url: str, session: aiohttp.ClientSession) -> Optional[str]:
     """
     Пытается достать прямой URL картинки по HTML:
@@ -616,11 +679,7 @@ async def fetch_media_image_url(url: str, session: aiohttp.ClientSession) -> Opt
         log.warning("fetch_media_image_url failed: %s", e)
         return None
 
-    for rx in (OG_IMAGE_RE, TW_IMAGE_RE, RESP_URL_RE):
-        m = rx.search(html)
-        if m:
-            return m.group(1)
-    return None
+    return extract_direct_vsco_image_url(html)
 
 # === Парсер "ссылка, комментарий до следующей ссылки" ========================
 def _expand_text_with_entities(text: Optional[str], entities: Optional[Sequence[MessageEntity]]) -> str:
@@ -748,7 +807,7 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
             elif info["kind"] == "media":
                 usr = info["username"]
                 profile_url = f"https://vsco.co/{usr}"
-                image_url = await fetch_media_image_url(final, s) or final  # fallback: страница медиа
+                image_url = await fetch_media_image_url(final, s) or ""
                 res.append({"username": usr, "url": profile_url, "comment": c, "image_url": image_url})
             elif info["kind"] == "perception":
                 slug = info["slug"]
@@ -3044,6 +3103,10 @@ def rebuild_urls_extracted(user_dir: Path) -> None:
         if not isinstance(item, dict):
             continue
         url = item.get("image_url") or item.get("responsive_url")
+        if not url:
+            if item.get("ok") is False:
+                continue
+            url = item.get("url")
         if isinstance(url, str) and not is_vsco_logo_url(url) and url not in seen:
             urls.append(url)
             seen.add(url)

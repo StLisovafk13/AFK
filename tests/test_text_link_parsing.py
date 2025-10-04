@@ -340,3 +340,37 @@ def test_polling_retries_after_network_error(monkeypatch, vsco_module):
 
     assert len(attempts) == 2
     assert sleeps == [1]
+
+
+def test_extract_direct_vsco_image_url_unescapes(vsco_module):
+    html = (
+        '<script>window.__PRELOADED_STATE__ = {"responsive_url":'
+        '"https:\\/\\/im.vsco.co\\/aws-us-west-2\\/path\\/asset.jpg"};</script>'
+    )
+    result = vsco_module.extract_direct_vsco_image_url(html)
+    assert result == "https://im.vsco.co/aws-us-west-2/path/asset.jpg"
+
+
+def test_extract_direct_vsco_image_url_skips_non_direct(vsco_module):
+    html = '<meta property="og:image" content="https://vsco.co/someuser/media/abc">'
+    assert vsco_module.extract_direct_vsco_image_url(html) is None
+
+
+@pytest.mark.asyncio
+async def test_normalize_vsco_pairs_media_without_direct_image(monkeypatch, vsco_module):
+    async def fake_fetch(url: str, session):
+        return None
+
+    monkeypatch.setattr(vsco_module, "fetch_media_image_url", fake_fetch)
+
+    pairs = [{"url": "https://vsco.co/testuser/media/abc123", "comment": ""}]
+    normalized = await vsco_module.normalize_vsco_pairs(pairs)
+
+    assert normalized == [
+        {
+            "username": "testuser",
+            "url": "https://vsco.co/testuser",
+            "comment": "",
+            "image_url": "",
+        }
+    ]
