@@ -3430,6 +3430,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📥 Скачать профиль", callback_data="menu:download")],
+            [InlineKeyboardButton(text="📤 Экспорт", callback_data="menu:export")],
             [
                 InlineKeyboardButton(text="🔗 Ссылки за 24ч", callback_data="menu:links"),
                 InlineKeyboardButton(text="📈 Статистика", callback_data="menu:stats"),
@@ -3497,6 +3498,14 @@ async def on_menu_click(cq: CallbackQuery):
     if action == "stats":
         await cmd_stats(cq.message)
         await cq.answer("Готово")
+        return
+
+    if action == "export":
+        if cq.message and cq.message.chat.type in ("group", "supergroup"):
+            await cq.answer("Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.", show_alert=True)
+            return
+        await cmd_export(cq.message)
+        await cq.answer("Открываю экспорт")
         return
 
     if action == "qstat":
