@@ -1447,7 +1447,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     html = f"""<!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8"/>
+  <meta charset=\"utf-8\"/>
   <title>{escape(title)}</title>
   <style>
     body {{ font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; margin:0; background:#f5f6f8; color:#111; }}
@@ -1462,6 +1462,10 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     .card .head {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }}
     .card .head .name a {{ font-weight:700; text-decoration:none; color:#111; }}
     .btn {{ display:inline-block; padding:6px 10px; border-radius:10px; background:#10b981; color:#fff; text-decoration:none; font-weight:600; }}
+    .btn:visited {{ color:#fff; }}
+    .btn-secondary {{ display:inline-flex; align-items:center; justify-content:center; padding:6px 12px; border-radius:10px; background:#111827; color:#fff; text-decoration:none; font-weight:600; border:none; cursor:pointer; transition:background .15s ease; }}
+    .btn-secondary:hover {{ background:#374151; }}
+    .card .actions {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }}
     .meta {{ font-size:12px; color:#6b7280; margin:4px 0 8px 0; }}
     .meta.added {{ color:#4b5563; margin-top:2px; }}
     .thumbs {{ display:flex; gap:6px; overflow:hidden; }}
@@ -1470,37 +1474,112 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     .cm ul {{ margin: 0 0 4px 18px; padding:0; }}
     .cm .empty {{ color:#9ca3af; font-size:12px; }}
     .cm .more {{ color:#6b7280; font-size:12px; }}
+    .hidden {{ display:none !important; }}
+    .profile-view {{ max-width: 1200px; margin: 0 auto; padding: 32px 16px 60px; }}
+    .profile-wrap {{ background:#fff; border-radius:20px; padding:36px; box-shadow:0 24px 40px rgba(15,23,42,0.08); }}
+    .profile-back {{ background:none; border:none; color:#2563eb; font-size:14px; font-weight:600; cursor:pointer; padding:0; margin-bottom:24px; display:inline-flex; align-items:center; gap:6px; }}
+    .profile-back:hover {{ color:#1d4ed8; }}
+    .profile-head {{ display:flex; gap:32px; align-items:center; margin-bottom:24px; }}
+    .profile-avatar {{ width:144px; height:144px; border-radius:50%; background:linear-gradient(135deg,#e5e7eb,#d1d5db); border:6px solid #f3f4f6; display:flex; align-items:center; justify-content:center; font-size:48px; font-weight:600; color:#9ca3af; overflow:hidden; background-size:cover; background-position:center; }}
+    .profile-avatar.has-image {{ border-color:#fff; color:transparent; }}
+    .profile-info {{ flex:1 1 auto; }}
+    .profile-username {{ font-size:32px; font-weight:300; margin:0 0 14px 0; display:flex; align-items:center; gap:14px; }}
+    .profile-actions {{ display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px; }}
+    .profile-actions .follow {{ background:#111; color:#fff; border-radius:999px; padding:8px 22px; font-size:13px; letter-spacing:0.08em; text-transform:uppercase; text-decoration:none; font-weight:700; }}
+    .profile-actions .follow.disabled {{ pointer-events:none; opacity:0.5; }}
+    .profile-actions .open {{ font-size:13px; color:#2563eb; text-decoration:none; font-weight:600; }}
+    .profile-actions .open:hover {{ text-decoration:underline; }}
+    .profile-meta {{ display:flex; gap:16px; flex-wrap:wrap; font-size:13px; color:#4b5563; margin-bottom:10px; }}
+    .profile-meta span {{ display:inline-flex; align-items:center; gap:6px; }}
+    .profile-tags {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }}
+    .profile-tags .tag {{ background:#f3f4f6; border-radius:999px; padding:4px 10px; font-size:12px; color:#4b5563; }}
+    .profile-cities {{ display:flex; gap:8px; flex-wrap:wrap; font-size:12px; color:#1f2937; margin-bottom:18px; }}
+    .profile-cities .chip {{ background:#e0f2fe; color:#1d4ed8; border-radius:999px; padding:4px 12px; }}
+    .profile-stats {{ display:flex; gap:32px; margin-bottom:28px; }}
+    .profile-stats .stat {{ display:flex; flex-direction:column; font-size:14px; color:#6b7280; }}
+    .profile-stats .stat .value {{ font-size:20px; font-weight:600; color:#111827; }}
+    .profile-grid {{ display:grid; grid-template-columns: repeat(auto-fill,minmax(220px,1fr)); gap:16px; }}
+    .profile-grid .cell {{ position:relative; width:100%; padding-bottom:100%; border-radius:18px; overflow:hidden; background:#f3f4f6; }}
+    .profile-grid .cell img {{ position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; }}
+    .profile-empty {{ text-align:center; font-size:15px; color:#6b7280; padding:40px 0; }}
+    @media (max-width: 900px) {{
+      .profile-wrap {{ padding:24px; }}
+      .profile-head {{ flex-direction:column; align-items:flex-start; }}
+      .profile-avatar {{ width:120px; height:120px; }}
+      .profile-username {{ font-size:26px; }}
+      .profile-grid {{ grid-template-columns: repeat(auto-fill,minmax(160px,1fr)); }}
+    }}
   </style>
 </head>
 <body>
-  <div class="wrap">
+  <div class=\"wrap\" id=\"galleryView\">
     <h1>🎯 {escape(title)}</h1>
-    <div class="sub">{escape(subtitle)}</div>
+    <div class=\"sub\">{escape(subtitle)}</div>
 
-    <div class="toolbar">
-      <input id="q" placeholder="Filter by username" />
-      <input id="latMin" placeholder="Lat min" type="number" step="0.0001"/>
-      <input id="latMax" placeholder="Lat max" type="number" step="0.0001"/>
-      <input id="lonMin" placeholder="Lon min" type="number" step="0.0001"/>
-      <input id="lonMax" placeholder="Lon max" type="number" step="0.0001"/>
-      <select id="sort">
-        <option value="img_desc">More images first</option>
-        <option value="img_asc">Fewer images first</option>
-        <option value="cm_desc">More comments first</option>
-        <option value="cm_asc">Fewer comments first</option>
-        <option value="name_asc">Username A–Z</option>
-        <option value="name_desc">Username Z–A</option>
+    <div class=\"toolbar\">
+      <input id=\"q\" placeholder=\"Filter by username\" />
+      <input id=\"latMin\" placeholder=\"Lat min\" type=\"number\" step=\"0.0001\"/>
+      <input id=\"latMax\" placeholder=\"Lat max\" type=\"number\" step=\"0.0001\"/>
+      <input id=\"lonMin\" placeholder=\"Lon min\" type=\"number\" step=\"0.0001\"/>
+      <input id=\"lonMax\" placeholder=\"Lon max\" type=\"number\" step=\"0.0001\"/>
+      <select id=\"sort\">
+        <option value=\"img_desc\">More images first</option>
+        <option value=\"img_asc\">Fewer images first</option>
+        <option value=\"cm_desc\">More comments first</option>
+        <option value=\"cm_asc\">Fewer comments first</option>
+        <option value=\"name_asc\">Username A–Z</option>
+        <option value=\"name_desc\">Username Z–A</option>
       </select>
-      <button id="apply">Apply</button>
-      <button id="reset" type="button">Reset</button>
+      <button id=\"apply\">Apply</button>
+      <button id=\"reset\" type=\"button\">Reset</button>
     </div>
 
-    <div class="stats" id="stats"></div>
-    <div class="grid" id="grid"></div>
+    <div class=\"stats\" id=\"stats\"></div>
+    <div class=\"grid\" id=\"grid\"></div>
+  </div>
+
+  <div class=\"profile-view hidden\" id=\"profileView\">
+    <div class=\"profile-wrap\">
+      <button class=\"profile-back\" id=\"profileBack\" type=\"button\">← Назад к галерее</button>
+      <div class=\"profile-head\">
+        <div class=\"profile-avatar\" id=\"profileAvatar\">@</div>
+        <div class=\"profile-info\">
+          <div class=\"profile-username\" id=\"profileUsername\">@username</div>
+          <div class=\"profile-actions\">
+            <a class=\"follow\" id=\"profileFollow\" href=\"#\" target=\"_blank\" rel=\"noopener\">FOLLOW</a>
+            <a class=\"open\" id=\"profileOpen\" href=\"#\" target=\"_blank\" rel=\"noopener\">Открыть оригинал</a>
+          </div>
+          <div class=\"profile-meta\" id=\"profileMeta\"></div>
+          <div class=\"profile-tags\" id=\"profileDatasets\"></div>
+          <div class=\"profile-cities\" id=\"profileCities\"></div>
+          <div class=\"profile-meta\" id=\"profileInfoExtra\"></div>
+        </div>
+      </div>
+      <div class=\"profile-stats\" id=\"profileStats\"></div>
+      <div class=\"profile-grid\" id=\"profileGrid\"></div>
+      <div class=\"profile-empty hidden\" id=\"profileEmpty\">Нет сохранённых фотографий для этого профиля.</div>
+    </div>
   </div>
 
   <script>
     const DATA = {data_json};
+    const DATA_MAP = new Map();
+    DATA.forEach(u => DATA_MAP.set((u.username || '').toLowerCase(), u));
+
+    const galleryView = document.getElementById('galleryView');
+    const profileView = document.getElementById('profileView');
+    const profileBack = document.getElementById('profileBack');
+    const profileAvatar = document.getElementById('profileAvatar');
+    const profileUsername = document.getElementById('profileUsername');
+    const profileFollow = document.getElementById('profileFollow');
+    const profileOpen = document.getElementById('profileOpen');
+    const profileMeta = document.getElementById('profileMeta');
+    const profileDatasets = document.getElementById('profileDatasets');
+    const profileCities = document.getElementById('profileCities');
+    const profileInfoExtra = document.getElementById('profileInfoExtra');
+    const profileStats = document.getElementById('profileStats');
+    const profileGrid = document.getElementById('profileGrid');
+    const profileEmpty = document.getElementById('profileEmpty');
 
     function sortData(arr, mode) {{
       switch(mode) {{
@@ -1525,8 +1604,101 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     }}
 
     function escapeHtml(s) {{
-      return (''+s).replace(/[&<>\"']/g, function(m) {{ return {{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}}[m]; }});
+      return (''+s).replace(/[&<>\"']/g, function(m) {{ return {{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}}[m]; }});
     }}
+
+    function renderProfile(user, updateHash=true) {{
+      if (!user) {{
+        return;
+      }}
+      const username = user.username || '';
+      const safeUsername = username ? '@' + username : 'Без username';
+      profileUsername.textContent = safeUsername;
+
+      const profileUrl = user.profile_url || '';
+      if (profileUrl) {{
+        profileFollow.href = profileUrl;
+        profileOpen.href = profileUrl;
+        profileFollow.classList.remove('disabled');
+      }} else {{
+        profileFollow.href = '#';
+        profileOpen.href = '#';
+        profileFollow.classList.add('disabled');
+      }}
+
+      const images = Array.isArray(user.images) ? user.images.filter(Boolean) : [];
+      if (images.length) {{
+        profileAvatar.classList.add('has-image');
+        profileAvatar.style.backgroundImage = 'url(' + JSON.stringify(images[0]) + ')';
+        profileAvatar.textContent = '';
+      }} else {{
+        profileAvatar.classList.remove('has-image');
+        profileAvatar.style.backgroundImage = '';
+        profileAvatar.textContent = username ? username[0].toUpperCase() : '@';
+      }}
+
+      const metaParts = [];
+      if (user.lat != null && user.lon != null) {{
+        metaParts.push('<span>📍 ' + user.lat.toFixed(5) + ', ' + user.lon.toFixed(5) + '</span>');
+      }}
+      if (user.added_by) {{
+        if (user.added_by_link) {{
+          metaParts.push('<span>👤 <a href="' + escapeHtml(user.added_by_link) + '" target="_blank" rel="noopener">' + escapeHtml(user.added_by) + '</a></span>');
+        }} else {{
+          metaParts.push('<span>👤 ' + escapeHtml(user.added_by) + '</span>');
+        }}
+      }}
+      profileMeta.innerHTML = metaParts.join('');
+      profileMeta.classList.toggle('hidden', metaParts.length === 0);
+
+      const datasetParts = (user.datasets || []).map(ds => '<span class=\"tag\">' + escapeHtml(ds.label || ds.value || '') + '</span>');
+      profileDatasets.innerHTML = datasetParts.join('');
+      profileDatasets.classList.toggle('hidden', datasetParts.length === 0);
+
+      const cityParts = (user.cities || []).map(city => '<span class=\"chip\">' + escapeHtml(city) + '</span>');
+      profileCities.innerHTML = cityParts.join('');
+      profileCities.classList.toggle('hidden', cityParts.length === 0);
+
+      const infoExtra = [];
+      if (user.first_created) {{
+        infoExtra.push('<span>🕓 Первое: ' + escapeHtml(user.first_created) + '</span>');
+      }}
+      if (user.last_created && user.last_created !== user.first_created) {{
+        infoExtra.push('<span>🕒 Последнее: ' + escapeHtml(user.last_created) + '</span>');
+      }}
+      profileInfoExtra.innerHTML = infoExtra.join('');
+      profileInfoExtra.classList.toggle('hidden', infoExtra.length === 0);
+
+      profileStats.innerHTML = [
+        '<div class=\"stat\"><span class=\"value\">' + images.length + '</span><span class=\"label\">posts</span></div>',
+        '<div class=\"stat\"><span class=\"value\">' + (user.comments_count || 0) + '</span><span class=\"label\">comments</span></div>'
+      ].join('');
+
+      if (images.length) {{
+        profileGrid.innerHTML = images.map(src => '<div class=\"cell\"><img src=\"' + escapeHtml(src) + '\" loading=\"lazy\" alt=\"\"></div>').join('');
+        profileEmpty.classList.add('hidden');
+      }} else {{
+        profileGrid.innerHTML = '';
+        profileEmpty.classList.remove('hidden');
+      }}
+
+      galleryView.classList.add('hidden');
+      profileView.classList.remove('hidden');
+      if (updateHash) {{
+        location.hash = '#/profile/' + encodeURIComponent(username || '');
+      }}
+      window.scrollTo({{ top: 0, behavior: 'smooth' }});
+    }}
+
+    function showGallery(updateHash=true) {{
+      profileView.classList.add('hidden');
+      galleryView.classList.remove('hidden');
+      if (updateHash) {{
+        location.hash = '#gallery';
+      }}
+    }}
+
+    profileBack.addEventListener('click', () => showGallery(true));
 
     function render(list) {{
       const grid=document.getElementById('grid'), stats=document.getElementById('stats');
@@ -1538,34 +1710,47 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         const images=(u.images||[]).slice(0,4);
         const cm=(u.comments||[]);
         let cmHtml='';
-        if (cm.length===0) cmHtml = '<div class="empty">нет комментариев</div>';
+        if (cm.length===0) cmHtml = '<div class=\"empty\">нет комментариев</div>';
         else {{
           const head = cm.slice(0,3).map(c=>`<li>${{escapeHtml(c)}}</li>`).join('');
-          const more = cm.length>3 ? `<div class="more">и ещё ${{cm.length-3}}…</div>` : '';
+          const more = cm.length>3 ? `<div class=\"more\">и ещё ${{cm.length-3}}…</div>` : '';
           cmHtml = `<ul>${{head}}</ul>` + more;
         }}
-        const thumbs = images.map(src=>`<img src="${{src}}" loading="lazy">`).join('');
+        const thumbs = images.map(src=>`<img src=\"${{escapeHtml(src)}}\" loading=\"lazy\">`).join('');
         const latStr = (u.lat!=null && u.lon!=null) ? `${{u.lat.toFixed(6)}}, ${{u.lon.toFixed(6)}}` : '';
         const addedBy = (()=>{{
           if (!u.added_by) return '';
           const label = escapeHtml(u.added_by);
           if (u.added_by_link) {{
-            return `<a href="${{escapeHtml(u.added_by_link)}}" target="_blank">${{label}}</a>`;
+            return `<a href=\"${{escapeHtml(u.added_by_link)}}\" target=\"_blank\">${{label}}</a>`;
           }}
           return label;
         }})();
         const card = document.createElement('div');
         card.className = 'card';
+        card.dataset.username = u.username || '';
+        const safeProfileUrl = escapeHtml(u.profile_url || '');
         card.innerHTML = `
-          <div class="head">
-            <div class="name"><a href="${{u.profile_url}}" target="_blank">@${{escapeHtml(u.username)}}</a></div>
-            <a class="btn" href="${{u.profile_url}}" target="_blank">View Profile</a>
+          <div class=\"head\">
+            <div class=\"name\"><a href=\"${{safeProfileUrl}}\" target=\"_blank\">@${{escapeHtml(u.username)}}</a></div>
+            <a class=\"btn\" href=\"${{safeProfileUrl}}\" target=\"_blank\">View Profile</a>
           </div>
-          <div class="meta">${{latStr ? latStr + ' • ' : ''}}${{u.images_count}} item(s) • ${{u.comments_count}} comment(s)</div>
-          <div class="meta added">Добавил: ${{addedBy || '—'}}</div>
-          <div class="thumbs">${{thumbs}}</div>
-          <div class="cm">${{cmHtml}}</div>
+          <div class=\"meta\">${{latStr ? latStr + ' • ' : ''}}${{u.images_count}} item(s) • ${{u.comments_count}} comment(s)</div>
+          <div class=\"meta added\">Добавил: ${{addedBy || '—'}}</div>
+          <div class=\"thumbs\">${{thumbs}}</div>
+          <div class=\"cm\">${{cmHtml}}</div>
+          <div class=\"actions\">
+            <button class=\"btn-secondary profile-btn\" type=\"button\">Открыть галерею</button>
+          </div>
         `;
+        const openBtn = card.querySelector('.profile-btn');
+        if (openBtn) {{
+          openBtn.addEventListener('click', (ev) => {{
+            ev.preventDefault();
+            ev.stopPropagation();
+            renderProfile(u);
+          }});
+        }}
         grid.appendChild(card);
       }});
     }}
@@ -1593,10 +1778,27 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     document.getElementById('apply').addEventListener('click', apply);
     document.getElementById('reset').addEventListener('click', reset);
     reset();
+
+    function handleHashNavigation() {{
+      const hash = location.hash || '';
+      if (hash.startsWith('#/profile/')) {{
+        const username = decodeURIComponent(hash.replace('#/profile/', ''));
+        const user = DATA_MAP.get((username || '').toLowerCase());
+        if (user) {{
+          renderProfile(user, false);
+          return;
+        }}
+      }}
+      showGallery(false);
+    }}
+
+    window.addEventListener('hashchange', handleHashNavigation);
+    handleHashNavigation();
   </script>
 </body>
 </html>"""
     return html
+
 
 def _map_html(
     title: str,
