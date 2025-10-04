@@ -25,7 +25,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple, Sequence
+from typing import List, Optional, Dict, Any, Tuple, Sequence, TypedDict
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, urljoin
 import json
@@ -765,16 +765,43 @@ def add_vsco_link_legacy(username: str, url: str, chat_id: int, conn: sqlite3.Co
     return cur.rowcount > 0
 
 
-def format_new_links_block(links: Sequence[str]) -> str:
-    uniq_links = [link for link in dict.fromkeys(links or []) if link]
-    if not uniq_links:
+class LinkEntry(TypedDict):
+    profile_url: str
+    image_url: str
+
+
+def _format_link(url: str) -> str:
+    href = escape(url, quote=True)
+    text = escape(url)
+    return f"<a href=\"{href}\">{text}</a>"
+
+
+def format_new_links_block(links: Sequence[LinkEntry]) -> str:
+    if not links:
         return ""
-    html_links = []
-    for link in uniq_links:
-        href = escape(link, quote=True)
-        text = escape(link)
-        html_links.append(f"<a href=\"{href}\">{text}</a>")
-    return "\nНовые ссылки:\n" + "\n".join(html_links)
+
+    uniq: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for link in links:
+        profile_url = (link.get("profile_url") or "").strip()
+        image_url = (link.get("image_url") or "").strip()
+        if not profile_url:
+            continue
+        key = (profile_url, image_url)
+        if key in uniq:
+            continue
+        uniq[key] = key
+
+    if not uniq:
+        return ""
+
+    formatted: List[str] = []
+    for profile_url, image_url in uniq.values():
+        parts = [_format_link(profile_url)]
+        if image_url:
+            parts.append(_format_link(image_url))
+        formatted.append("\n".join(parts))
+
+    return "\nНовые ссылки:\n" + "\n\n".join(formatted)
 
 def _get_item_id(conn: sqlite3.Connection, username: str, profile_url: str, image_url: str) -> Optional[int]:
     row = conn.execute(
@@ -808,11 +835,11 @@ def _insert_item(conn: sqlite3.Connection, chat_id: int, username: str, profile_
     )
     return cur.lastrowid
 
-def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source: str, source_file: Optional[str], added_by: str) -> Tuple[int,int,List[str]]:
+def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source: str, source_file: Optional[str], added_by: str) -> Tuple[int,int,List[LinkEntry]]:
     if not pairs: return (0,0,[])
     conn = db_connect()
     added_items = added_comments = 0
-    new_links: List[str] = []
+    new_links: List[LinkEntry] = []
     try:
         for r in pairs:
             username = (r.get("username") or "").lstrip("@")
@@ -822,7 +849,8 @@ def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source:
             if not username or not profile_url: continue
 
             item_id = _get_item_id(conn, username, profile_url, image_url)
-            if item_id is None:
+            is_new_item = item_id is None
+            if is_new_item:
                 item_id = _insert_item(conn, chat_id, username, profile_url, image_url, None, None, source, source_file, added_by)
                 added_items += 1
 
@@ -834,25 +862,25 @@ def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source:
                 if conn.total_changes > 0:
                     added_comments += 1
 
-            if add_vsco_link_legacy(username, profile_url, chat_id, conn):
-                new_links.append(profile_url)
+            if is_new_item and add_vsco_link_legacy(username, profile_url, chat_id, conn):
+                new_links.append(LinkEntry(profile_url=profile_url, image_url=image_url))
 
         conn.commit()
         return (added_items, added_comments, new_links)
     finally:
         conn.close()
 
-def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_file: str, added_by: str) -> Tuple[int, List[str]]:
+def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_file: str, added_by: str) -> Tuple[int, List[LinkEntry]]:
     if not rows:
         return (0, [])
     conn = db_connect()
     added = 0
-    new_links: List[str] = []
+    new_links: List[LinkEntry] = []
     try:
         for r in rows:
             username = (r.get("username") or "").lstrip("@")
             profile_url = r.get("profile_url") or (f"https://vsco.co/{username}" if username else "")
-            image_url = r.get("image_url") or ""
+            image_url = (r.get("image_url") or "").strip()
             lat = r.get("latitude"); lon = r.get("longitude")
             try: lat = float(lat) if lat not in ("", None, "None") else None
             except Exception: lat = None
@@ -861,12 +889,14 @@ def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_f
             if not username or not profile_url:
                 continue
 
-            if _get_item_id(conn, username, profile_url, image_url) is None:
+            item_id = _get_item_id(conn, username, profile_url, image_url)
+            is_new_item = item_id is None
+            if is_new_item:
                 _insert_item(conn, chat_id, username, profile_url, image_url, lat, lon, "html", source_file, added_by)
                 added += 1
 
-            if add_vsco_link_legacy(username, profile_url, chat_id, conn):
-                new_links.append(profile_url)
+            if is_new_item and add_vsco_link_legacy(username, profile_url, chat_id, conn):
+                new_links.append(LinkEntry(profile_url=profile_url, image_url=image_url))
         conn.commit()
         return (added, new_links)
     finally:
@@ -2326,7 +2356,7 @@ async def send_file(msg: Message, path: Path, caption: str = ""):
 async def on_document(msg: Message):
     ses = get_session(msg.chat.id)
     found = added_items = added_comments = 0
-    new_links: List[str] = []
+    new_links: List[LinkEntry] = []
     added_by = resolve_added_by(msg.from_user)
 
     if msg.caption:
@@ -2387,7 +2417,7 @@ async def on_document(msg: Message):
                 source_file=p.name,
                 added_by=added_by,
             )
-            all_links: List[str] = []
+            all_links: List[LinkEntry] = []
             if msg.caption:
                 all_links.extend(new_links)
             all_links.extend(html_links)
