@@ -74,8 +74,19 @@ from zip_profile import zip_router
 # ---------------------- setup & logging ----------------------
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-WORKDIR = Path(os.getenv("BOT_WORKDIR", "./work")); WORKDIR.mkdir(parents=True, exist_ok=True)
-LOGDIR = Path(os.getenv("BOT_LOGDIR", "./logs")); LOGDIR.mkdir(parents=True, exist_ok=True)
+
+
+def _prepare_storage_dir(env_var: str, default: Path) -> Path:
+    raw = os.getenv(env_var, "").strip()
+    path = Path(raw).expanduser() if raw else default
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+DEFAULT_WORKDIR = Path(tempfile.gettempdir()) / "vsco-bot" / "work"
+DEFAULT_LOGDIR = Path("./logs")
+WORKDIR = _prepare_storage_dir("BOT_WORKDIR", DEFAULT_WORKDIR)
+LOGDIR = _prepare_storage_dir("BOT_LOGDIR", DEFAULT_LOGDIR)
 DB_PATH = os.getenv("BOT_DB_PATH", "vsco_links.db")
 SEND_TIMEOUT = int(os.getenv("BOT_SEND_TIMEOUT", "600"))
 ARCHIVE_CHANNEL_ID_ENV = os.getenv("BOT_ARCHIVE_CHANNEL_ID", "").strip()
