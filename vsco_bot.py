@@ -80,6 +80,7 @@ from vsco_utils import (
     SHORT_SLUG_RE,
     dedupe_keep_order,
     extract_vsco_media_urls,
+    extract_media_urls_from_html,
     is_media_url,
     normalize_vsco_profile_url,
     resolve_vsco_short_link,
@@ -87,7 +88,7 @@ from vsco_utils import (
     build_perception_gallery_url,
     is_vsco_logo_url,
     normalize_media_url,
-    select_best_from_srcset,
+    scan_profile_media,
     upscale_w_param,
 )
 
@@ -559,45 +560,6 @@ async def resolve_vsco_short(url: str, session: aiohttp.ClientSession) -> str:
         request_kwargs={"timeout": 10},
     )
 
-def extract_media_urls_from_html(html: str, *, max_width: int) -> List[str]:
-    if not BeautifulSoup:
-        return []
-    soup = BeautifulSoup(html, "html.parser")
-    urls: List[str] = []
-
-    def push(url: Optional[str]):
-        if not url:
-            return
-        normalized = normalize_media_url(url)
-        if not normalized or not is_media_url(normalized):
-            return
-        final_url = upscale_w_param(normalized, max_width)
-        if not is_vsco_logo_url(final_url):
-            urls.append(final_url)
-
-    for img in soup.find_all("img"):
-        srcset = img.get("srcset")
-        candidate = select_best_from_srcset(srcset) if srcset else None
-        if not candidate:
-            candidate = img.get("src")
-        push(candidate)
-
-    for picture in soup.find_all("picture"):
-        for source in picture.find_all("source"):
-            candidate = select_best_from_srcset(source.get("srcset") or "")
-            push(candidate or source.get("src"))
-
-    for video in soup.find_all("video"):
-        push(video.get("src"))
-        for source in video.find_all("source"):
-            push(source.get("src"))
-            srcset = source.get("srcset")
-            if srcset:
-                push(select_best_from_srcset(srcset))
-
-    return dedupe_keep_order(urls)
-
-
 async def fetch_media_asset_urls(
     url: str,
     session: aiohttp.ClientSession,
@@ -614,7 +576,7 @@ async def fetch_media_asset_urls(
         log.warning("fetch_media_asset_urls failed: %s", e)
         return []
 
-    urls = extract_media_urls_from_html(html, max_width=max_width)
+    urls = extract_media_urls_from_html(html, max_width=max_width, root=url)
     if not urls:
         fallback_sources = extract_vsco_media_urls(html, sources=("og", "twitter", "responsive", "inline"))
         for candidate in fallback_sources:
@@ -749,7 +711,26 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
                 continue
 
             if info["kind"] == "profile":
-                res.append({"username": info["username"], "url": info["final_url"], "comment": c, "image_url": ""})
+                username = info["username"]
+                profile_url = info["final_url"]
+                gallery_url = normalize_vsco_profile_url(profile_url) or f"{profile_url.rstrip('/')}/gallery"
+                assets: List[str] = []
+                try:
+                    assets = await scan_profile_media(
+                        s,
+                        gallery_url,
+                        max_width=MEDIA_PAGE_MAX_WIDTH,
+                        logger=log,
+                    )
+                except Exception:
+                    log.exception("scan_profile_media failed for profile %s", profile_url)
+                    assets = []
+
+                if not assets:
+                    res.append({"username": username, "url": profile_url, "comment": c, "image_url": ""})
+                else:
+                    for asset in assets:
+                        res.append({"username": username, "url": profile_url, "comment": c, "image_url": asset})
             elif info["kind"] == "media":
                 usr = info["username"]
                 profile_url = f"https://vsco.co/{usr}"

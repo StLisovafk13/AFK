@@ -1,6 +1,7 @@
 """Shared VSCO helpers."""
 from __future__ import annotations
 
+import logging
 import re
 from typing import Iterable, Optional, Sequence
 from urllib.parse import (
@@ -12,6 +13,11 @@ from urllib.parse import (
     urlunparse,
     urlunsplit,
 )
+
+try:  # pragma: no cover - optional dependency
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    BeautifulSoup = None  # type: ignore
 
 
 VSCO_LOGO_MARKERS = ("vsco-logo-white",)
@@ -272,5 +278,107 @@ def extract_vsco_media_urls(
             urls.extend(match.group(1) for match in RESPONSIVE_URL_RE.finditer(html))
         elif source == "inline":
             urls.extend(INLINE_IMG_RE.findall(html))
+    return urls
+
+
+def extract_media_urls_from_html(
+    html: str,
+    *,
+    max_width: int,
+    root: Optional[str] = None,
+) -> list[str]:
+    """Collect direct media URLs from a VSCO HTML snippet.
+
+    The function prefers high-resolution candidates, applies ``?w=`` upscaling
+    and filters out known VSCO logo assets. Relative URLs are resolved against
+    ``root`` when provided.
+    """
+
+    if not html or not BeautifulSoup:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    urls: list[str] = []
+    base_root = root or "https://vsco.co/"
+
+    def push(candidate: Optional[str]):
+        if not candidate:
+            return
+        normalized = normalize_media_url(candidate, root=base_root)
+        if not normalized or not is_media_url(normalized):
+            return
+        final_url = upscale_w_param(normalized, max_width)
+        if not is_vsco_logo_url(final_url):
+            urls.append(final_url)
+
+    for img in soup.find_all("img"):
+        srcset = img.get("srcset")
+        candidate = select_best_from_srcset(srcset) if srcset else None
+        if not candidate:
+            candidate = img.get("src")
+        push(candidate)
+
+    for picture in soup.find_all("picture"):
+        for source in picture.find_all("source"):
+            candidate = select_best_from_srcset(source.get("srcset") or "")
+            push(candidate or source.get("src"))
+
+    for video in soup.find_all("video"):
+        push(video.get("src"))
+        for source in video.find_all("source"):
+            push(source.get("src"))
+            srcset = source.get("srcset")
+            if srcset:
+                push(select_best_from_srcset(srcset))
+
+    return dedupe_keep_order(urls)
+
+
+async def scan_profile_media(
+    session,
+    profile_url: str,
+    *,
+    max_width: int = 2048,
+    limit: int = 0,
+    logger: Optional[logging.Logger] = None,
+    request_kwargs: Optional[dict] = None,
+) -> list[str]:
+    """Fetch a VSCO profile page and return direct media asset URLs.
+
+    The helper performs a single HTTP GET (with optional ``request_kwargs``)
+    and extracts media links via :func:`extract_media_urls_from_html`. If no
+    direct ``img``/``video`` tags are present, a fallback scan through OG /
+    Twitter / responsive meta tags is attempted.
+    """
+
+    html = ""
+    kwargs = {"allow_redirects": True}
+    if request_kwargs:
+        kwargs.update(request_kwargs)
+
+    try:
+        async with session.get(profile_url, **kwargs) as resp:
+            html = await resp.text(errors="ignore")
+    except Exception as exc:
+        if logger is not None:
+            logger.warning("scan_profile_media: fetch failed for %s: %s", profile_url, exc)
+        return []
+
+    urls = extract_media_urls_from_html(html, max_width=max_width, root=profile_url)
+
+    if not urls:
+        fallback: list[str] = []
+        for candidate in extract_vsco_media_urls(html, sources=("og", "twitter", "responsive", "inline")):
+            normalized = normalize_media_url(candidate, root=profile_url)
+            if not normalized:
+                continue
+            final_url = upscale_w_param(normalized, max_width)
+            if is_media_url(final_url) and not is_vsco_logo_url(final_url):
+                fallback.append(final_url)
+        urls = dedupe_keep_order(fallback)
+
+    if limit and len(urls) > limit:
+        urls = urls[:limit]
+
     return urls
 
