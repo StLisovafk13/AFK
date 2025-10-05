@@ -88,7 +88,7 @@ from vsco_utils import (
     build_perception_gallery_url,
     is_vsco_logo_url,
     normalize_media_url,
-    scan_profile_media,
+    playwright_scan_profile,
     upscale_w_param,
 )
 
@@ -763,14 +763,14 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
                 gallery_url = normalize_vsco_profile_url(profile_url) or f"{profile_url.rstrip('/')}/gallery"
                 assets: List[str] = []
                 try:
-                    assets = await scan_profile_media(
-                        s,
+                    assets = await playwright_scan_profile(
                         gallery_url,
                         max_width=MEDIA_PAGE_MAX_WIDTH,
+                        session=s,
                         logger=log,
                     )
                 except Exception:
-                    log.exception("scan_profile_media failed for profile %s", profile_url)
+                    log.exception("playwright_scan_profile failed for profile %s", profile_url)
                     assets = []
 
                 if not assets:
@@ -815,6 +815,65 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
         len(res),
     )
     return list(uniq.values())
+
+
+def _profile_slug_from_url(profile_url: str) -> str:
+    parsed = urlparse(profile_url)
+    segments = [segment for segment in (parsed.path or "").split("/") if segment]
+    candidate = segments[0] if segments else ""
+    if candidate.lower() == "gallery" and len(segments) >= 2:
+        candidate = segments[-2]
+    if not candidate and parsed.netloc:
+        candidate = parsed.netloc.split(".")[0]
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", candidate)
+    return safe or "profile"
+
+
+def persist_profile_media_urls(
+    pairs: Sequence[Dict[str, str]],
+    base_dir: Path,
+) -> List[Path]:
+    grouped: Dict[str, List[str]] = {}
+    for entry in pairs:
+        profile_url = (entry.get("url") or "").strip()
+        image_url = (entry.get("image_url") or "").strip()
+        if not profile_url or not image_url:
+            continue
+        if is_vsco_logo_url(image_url):
+            continue
+        grouped.setdefault(profile_url, []).append(image_url)
+
+    saved: List[Path] = []
+    if not grouped:
+        return saved
+
+    profiles_root = base_dir / "profiles"
+    for profile_url, urls in grouped.items():
+        deduped = dedupe_keep_order(urls)
+        if not deduped:
+            continue
+        slug = _profile_slug_from_url(profile_url)
+        dest_dir = profiles_root / slug
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / "urls_extracted.txt"
+        with dest.open("w", encoding="utf-8") as fh:
+            fh.write("\n".join(deduped) + "\n")
+        saved.append(dest)
+    return saved
+
+
+def format_profile_urls_notice(paths: Sequence[Path], base_dir: Path) -> str:
+    if not paths:
+        return ""
+    lines: List[str] = []
+    for path in paths:
+        try:
+            display = path.relative_to(base_dir)
+        except ValueError:
+            display = path
+        lines.append(f"• <code>{escape(str(display))}</code>")
+    return "\nФайлы со ссылками:\n" + "\n".join(lines)
+
 
 # ---------------------- DB ops ----------------------
 def add_vsco_link_legacy(username: str, url: str, chat_id: int, conn: sqlite3.Connection) -> bool:
@@ -2678,9 +2737,11 @@ async def on_document(msg: Message):
     found = added_items = added_comments = 0
     new_links: List[str] = []
     added_by = resolve_added_by(msg.from_user)
+    caption_profile_files: List[Path] = []
 
     if msg.caption:
         pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_message(msg.caption, msg.caption_entities))
+        caption_profile_files = persist_profile_media_urls(pairs, ses.dir)
         found += len(pairs)
         ai, ac, links = upsert_items_with_comments(
             msg.chat.id,
@@ -2737,10 +2798,11 @@ async def on_document(msg: Message):
             added_comments += ac
             new_links.extend(links)
             links_block = format_new_links_block(new_links)
+            notice_block = format_profile_urls_notice(caption_profile_files, ses.dir)
             await msg.answer(
                 f"CSV загружен: <code>{escape(p.name)}</code>\n"
                 f"Найдено VSCO-ссылок: {found}, добавлено ссылок/медиа: {added_items}, добавлено комментариев: {added_comments}"
-                f"{links_block}"
+                f"{links_block}{notice_block}"
             )
         except Exception as e:
             log.exception("CSV processing failed")
@@ -2769,11 +2831,12 @@ async def on_document(msg: Message):
                 extra = (
                     f"\n+ из подписи: добавлено {added_items} записей, комментариев {added_comments}"
                 )
+            notice_block = format_profile_urls_notice(caption_profile_files, ses.dir)
             await msg.answer(
                 f"HTML загружен: <code>{escape(p.name)}</code>\n"
                 f"Сохранено элементов: {added_full}"
                 f"{extra}"
-                f"{links_block}"
+                f"{links_block}{notice_block}"
             )
         except Exception as e:
             log.exception("HTML processing failed")
@@ -2781,9 +2844,10 @@ async def on_document(msg: Message):
         return
 
     links_block = format_new_links_block(new_links) if msg.caption else ""
+    notice_block = format_profile_urls_notice(caption_profile_files, ses.dir)
     await msg.answer(
         "Файл сохранён. Нужны .html/.csv. Ссылки из подписи учтены, если были."
-        f"{links_block}"
+        f"{links_block}{notice_block}"
     )
 
 # ---------- plain text ----------
@@ -2812,6 +2876,7 @@ async def on_text(msg: Message):
     pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_message(msg.text, msg.entities))
     if not pairs:
         return  # без ответа
+    profile_files = persist_profile_media_urls(pairs, ses.dir)
     added_by = resolve_added_by(msg.from_user)
     ai, ac, links = upsert_items_with_comments(
         msg.chat.id,
@@ -2821,8 +2886,9 @@ async def on_text(msg: Message):
         added_by=added_by,
     )
     links_block = format_new_links_block(links)
+    notice_block = format_profile_urls_notice(profile_files, ses.dir)
     await msg.answer(
-        f"Найдено VSCO-ссылок: {len(pairs)}, добавлено записей: {ai}, комментариев: {ac}{links_block}"
+        f"Найдено VSCO-ссылок: {len(pairs)}, добавлено записей: {ai}, комментариев: {ac}{links_block}{notice_block}"
     )
 
 # ---------- export ----------
