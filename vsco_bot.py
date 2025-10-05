@@ -590,6 +590,27 @@ async def fetch_media_asset_urls(
     return dedupe_keep_order(urls)
 
 # === Парсер "ссылка, комментарий до следующей ссылки" ========================
+def _describe_entities_for_log(entities: Optional[Sequence[MessageEntity]]) -> List[Dict[str, Any]]:
+    if not entities:
+        return []
+
+    described: List[Dict[str, Any]] = []
+    for entity in entities:
+        entity_type = getattr(entity, "type", "")
+        if hasattr(entity_type, "value"):
+            entity_type = entity_type.value
+        described.append(
+            {
+                "type": str(entity_type or ""),
+                "offset": getattr(entity, "offset", None),
+                "length": getattr(entity, "length", None),
+                "url": getattr(entity, "url", None),
+            }
+        )
+
+    return described
+
+
 def _expand_text_with_entities(text: Optional[str], entities: Optional[Sequence[MessageEntity]]) -> str:
     if not text:
         return ""
@@ -643,15 +664,30 @@ def _expand_text_with_entities(text: Optional[str], entities: Optional[Sequence[
 
 
 def parse_vsco_pairs_from_message(text: Optional[str], entities: Optional[Sequence[MessageEntity]]) -> List[Dict[str, str]]:
+    log.debug(
+        "parse_vsco_pairs_from_message: raw_text=%r, entities=%s",
+        text,
+        _describe_entities_for_log(entities),
+    )
     expanded = _expand_text_with_entities(text, entities)
-    return _parse_vsco_pairs(expanded)
+    pairs = _parse_vsco_pairs(expanded)
+    log.debug(
+        "parse_vsco_pairs_from_message: expanded_text=%r, parsed_pairs=%s",
+        expanded,
+        pairs,
+    )
+    return pairs
 
 
 def _parse_vsco_pairs(text: str) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     if not text:
+        log.debug("_parse_vsco_pairs: empty text, nothing to parse")
         return out
+    log.debug("_parse_vsco_pairs: scanning text length=%d", len(text))
     matches = [m for m in URL_RE.finditer(text) if is_vsco_url(m.group(0))]
+    if not matches:
+        log.debug("_parse_vsco_pairs: no VSCO URLs found")
     for i, m in enumerate(matches):
         raw = m.group(0)
         url_trimmed = raw.rstrip('.,);!?]')
@@ -672,6 +708,9 @@ def _parse_vsco_pairs(text: str) -> List[Dict[str, str]]:
             if comment_start < next_start:
                 comment = text[comment_start:next_start].strip()
         out.append({"url": url_trimmed, "comment": comment})
+        log.debug(
+            "_parse_vsco_pairs: match #%d url=%s comment=%r", i + 1, url_trimmed, comment
+        )
     return out
 
 def parse_vsco_pairs_from_text(text: str) -> List[Dict[str, str]]:
@@ -690,24 +729,32 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
     Возвращает элементы:
       {'username':..., 'url': <profile_url>, 'comment':..., 'image_url': <'' или ссылка на картинку>}
     """
-    if not pairs: return []
+    if not pairs:
+        log.debug("normalize_vsco_pairs: no pairs provided")
+        return []
+    log.debug("normalize_vsco_pairs: start with %d pair(s)", len(pairs))
     res: List[Dict[str, str]] = []
     async with aiohttp.ClientSession() as s:
         for pair in pairs:
             u = pair.get("url", ""); c = (pair.get("comment") or "").strip()
             if not is_vsco_url(u):
+                log.debug("normalize_vsco_pairs: skip non-VSCO url=%s", u)
                 continue
 
             p = urlparse(u); host = (p.netloc or "").lower()
             final = u
             if host in VSCO_SHORT_HOSTS:
                 final = await resolve_vsco_short(u, s)
+                log.debug("normalize_vsco_pairs: resolved short url %s -> %s", u, final)
 
             info = classify_vsco_path(final)
             if not info:
                 usr = username_from_vsco_co(final)
                 if usr:
                     res.append({"username": usr, "url": f"https://vsco.co/{usr}", "comment": c, "image_url": ""})
+                    log.debug(
+                        "normalize_vsco_pairs: fallback username=%s from url=%s", usr, final
+                    )
                 continue
 
             if info["kind"] == "profile":
@@ -728,21 +775,45 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
 
                 if not assets:
                     res.append({"username": username, "url": profile_url, "comment": c, "image_url": ""})
+                    log.debug(
+                        "normalize_vsco_pairs: profile=%s no assets found, added placeholder",
+                        profile_url,
+                    )
                 else:
                     for asset in assets:
                         res.append({"username": username, "url": profile_url, "comment": c, "image_url": asset})
+                    log.debug(
+                        "normalize_vsco_pairs: profile=%s appended %d asset(s)",
+                        profile_url,
+                        len(assets),
+                    )
             elif info["kind"] == "media":
                 usr = info["username"]
                 profile_url = f"https://vsco.co/{usr}"
                 asset_urls = await fetch_media_asset_urls(final, s)
                 if not asset_urls:
                     asset_urls = [final]
+                log.debug(
+                    "normalize_vsco_pairs: media url=%s resolved to %d asset(s)",
+                    final,
+                    len(asset_urls),
+                )
                 for asset in asset_urls:
                     res.append({"username": usr, "url": profile_url, "comment": c, "image_url": asset})
             elif info["kind"] == "perception":
                 slug = info["slug"]
                 res.append({"username": slug, "url": info["final_url"], "comment": c, "image_url": ""})
+                log.debug(
+                    "normalize_vsco_pairs: perception slug=%s final_url=%s",
+                    slug,
+                    info["final_url"],
+                )
     uniq = {(r["username"], r["url"], r["comment"], r.get("image_url","")): r for r in res}
+    log.debug(
+        "normalize_vsco_pairs: produced %d unique record(s) from %d input(s)",
+        len(uniq),
+        len(res),
+    )
     return list(uniq.values())
 
 # ---------------------- DB ops ----------------------
@@ -798,7 +869,21 @@ def _insert_item(conn: sqlite3.Connection, chat_id: int, username: str, profile_
     return cur.lastrowid
 
 def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source: str, source_file: Optional[str], added_by: str) -> Tuple[int,int,List[str]]:
-    if not pairs: return (0,0,[])
+    if not pairs:
+        log.debug(
+            "upsert_items_with_comments: chat_id=%s source=%s no pairs provided",
+            chat_id,
+            source,
+        )
+        return (0,0,[])
+    log.debug(
+        "upsert_items_with_comments: chat_id=%s source=%s source_file=%s added_by=%s pairs=%d",
+        chat_id,
+        source,
+        source_file,
+        added_by,
+        len(pairs),
+    )
     conn = db_connect()
     added_items = added_comments = 0
     new_links: List[str] = []
@@ -810,10 +895,22 @@ def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source:
             comment = (r.get("comment") or "").strip()
             if not username or not profile_url: continue
 
+            log.debug(
+                "upsert_items_with_comments: processing username=%s profile=%s image=%s comment_present=%s",
+                username,
+                profile_url,
+                image_url,
+                bool(comment),
+            )
             item_id = _get_item_id(conn, username, profile_url, image_url)
             if item_id is None:
                 item_id = _insert_item(conn, chat_id, username, profile_url, image_url, None, None, source, source_file, added_by)
                 added_items += 1
+                log.debug(
+                    "upsert_items_with_comments: inserted new item id=%s username=%s",
+                    item_id,
+                    username,
+                )
 
             if comment:
                 conn.execute(
@@ -822,18 +919,41 @@ def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source:
                 )
                 if conn.total_changes > 0:
                     added_comments += 1
+                    log.debug(
+                        "upsert_items_with_comments: added comment for item_id=%s", item_id
+                    )
 
             if add_vsco_link_legacy(username, profile_url, chat_id, conn):
                 new_links.append(profile_url)
+                log.debug(
+                    "upsert_items_with_comments: stored legacy link %s", profile_url
+                )
 
         conn.commit()
+        log.debug(
+            "upsert_items_with_comments: committed items=%d comments=%d links=%d",
+            added_items,
+            added_comments,
+            len(new_links),
+        )
         return (added_items, added_comments, new_links)
     finally:
         conn.close()
 
 def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_file: str, added_by: str) -> Tuple[int, List[str]]:
     if not rows:
+        log.debug(
+            "insert_full_rows_from_html: chat_id=%s source_file=%s empty rows",
+            chat_id,
+            source_file,
+        )
         return (0, [])
+    log.debug(
+        "insert_full_rows_from_html: chat_id=%s source_file=%s rows=%d",
+        chat_id,
+        source_file,
+        len(rows),
+    )
     conn = db_connect()
     added = 0
     new_links: List[str] = []
@@ -851,12 +971,26 @@ def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_f
                 continue
 
             if _get_item_id(conn, username, profile_url, image_url) is None:
-                _insert_item(conn, chat_id, username, profile_url, image_url, lat, lon, "html", source_file, added_by)
+                new_id = _insert_item(conn, chat_id, username, profile_url, image_url, lat, lon, "html", source_file, added_by)
                 added += 1
+                log.debug(
+                    "insert_full_rows_from_html: inserted item id=%s username=%s profile=%s",
+                    new_id,
+                    username,
+                    profile_url,
+                )
 
             if add_vsco_link_legacy(username, profile_url, chat_id, conn):
                 new_links.append(profile_url)
+                log.debug(
+                    "insert_full_rows_from_html: stored legacy link %s", profile_url
+                )
         conn.commit()
+        log.debug(
+            "insert_full_rows_from_html: committed %d item(s) %d new link(s)",
+            added,
+            len(new_links),
+        )
         return (added, new_links)
     finally:
         conn.close()
@@ -868,6 +1002,11 @@ def ingest_download_results(job: "DLJob", user_dir: Path) -> Tuple[int, bool]:
     Returns a tuple ``(items_added, profile_link_added)``.
     """
 
+    log.debug(
+        "ingest_download_results: job_id=%s user_dir=%s",
+        job.id,
+        user_dir,
+    )
     manifest_path = user_dir / "manifest.json"
     manifest_meta: Dict[str, Any] = {}
     items_data: List[Dict[str, Any]] = []
@@ -885,6 +1024,10 @@ def ingest_download_results(job: "DLJob", user_dir: Path) -> Tuple[int, bool]:
                     items_data = [x for x in maybe_items if isinstance(x, dict)]
             elif isinstance(raw, list):
                 items_data = [x for x in raw if isinstance(x, dict)]
+            log.debug(
+                "ingest_download_results: manifest loaded items=%d",
+                len(items_data),
+            )
 
     if not items_data:
         urls_path = user_dir / "urls_extracted.txt"
@@ -895,12 +1038,20 @@ def ingest_download_results(job: "DLJob", user_dir: Path) -> Tuple[int, bool]:
                 urls = []
             if urls:
                 items_data = [{"url": u, "ok": True} for u in urls]
+                log.debug(
+                    "ingest_download_results: fallback to urls_extracted.txt entries=%d",
+                    len(items_data),
+                )
 
     username = _extract_username_from_target(job.target)
     if not username:
         candidate = manifest_meta.get("username") if isinstance(manifest_meta, dict) else None
         if isinstance(candidate, str) and candidate.strip():
             username = candidate.strip()
+            log.debug(
+                "ingest_download_results: username resolved from manifest=%s",
+                username,
+            )
 
     profile_url = ""
     manifest_profile = manifest_meta.get("profile_url") if isinstance(manifest_meta, dict) else None
@@ -915,9 +1066,17 @@ def ingest_download_results(job: "DLJob", user_dir: Path) -> Tuple[int, bool]:
         extracted = username_from_vsco_co(profile_url)
         if extracted:
             username = extracted
+            log.debug(
+                "ingest_download_results: username extracted from profile_url=%s",
+                username,
+            )
 
     if not profile_url and username:
         profile_url = f"https://vsco.co/{username}"
+        log.debug(
+            "ingest_download_results: profile_url synthesized=%s",
+            profile_url,
+        )
 
     if not profile_url and job.target and is_vsco_url(job.target):
         info = classify_vsco_path(job.target)
