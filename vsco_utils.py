@@ -3,7 +3,15 @@ from __future__ import annotations
 
 import re
 from typing import Iterable, Optional, Sequence
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import (
+    parse_qsl,
+    urlencode,
+    urljoin,
+    urlparse,
+    urlsplit,
+    urlunparse,
+    urlunsplit,
+)
 
 
 VSCO_LOGO_MARKERS = ("vsco-logo-white",)
@@ -14,6 +22,8 @@ VSCO_SHORT_HOSTS = {"vs.co", "www.vs.co"}
 VSCO_PERCEPTION_HOSTS = {"perception.vsco.co", "www.perception.vsco.co"}
 
 SHORT_SLUG_RE = re.compile(r"^/([A-Za-z0-9]+)(?:/.*)?$")
+
+MEDIA_EXT_RE = re.compile(r"\.(jpg|jpeg|png|webp|mp4|webm|mov)(\?|$)", re.IGNORECASE)
 
 OG_IMAGE_RE = re.compile(
     r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
@@ -39,6 +49,104 @@ def is_vsco_logo_url(url: Optional[str]) -> bool:
     return any(marker in low for marker in VSCO_LOGO_MARKERS)
 
 
+# --- Media helpers --------------------------------------------------------
+def select_best_from_srcset(srcset: str) -> Optional[str]:
+    """Return the highest-resolution candidate from an HTML ``srcset`` string."""
+
+    try:
+        candidates = []
+        for chunk in srcset.split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if " " in chunk:
+                url_part, size_part = chunk.rsplit(" ", 1)
+                try:
+                    width = int(size_part.rstrip("w")) if size_part.endswith("w") else int(size_part)
+                except ValueError:
+                    width = 0
+            else:
+                url_part, width = chunk, 0
+            candidates.append((width, url_part))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda pair: pair[0], reverse=True)
+        return candidates[0][1]
+    except Exception:
+        return None
+
+
+def normalize_media_url(url: Optional[str], *, root: str = "https://vsco.co/") -> Optional[str]:
+    """Normalise VSCO CDN/relative URLs to absolute HTTPS links."""
+
+    if not url:
+        return None
+    candidate = url.strip()
+    if candidate.startswith("//"):
+        return "https:" + candidate
+    if candidate.startswith("/"):
+        return urljoin(root, candidate)
+    return candidate
+
+
+def is_media_url(url: str) -> bool:
+    """Return ``True`` when the link looks like an image/video asset."""
+
+    if not url:
+        return False
+    return bool(MEDIA_EXT_RE.search(url))
+
+
+def upscale_w_param(url: str, max_width: int) -> str:
+    """Bump VSCO ``?w=`` query parameters up to ``max_width`` for images."""
+
+    if not url or not MEDIA_EXT_RE.search(url):
+        return url
+    if re.search(r"\.(mp4|webm|mov)(\?|$)", url, re.IGNORECASE):
+        return url
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if "w" in query:
+        try:
+            current = int(query["w"])
+        except (ValueError, TypeError):
+            return url
+        if current < max_width:
+            query["w"] = str(max_width)
+            new_query = urlencode(query, doseq=True)
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+    return url
+
+
+def dedupe_keep_order(items: Iterable[str]) -> list[str]:
+    """Return unique items preserving the first-seen order."""
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def generate_media_filename(url: str, idx: int, *, default_ext: str = "jpg") -> str:
+    """Derive a collision-resistant filename for VSCO CDN URLs."""
+
+    path_parts = urlsplit(url).path.rstrip("/").split("/")
+    base = path_parts[-1] if path_parts else ""
+    if base and "." in base:
+        if len(path_parts) >= 2 and path_parts[-2]:
+            return f"{path_parts[-2]}_{base}"
+        return base
+    path = urlsplit(url).path.lower()
+    if path.endswith(".mp4"):
+        return f"vsco_{idx:05d}.mp4"
+    if path.endswith(".webm"):
+        return f"vsco_{idx:05d}.webm"
+    if path.endswith(".mov"):
+        return f"vsco_{idx:05d}.mov"
+    return f"vsco_{idx:05d}.{default_ext.strip('.')}"
 # --- URL helpers ---------------------------------------------------------
 def build_perception_gallery_url(slug: str) -> str:
     return f"https://perception.vsco.co/{slug}/gallery"

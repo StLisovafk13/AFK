@@ -11,7 +11,7 @@ import zipfile
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Iterable, List, Optional
+from typing import List, Optional
 
 import aiohttp
 from aiogram import Router
@@ -20,7 +20,9 @@ from aiogram.types import Message, BufferedInputFile
 
 from vsco_utils import (
     build_perception_gallery_url,
+    dedupe_keep_order,
     extract_vsco_media_urls,
+    generate_media_filename,
     normalize_vsco_profile_url,
     resolve_vsco_short_link,
     vsco_short_slug,
@@ -70,21 +72,6 @@ class ZipStats:
 def _gen_req_id(chat_id: int) -> str:
     # Generate a readable request id
     return f"ZIP{chat_id}-{int(time.time()*1000)%1_000_000:06d}"
-
-def _dedup_preserve_order(seq: Iterable[str]) -> List[str]:
-    seen = set()
-    out: List[str] = []
-    for x in seq:
-        if x and x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
-
-def _safe_img_name(url: str, idx: int) -> str:
-    name = url.split("/")[-1].split("?")[0].strip()
-    if not name or "." not in name or name.rsplit(".", 1)[-1].lower() not in ("jpg", "jpeg", "png", "webp", "gif"):
-        name = f"vsco_{idx:05d}.jpg"
-    return name
 
 @asynccontextmanager
 async def _http_simple(headers: Optional[dict] = None):
@@ -208,7 +195,7 @@ async def fetch_vsco_api_image_urls(site_id: str, stats: ZipStats, max_urls: int
 
             page += 1
 
-    urls = _dedup_preserve_order(urls)
+    urls = dedupe_keep_order(urls)
     if max_urls and len(urls) > max_urls:
         urls = urls[:max_urls]
 
@@ -236,7 +223,7 @@ async def fetch_vsco_profile_image_urls(profile_url: str, stats: ZipStats, max_u
     urls = extract_vsco_media_urls(html, sources=("responsive", "twitter", "inline"))
 
     stats.urls_found = len(urls)
-    urls = _dedup_preserve_order(urls)
+    urls = dedupe_keep_order(urls)
     stats.urls_after_dedup = len(urls)
 
     if not urls:
@@ -263,7 +250,7 @@ async def _fetch_one(session: aiohttp.ClientSession, url: str, idx: int, stats: 
             async with session.get(url, allow_redirects=True) as r:
                 if r.status == 200:
                     data = await r.read()
-                    return _safe_img_name(url, idx), data
+                    return generate_media_filename(url, idx, default_ext="jpg"), data
                 else:
                     log.debug("fetch_one: non-200 url=%s status=%s", url, r.status, extra=stats.asdict())
         except Exception:
