@@ -23,6 +23,9 @@ def vsco_module(tmp_path, monkeypatch):
     sys.modules.pop("zip_profile", None)
     vsco_bot = importlib.import_module("vsco_bot")
     vsco_bot.init_db()
+    async def _empty_scan(session, profile_url, **kwargs):  # type: ignore[override]
+        return []
+    monkeypatch.setattr(vsco_bot, "scan_profile_media", _empty_scan, raising=False)
     yield vsco_bot
     asyncio.run(vsco_bot.bot.session.close())
 
@@ -57,6 +60,42 @@ def test_text_link_message_inserts_profile(vsco_module):
     assert link_row == ("anast2010", "https://vsco.co/anast2010")
     assert item_row == ("anast2010", "https://vsco.co/anast2010")
     assert comment_row == ("hi",)
+
+
+def test_profile_link_scans_direct_media(monkeypatch, vsco_module):
+    assets = [
+        "https://cdn.example.com/photo1.jpg?w=800",
+        "https://cdn.example.com/photo2.jpg",
+        "https://cdn.example.com/video1.mp4",
+    ]
+
+    async def fake_scan(session, profile_url, **kwargs):  # type: ignore[override]
+        return assets
+
+    monkeypatch.setattr(vsco_module, "scan_profile_media", fake_scan, raising=False)
+
+    pairs = [{"url": "https://vsco.co/sampleuser", "comment": "wow"}]
+
+    normalized = asyncio.run(vsco_module.normalize_vsco_pairs(pairs))
+
+    assert len(normalized) == len(assets)
+    assert {entry["image_url"] for entry in normalized} == set(assets)
+
+    items_added, comments_added, new_links = vsco_module.upsert_items_with_comments(
+        chat_id=200,
+        pairs=normalized,
+        source="text",
+        source_file="message",
+        added_by="tester",
+    )
+
+    assert items_added == len(assets)
+    assert comments_added == len(assets)
+    assert new_links == ["https://vsco.co/sampleuser"]
+
+    gallery_users = vsco_module.fetch_gallery_users("chat", 200)
+    assert gallery_users and gallery_users[0]["username"] == "sampleuser"
+    assert set(gallery_users[0]["images"]) == set(assets)
 
 
 def test_text_link_with_emoji_preserves_comment(vsco_module):

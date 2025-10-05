@@ -40,17 +40,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
-from bs4 import BeautifulSoup
 from urllib.parse import urlsplit
 
 from vsco_utils import (
-    VSCO_LOGO_MARKERS,
     dedupe_keep_order,
+    extract_media_urls_from_html,
     generate_media_filename,
     is_media_url,
     is_vsco_logo_url,
     normalize_media_url,
-    select_best_from_srcset,
     upscale_w_param,
 )
 
@@ -187,46 +185,8 @@ async def collect_image_urls(
     """
 
     def extract_from_html(html: str) -> List[str]:
-        soup = BeautifulSoup(html, "html.parser")
-        urls: List[str] = []
-
-        # IMG (картинки)
-        for img in soup.find_all("img"):
-            src = img.get("src"); srcset = img.get("srcset")
-            cand = select_best_from_srcset(srcset) if srcset else None
-            if not cand and src:
-                cand = src
-            if cand:
-                cand = normalize_media_url(cand)
-                if cand and is_media_url(cand):
-                    urls.append(upscale_w_param(cand, max_width))
-
-        # PICTURE/SOURCE (картинки)
-        for pic in soup.find_all("picture"):
-            for s in pic.find_all("source"):
-                ss = s.get("srcset") or ""
-                best = select_best_from_srcset(ss)
-                best = normalize_media_url(best) if best else None
-                if best and is_media_url(best):
-                    urls.append(upscale_w_param(best, max_width))
-
-        # VIDEO (src) + SOURCE (видео)
-        for vid in soup.find_all("video"):
-            vsrc = normalize_media_url(vid.get("src"))
-            if vsrc and is_media_url(vsrc):
-                urls.append(vsrc)
-            for s in vid.find_all("source"):
-                vurl = normalize_media_url(s.get("src"))
-                if vurl and is_media_url(vurl):
-                    urls.append(vurl)
-                vset = s.get("srcset")
-                if vset:
-                    bestv = select_best_from_srcset(vset)
-                    bestv = normalize_media_url(bestv) if bestv else None
-                    if bestv and is_media_url(bestv):
-                        urls.append(bestv)
-
-        return urls
+        root = page.url if hasattr(page, "url") else None
+        return extract_media_urls_from_html(html, max_width=max_width, root=root)
 
     html = await page.content()
     urls = dedupe_keep_order(extract_from_html(html))
