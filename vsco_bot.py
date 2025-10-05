@@ -17,6 +17,7 @@
 # - /links: ссылки за последние 24ч + пагинация + CSV.
 # - Парсинг комментария: сразу после ссылки через запятую до следующей ссылки.
 
+import csv
 import os
 import re
 import sqlite3
@@ -28,12 +29,8 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple, Sequence
 from datetime import datetime, timedelta, timezone
 from urllib.parse import (
-    urlparse,
     urljoin,
-    urlsplit,
-    urlunsplit,
-    parse_qsl,
-    urlencode,
+    urlparse,
 )
 import json
 import time
@@ -46,11 +43,6 @@ try:
     import reverse_geocoder  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     reverse_geocoder = None  # type: ignore
-
-try:
-    import pandas as pd  # type: ignore
-except Exception:  # pandas is optional
-    pd = None  # type: ignore
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
@@ -86,12 +78,17 @@ from vsco_utils import (
     VSCO_PERCEPTION_HOSTS,
     VSCO_SHORT_HOSTS,
     SHORT_SLUG_RE,
+    dedupe_keep_order,
     extract_vsco_media_urls,
+    is_media_url,
     normalize_vsco_profile_url,
     resolve_vsco_short_link,
     vsco_short_slug,
     build_perception_gallery_url,
     is_vsco_logo_url,
+    normalize_media_url,
+    select_best_from_srcset,
+    upscale_w_param,
 )
 
 # ---------------------- setup & logging ----------------------
@@ -272,9 +269,6 @@ def _resolve_channel_ids() -> None:
 
 
 _resolve_channel_ids()
-
-if pd is None:
-    log.warning("pandas is not installed; CSV features are disabled")
 
 # ---------------------- VSCO constants ----------------------
 VSCO_RESERVED = {
@@ -565,79 +559,6 @@ async def resolve_vsco_short(url: str, session: aiohttp.ClientSession) -> str:
         request_kwargs={"timeout": 10},
     )
 
-MEDIA_EXT_RE = re.compile(r"\.(jpg|jpeg|png|webp|mp4|webm|mov)(\?|$)", re.IGNORECASE)
-
-
-def _select_best_from_srcset(srcset: str) -> Optional[str]:
-    try:
-        candidates = []
-        for chunk in srcset.split(","):
-            chunk = chunk.strip()
-            if not chunk:
-                continue
-            if " " in chunk:
-                url_part, size_part = chunk.rsplit(" ", 1)
-                try:
-                    width = int(size_part.rstrip("w")) if size_part.endswith("w") else int(size_part)
-                except ValueError:
-                    width = 0
-            else:
-                url_part, width = chunk, 0
-            candidates.append((width, url_part))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda pair: pair[0], reverse=True)
-        return candidates[0][1]
-    except Exception:
-        return None
-
-
-def _normalize_media_url(url: Optional[str]) -> Optional[str]:
-    if not url:
-        return None
-    candidate = url.strip()
-    if candidate.startswith("//"):
-        candidate = "https:" + candidate
-    if candidate.startswith("/"):
-        return urljoin("https://vsco.co/", candidate)
-    return candidate
-
-
-def _is_media_url(url: str) -> bool:
-    if not url:
-        return False
-    return bool(MEDIA_EXT_RE.search(url))
-
-
-def _upscale_w_param(url: str, max_width: int) -> str:
-    if not url or not MEDIA_EXT_RE.search(url):
-        return url
-    if re.search(r"\.(mp4|webm|mov)(\?|$)", url, re.IGNORECASE):
-        return url
-    parts = urlsplit(url)
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    if "w" in query:
-        try:
-            current = int(query["w"])
-        except (ValueError, TypeError):
-            return url
-        if current < max_width:
-            query["w"] = str(max_width)
-            new_query = urlencode(query, doseq=True)
-            return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
-    return url
-
-
-def _dedupe_keep_order(items: List[str]) -> List[str]:
-    seen: set[str] = set()
-    out: List[str] = []
-    for item in items:
-        if item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
-
-
 def extract_media_urls_from_html(html: str, *, max_width: int) -> List[str]:
     if not BeautifulSoup:
         return []
@@ -647,23 +568,23 @@ def extract_media_urls_from_html(html: str, *, max_width: int) -> List[str]:
     def push(url: Optional[str]):
         if not url:
             return
-        normalized = _normalize_media_url(url)
-        if not normalized or not _is_media_url(normalized):
+        normalized = normalize_media_url(url)
+        if not normalized or not is_media_url(normalized):
             return
-        final_url = _upscale_w_param(normalized, max_width)
+        final_url = upscale_w_param(normalized, max_width)
         if not is_vsco_logo_url(final_url):
             urls.append(final_url)
 
     for img in soup.find_all("img"):
         srcset = img.get("srcset")
-        candidate = _select_best_from_srcset(srcset) if srcset else None
+        candidate = select_best_from_srcset(srcset) if srcset else None
         if not candidate:
             candidate = img.get("src")
         push(candidate)
 
     for picture in soup.find_all("picture"):
         for source in picture.find_all("source"):
-            candidate = _select_best_from_srcset(source.get("srcset") or "")
+            candidate = select_best_from_srcset(source.get("srcset") or "")
             push(candidate or source.get("src"))
 
     for video in soup.find_all("video"):
@@ -672,9 +593,9 @@ def extract_media_urls_from_html(html: str, *, max_width: int) -> List[str]:
             push(source.get("src"))
             srcset = source.get("srcset")
             if srcset:
-                push(_select_best_from_srcset(srcset))
+                push(select_best_from_srcset(srcset))
 
-    return _dedupe_keep_order(urls)
+    return dedupe_keep_order(urls)
 
 
 async def fetch_media_asset_urls(
@@ -697,14 +618,14 @@ async def fetch_media_asset_urls(
     if not urls:
         fallback_sources = extract_vsco_media_urls(html, sources=("og", "twitter", "responsive", "inline"))
         for candidate in fallback_sources:
-            normalized = _normalize_media_url(candidate)
+            normalized = normalize_media_url(candidate)
             if not normalized:
                 continue
-            final_url = _upscale_w_param(normalized, max_width)
-            if not is_vsco_logo_url(final_url) and _is_media_url(final_url):
+            final_url = upscale_w_param(normalized, max_width)
+            if not is_vsco_logo_url(final_url) and is_media_url(final_url):
                 urls.append(final_url)
 
-    return _dedupe_keep_order(urls)
+    return dedupe_keep_order(urls)
 
 # === Парсер "ссылка, комментарий до следующей ссылки" ========================
 def _expand_text_with_entities(text: Optional[str], entities: Optional[Sequence[MessageEntity]]) -> str:
@@ -2635,16 +2556,34 @@ async def on_document(msg: Message):
     low = (p.name or "").lower()
 
     if low.endswith(".csv"):
-        if pd is None:
-            await msg.answer("Обработка CSV недоступна: не установлен pandas")
-            return
         ses.uploaded_csv.append(p)
         try:
-            df = pd.read_csv(p)
-            pairs: List[Dict[str,str]] = []
-            for c in [c for c in df.columns if isinstance(c, str)]:
-                for v in df[c].astype(str).tolist():
-                    pairs.extend(parse_vsco_pairs_from_cell(v))
+            encodings = ("utf-8-sig", "utf-8", "cp1251")
+            pairs: List[Dict[str, str]] = []
+
+            for encoding in encodings:
+                try:
+                    attempt_pairs: List[Dict[str, str]] = []
+                    with p.open("r", encoding=encoding, newline="") as fh:
+                        reader = csv.reader(fh)
+                        for row in reader:
+                            for cell in row:
+                                if cell is None:
+                                    continue
+                                attempt_pairs.extend(parse_vsco_pairs_from_cell(str(cell)))
+                    pairs = attempt_pairs
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                with p.open("r", encoding="utf-8", errors="ignore", newline="") as fh:
+                    reader = csv.reader(fh)
+                    for row in reader:
+                        for cell in row:
+                            if cell is None:
+                                continue
+                            pairs.extend(parse_vsco_pairs_from_cell(str(cell)))
+
             pairs = await normalize_vsco_pairs(pairs)
             found += len(pairs)
             ai, ac, links = upsert_items_with_comments(
@@ -2654,7 +2593,9 @@ async def on_document(msg: Message):
                 source_file=p.name,
                 added_by=added_by,
             )
-            added_items += ai; added_comments += ac; new_links.extend(links)
+            added_items += ai
+            added_comments += ac
+            new_links.extend(links)
             links_block = format_new_links_block(new_links)
             await msg.answer(
                 f"CSV загружен: <code>{escape(p.name)}</code>\n"
@@ -2663,7 +2604,9 @@ async def on_document(msg: Message):
             )
         except Exception as e:
             log.exception("CSV processing failed")
-            await msg.answer(f"CSV загружен: <code>{escape(p.name)}</code>, но не удалось обработать: {escape(str(e))}")
+            await msg.answer(
+                f"CSV загружен: <code>{escape(p.name)}</code>, но не удалось обработать: {escape(str(e))}"
+            )
         return
 
     if low.endswith(".html") or low.endswith(".htm"):
@@ -2822,9 +2765,6 @@ async def on_export_click(cq: CallbackQuery):
     if len(parts)>=3 and parts[1]=="format":
         fmt = parts[2]
         if fmt == "csv":
-            if pd is None:
-                await cq.answer("Экспорт CSV недоступен: не установлен pandas", show_alert=True)
-                return
             users = fetch_gallery_users(ses.export_scope, chat_id)
             if not users:
                 await cq.answer("Нет данных", show_alert=True)
@@ -2840,7 +2780,12 @@ async def on_export_click(cq: CallbackQuery):
                 "added_by_link": u.get("added_by_link", ""),
             } for u in users]
             out = ses.dir / f"export_{ses.export_scope}.csv"
-            pd.DataFrame(flat).to_csv(out, index=False, encoding="utf-8")
+            fieldnames = list(flat[0].keys()) if flat else []
+            with out.open("w", encoding="utf-8", newline="") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in flat:
+                    writer.writerow(row)
             await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
                 caption=f"CSV ({'вся база' if ses.export_scope=='all' else 'текущий чат'})")
             return
@@ -3030,26 +2975,26 @@ async def on_links_click(cq: CallbackQuery):
     elif parts[1] == "refresh":
         page = 1
     elif parts[1] == "csv":
-        if pd is None:
-            await cq.answer("Экспорт CSV недоступен: не установлен pandas", show_alert=True)
-            return
         since = _since_utc_iso(1)
         total, rows = _links_since_query(chat_id, ses.export_scope, since, limit=10_000, offset=0)
         if not rows:
             await cq.answer("За день нет ссылок", show_alert=True)
             return
-        df = pd.DataFrame([
-            {
-                "username": r[0],
-                "url": r[1],
-                "created_at": r[2],
-                "chat_id": r[3],
-                "added_by": r[4],
-            }
-            for r in rows
-        ])
         out = get_session(chat_id).dir / f"links_day_{ses.export_scope}.csv"
-        df.to_csv(out, index=False, encoding="utf-8")
+        fieldnames = ["username", "url", "created_at", "chat_id", "added_by"]
+        with out.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(
+                    {
+                        "username": r[0],
+                        "url": r[1],
+                        "created_at": r[2],
+                        "chat_id": r[3],
+                        "added_by": r[4],
+                    }
+                )
         await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
                                          caption=f"Ссылки за день — {('вся база' if ses.export_scope=='all' else 'текущий чат')}: {total} шт.")
         await cq.answer("CSV готово")

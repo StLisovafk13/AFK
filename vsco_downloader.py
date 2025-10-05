@@ -41,9 +41,18 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
+from urllib.parse import urlsplit
 
-from vsco_utils import VSCO_LOGO_MARKERS, is_vsco_logo_url
+from vsco_utils import (
+    VSCO_LOGO_MARKERS,
+    dedupe_keep_order,
+    generate_media_filename,
+    is_media_url,
+    is_vsco_logo_url,
+    normalize_media_url,
+    select_best_from_srcset,
+    upscale_w_param,
+)
 
 # -----------------------------
 # ЛОГИ
@@ -117,84 +126,7 @@ def normalize_profile(username: Optional[str], profile_url: Optional[str]) -> Tu
 # -----------------------------
 # URL / МЕДИА УТИЛИТЫ
 # -----------------------------
-MEDIA_EXT_RE = re.compile(r"\.(jpg|jpeg|png|webp|mp4|webm|mov)(\?|$)", re.I)
 POSTER_HINT_RE = re.compile(r"(?i)(poster|thumb|thumbnail|cover|preview|frame)")
-def select_best_from_srcset(srcset: str) -> Optional[str]:
-    try:
-        cand = []
-        for part in srcset.split(","):
-            part = part.strip()
-            if not part: continue
-            if " " in part:
-                u, sz = part.rsplit(" ", 1)
-                w = int(sz.replace("w", "")) if sz.endswith("w") else 0
-            else:
-                u, w = part, 0
-            cand.append((w, u))
-        if not cand: return None
-        cand.sort(key=lambda x: x[0], reverse=True)
-        return cand[0][1]
-    except Exception:
-        return None
-
-def normalize_url(u: Optional[str], base: str = "https://") -> Optional[str]:
-    if not u: return None
-    u = u.strip()
-    if u.startswith("//"): return base + u.lstrip("/")
-    if u.startswith("/"):  return urljoin("https://vsco.co/", u)
-    return u
-
-def is_media_url(u: str) -> bool:
-    if not u: return False
-    return bool(MEDIA_EXT_RE.search(u))
-
-def upscale_w_param(u: str, max_w: int) -> str:
-    """
-    Апскейлим только картинки по параметру ?w=. Для видео возвращаем исходный URL.
-    """
-    if not u or not MEDIA_EXT_RE.search(u):
-        return u
-    if re.search(r"\.(mp4|webm|mov)(\?|$)", u, re.I):
-        return u
-    parts = urlsplit(u)
-    q = dict(parse_qsl(parts.query, keep_blank_values=True))
-    if "w" in q:
-        try:
-            cur = int(q["w"])
-            if cur < max_w:
-                q["w"] = str(max_w)
-                new_query = urlencode(q, doseq=True)
-                return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
-        except ValueError:
-            return u
-    return u
-
-def guess_filename(url: str, idx: int) -> str:
-    """Return a deterministic file name derived from URL.
-
-    Some VSCO CDN URLs use the same media file name while placing a
-    unique identifier in the path right before it. For example:
-
-        .../6340fee78c264f3f15c8be6c/vsco_100722.jpg
-        .../6340fe288c264f3f15c8be68/vsco_100722.jpg
-
-    Without accounting for the parent directory, both would save as
-    ``vsco_100722.jpg`` and overwrite each other.  To avoid this we
-    prepend the immediate parent folder when available.
-    """
-
-    path_parts = urlsplit(url).path.rstrip("/").split("/")
-    base = path_parts[-1] if path_parts else ""
-    if base and "." in base:
-        # Include the segment preceding the filename to keep URLs unique
-        if len(path_parts) >= 2 and path_parts[-2]:
-            return f"{path_parts[-2]}_{base}"
-        return base
-    path = urlsplit(url).path.lower()
-    if path.endswith(".mp4"):  return f"vsco_{idx:05d}.mp4"
-    if path.endswith(".webm"): return f"vsco_{idx:05d}.webm"
-    if path.endswith(".mov"):  return f"vsco_{idx:05d}.mov"
-    return f"vsco_{idx:05d}.jpg"
 
 # -----------------------------
 # ПОСТЕРЫ ВИДЕО: ЭВРИСТИКИ И ПАРИНГ
@@ -262,9 +194,10 @@ async def collect_image_urls(
         for img in soup.find_all("img"):
             src = img.get("src"); srcset = img.get("srcset")
             cand = select_best_from_srcset(srcset) if srcset else None
-            if not cand and src: cand = src
+            if not cand and src:
+                cand = src
             if cand:
-                cand = normalize_url(cand, base="https://")
+                cand = normalize_media_url(cand)
                 if cand and is_media_url(cand):
                     urls.append(upscale_w_param(cand, max_width))
 
@@ -273,37 +206,30 @@ async def collect_image_urls(
             for s in pic.find_all("source"):
                 ss = s.get("srcset") or ""
                 best = select_best_from_srcset(ss)
-                best = normalize_url(best, base="https://") if best else None
+                best = normalize_media_url(best) if best else None
                 if best and is_media_url(best):
                     urls.append(upscale_w_param(best, max_width))
 
         # VIDEO (src) + SOURCE (видео)
         for vid in soup.find_all("video"):
-            vsrc = normalize_url(vid.get("src"), base="https://")
+            vsrc = normalize_media_url(vid.get("src"))
             if vsrc and is_media_url(vsrc):
                 urls.append(vsrc)
             for s in vid.find_all("source"):
-                vurl = normalize_url(s.get("src"), base="https://")
+                vurl = normalize_media_url(s.get("src"))
                 if vurl and is_media_url(vurl):
                     urls.append(vurl)
                 vset = s.get("srcset")
                 if vset:
                     bestv = select_best_from_srcset(vset)
-                    bestv = normalize_url(bestv, base="https://") if bestv else None
+                    bestv = normalize_media_url(bestv) if bestv else None
                     if bestv and is_media_url(bestv):
                         urls.append(bestv)
 
         return urls
 
-    def dedup_keep_order(seq: List[str]) -> List[str]:
-        seen, out = set(), []
-        for u in seq:
-            if u not in seen:
-                seen.add(u); out.append(u)
-        return out
-
     html = await page.content()
-    urls = dedup_keep_order(extract_from_html(html))
+    urls = dedupe_keep_order(extract_from_html(html))
     if urls:
         filtered = [u for u in urls if not is_vsco_logo_url(u)]
         if len(filtered) != len(urls):
@@ -365,7 +291,7 @@ async def collect_image_urls(
             if len(filtered) != len(extracted):
                 logger.info(f"Пропущено {len(extracted) - len(filtered)} служебных изображений VSCO-logo-white")
             extracted = filtered
-        urls = dedup_keep_order(urls + extracted)
+        urls = dedupe_keep_order(urls + extracted)
         if len(urls) > prev_count:
             logger.info(f"scan_progress {len(urls)}")
 
@@ -451,7 +377,7 @@ async def download_all_via_context(
     }
 
     async def fetch(idx: int, url: str):
-        name = guess_filename(url, idx)
+        name = generate_media_filename(url, idx)
         dest = out_dir / name
         meta: Dict[str, Any] = {
             "index": idx, "url": url, "file": str(dest),
@@ -462,7 +388,7 @@ async def download_all_via_context(
         if url in thumb_pairs:
             meta["thumbnail_of"] = thumb_pairs[url]
             # Подправим имя, чтобы лежало рядом: foo.mp4 -> foo.poster.jpg
-            parent_name = guess_filename(thumb_pairs[url], idx)
+            parent_name = generate_media_filename(thumb_pairs[url], idx)
             parent_stem = Path(parent_name).stem
             ext = Path(name).suffix.lower()
             if ext not in (".jpg", ".jpeg", ".png", ".webp"):
