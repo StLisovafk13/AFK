@@ -291,7 +291,7 @@ async def collect_image_urls(
             if len(filtered) != len(extracted):
                 logger.info(f"Пропущено {len(extracted) - len(filtered)} служебных изображений VSCO-logo-white")
             extracted = filtered
-        urls = dedup_keep_order(urls + extracted)
+        urls = dedupe_keep_order(urls + extracted)
         if len(urls) > prev_count:
             logger.info(f"scan_progress {len(urls)}")
 
@@ -377,7 +377,7 @@ async def download_all_via_context(
     }
 
     async def fetch(idx: int, url: str):
-        name = guess_filename(url, idx)
+        name = generate_media_filename(url, idx)
         dest = out_dir / name
         meta: Dict[str, Any] = {
             "index": idx, "url": url, "file": str(dest),
@@ -388,7 +388,7 @@ async def download_all_via_context(
         if url in thumb_pairs:
             meta["thumbnail_of"] = thumb_pairs[url]
             # Подправим имя, чтобы лежало рядом: foo.mp4 -> foo.poster.jpg
-            parent_name = guess_filename(thumb_pairs[url], idx)
+            parent_name = generate_media_filename(thumb_pairs[url], idx)
             parent_stem = Path(parent_name).stem
             ext = Path(name).suffix.lower()
             if ext not in (".jpg", ".jpeg", ".png", ".webp"):
