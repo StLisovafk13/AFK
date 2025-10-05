@@ -266,7 +266,6 @@ async def build_zip_parts_from_urls(urls: List[str], stats: ZipStats) -> List[by
         return []
 
     parts: List[bytes] = []
-    part_idx = 1
     current_buf = io.BytesIO()
     zf = zipfile.ZipFile(current_buf, "w", compression=zipfile.ZIP_DEFLATED)
     current_size = 0
@@ -275,7 +274,7 @@ async def build_zip_parts_from_urls(urls: List[str], stats: ZipStats) -> List[by
     sem = asyncio.Semaphore(CONNECTION_LIMIT)
 
     async def fetch_and_add(i: int, u: str):
-        nonlocal zf, current_buf, current_size, written_in_part, part_idx, parts
+        nonlocal zf, current_buf, current_size, written_in_part, parts
         async with sem:
             res = await _fetch_one(session, u, i, stats)
         if not res:

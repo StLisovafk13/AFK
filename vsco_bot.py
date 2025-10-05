@@ -713,9 +713,6 @@ def _parse_vsco_pairs(text: str) -> List[Dict[str, str]]:
         )
     return out
 
-def parse_vsco_pairs_from_text(text: str) -> List[Dict[str, str]]:
-    return _parse_vsco_pairs(text or "")
-
 def parse_vsco_pairs_from_cell(cell: str) -> List[Dict[str, str]]:
     if not isinstance(cell, str): return []
     return _parse_vsco_pairs(cell)
@@ -1546,22 +1543,6 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     return out
 
 # ---------------------- HTML builders (gallery/maps) ----------------------
-def _comments_html_preview(comments: List[str], limit: int = 3, max_len: int = 160) -> str:
-    if not comments:
-        return "<div class='cm-empty'>нет комментариев</div>"
-    parts = []
-    for c in comments[:limit]:
-        txt = escape(c)
-        if len(txt) > max_len: txt = txt[:max_len-1] + "…"
-        parts.append(f"<li>{txt}</li>")
-    more = f"<div class='cm-more'>и ещё {len(comments)-limit}…</div>" if len(comments) > limit else ""
-    return "<ul class='cm-list'>" + "".join(parts) + "</ul>" + more
-
-def _thumbs_html_preview(images: List[str], limit: int = 4) -> str:
-    if not images: return ""
-    thumbs = "".join([f"<img src='{escape(src)}' loading='lazy'/>" for src in images[:limit]])
-    return f"<div class='pop-thumbs'>{thumbs}</div>"
-
 def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtitle=""):
     data_json = json.dumps(users, ensure_ascii=False)
     html = f"""<!DOCTYPE html>
@@ -2726,10 +2707,6 @@ def get_session(chat_id: int) -> Session:
         p = WORKDIR / f"chat_{chat_id}"; p.mkdir(parents=True, exist_ok=True)
         _sessions[chat_id] = Session(chat_id=chat_id, dir=p)
     return _sessions[chat_id]
-
-async def send_file(msg: Message, path: Path, caption: str = ""):
-    await msg.answer_document(BufferedInputFile(path.read_bytes(), filename=path.name), caption=caption)
-
 
 @dp.message(F.document)
 async def on_document(msg: Message):
