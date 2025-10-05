@@ -21,9 +21,16 @@ from aiogram.types import Message, BufferedInputFile
 from vsco_utils import (
     build_perception_gallery_url,
     dedupe_keep_order,
+    extract_media_urls_from_html,
+    extract_site_id_from_html,
     extract_vsco_media_urls,
+    fetch_vsco_api_media_urls,
     generate_media_filename,
+    is_media_url,
+    is_vsco_logo_url,
+    normalize_media_url,
     normalize_vsco_profile_url,
+    upscale_w_param,
     resolve_vsco_short_link,
     vsco_short_slug,
 )
@@ -83,15 +90,6 @@ async def _http_simple(headers: Optional[dict] = None):
     async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT, headers=base_headers, connector=conn) as s:
         yield s
 
-# ------------ VSCO parsing ------------
-# NEW: site_id finders
-_SITE_ID_RE_LIST = [
-    re.compile(r'"site_id"\s*:\s*(\d+)', re.IGNORECASE),
-    re.compile(r'data-site-id=["\'](\d+)["\']', re.IGNORECASE),
-    re.compile(r'\bsiteId\s*:\s*(\d+)\b', re.IGNORECASE),
-]
-
-
 async def resolve_vsco_short_or_profile(u: str, stats: ZipStats) -> Optional[str]:
     """Return a normalized VSCO profile URL for vs.co/vsco.co inputs."""
 
@@ -128,83 +126,9 @@ async def resolve_vsco_short_or_profile(u: str, stats: ZipStats) -> Optional[str
         stats.normalized_url = fallback
         return fallback
 
-    log.warning("resolve_vsco_short: redirect resolution failed", extra=stats.asdict())
-    return None
-
-def _extract_site_id(html: str) -> Optional[str]:
-    for rx in _SITE_ID_RE_LIST:
-        m = rx.search(html)
-        if m:
-            return m.group(1)
-    return None
-
-async def fetch_vsco_api_image_urls(site_id: str, stats: ZipStats, max_urls: int = 2000) -> List[str]:
-    """
-    Call VSCO public API:
-      https://vsco.co/api/2.0/medias?site_id=<id>&page=<n>&size=100
-    Collect direct image links from various fields.
-    """
-    if not site_id:
-        return []
-    page = 1
-    size = 100
-    urls: List[str] = []
-    api_pages = 0
-    api_items = 0
-
-    async with _http_simple() as s:
-        while True:
-            if max_urls and len(urls) >= max_urls:
-                break
-            api_url = f"https://vsco.co/api/2.0/medias?site_id={site_id}&page={page}&size={size}"
-            try:
-                t0 = time.time()
-                async with s.get(api_url, allow_redirects=True) as r:
-                    if r.status != 200:
-                        log.debug("api_non_200 page=%d status=%s", page, r.status, extra=stats.asdict())
-                        break
-                    data = await r.json(content_type=None)
-                api_pages += 1
-                log.debug("api_page_ok page=%d elapsed_ms=%d", page, int((time.time()-t0)*1000), extra=stats.asdict())
-            except Exception:
-                log.exception("api_request_exception page=%d", page, extra=stats.asdict())
-                break
-
-            items = (data or {}).get("medias") or (data or {}).get("media") or []
-            if not items:
-                break
-
-            api_items += len(items)
-            for it in items:
-                u = (
-                    it.get("responsive_url")
-                    or it.get("image", {}).get("cdn_url")
-                    or it.get("image", {}).get("url")
-                    or it.get("image", {}).get("path")
-                    or it.get("url")
-                )
-                if isinstance(u, str) and u.startswith("http"):
-                    urls.append(u)
-
-                variants = it.get("images") or it.get("variants") or []
-                if isinstance(variants, list):
-                    for v in variants:
-                        vu = v.get("url") or v.get("cdn_url")
-                        if isinstance(vu, str) and vu.startswith("http"):
-                            urls.append(vu)
-
-            page += 1
-
-    urls = dedupe_keep_order(urls)
-    if max_urls and len(urls) > max_urls:
-        urls = urls[:max_urls]
-
-    log.info("api_collect_done pages=%d items=%d urls=%d site_id=%s",
-             api_pages, api_items, len(urls), site_id, extra=stats.asdict())
-    return urls
-
 async def fetch_vsco_profile_image_urls(profile_url: str, stats: ZipStats, max_urls: int = 2000) -> List[str]:
-    """Fetch profile HTML and extract image links. If none found — fallback to API by site_id."""
+    """Fetch profile HTML and extract image links. Fallback to the VSCO API when needed."""
+
     html = ""
     async with _http_simple() as s:
         try:
@@ -212,36 +136,69 @@ async def fetch_vsco_profile_image_urls(profile_url: str, stats: ZipStats, max_u
             async with s.get(profile_url, allow_redirects=True) as r:
                 html = await r.text(errors="ignore")
                 stats.html_bytes = len(html.encode("utf-8", "ignore"))
-                log.debug("profile_fetch: status=%s bytes=%s elapsed_ms=%d",
-                          r.status, stats.html_bytes, int((time.time()-t0)*1000), extra=stats.asdict())
+                log.debug(
+                    "profile_fetch: status=%s bytes=%s elapsed_ms=%d",
+                    r.status,
+                    stats.html_bytes,
+                    int((time.time() - t0) * 1000),
+                    extra=stats.asdict(),
+                )
                 if r.status != 200:
                     return []
         except Exception:
             log.exception("profile_fetch: exception", extra=stats.asdict())
             return []
 
-    urls = extract_vsco_media_urls(html, sources=("responsive", "twitter", "inline"))
+        direct_urls = extract_media_urls_from_html(html, max_width=2048, root=profile_url)
 
-    stats.urls_found = len(urls)
-    urls = dedupe_keep_order(urls)
-    stats.urls_after_dedup = len(urls)
+        fallback_candidates: List[str] = []
+        if not direct_urls:
+            for candidate in extract_vsco_media_urls(html, sources=("responsive", "twitter", "inline")):
+                normalized = normalize_media_url(candidate, root=profile_url)
+                if not normalized:
+                    continue
+                final_url = upscale_w_param(normalized, 2048)
+                if is_media_url(final_url) and not is_vsco_logo_url(final_url):
+                    fallback_candidates.append(final_url)
 
-    if not urls:
-        # ---- Fallback: try API with site_id ----
-        site_id = _extract_site_id(html)
-        if not site_id:
+        urls = dedupe_keep_order([*direct_urls, *fallback_candidates])
+        stats.urls_found = len(urls)
+        stats.urls_after_dedup = len(urls)
+
+        site_id = extract_site_id_from_html(html)
+        api_urls: List[str] = []
+        if site_id:
+            log.info("api_profile_scan site_id=%s", site_id, extra=stats.asdict())
+            api_urls = await fetch_vsco_api_media_urls(
+                s,
+                site_id,
+                max_width=2048,
+                max_items=max_urls,
+                logger=log,
+            )
+        elif not urls:
             log.warning("no_images_and_no_site_id", extra=stats.asdict())
-            return []
-        log.info("fallback_api_try site_id=%s", site_id, extra=stats.asdict())
-        api_urls = await fetch_vsco_api_image_urls(site_id, stats, max_urls=max_urls)
-        stats.urls_found = len(api_urls)
-        stats.urls_after_dedup = len(api_urls)
-        return api_urls
 
-    if max_urls and len(urls) > max_urls:
-        urls = urls[:max_urls]
-    log.info("profile_parse: urls_found=%d dedup=%d", stats.urls_found, stats.urls_after_dedup, extra=stats.asdict())
-    return urls
+        if api_urls:
+            merged = dedupe_keep_order([*urls, *api_urls]) if urls else api_urls
+            stats.urls_found = len(merged)
+            stats.urls_after_dedup = len(merged)
+            urls = merged
+
+        if not urls:
+            return []
+
+        if max_urls and len(urls) > max_urls:
+            urls = urls[:max_urls]
+            stats.urls_after_dedup = len(urls)
+
+        log.info(
+            "profile_parse: urls_found=%d dedup=%d",
+            stats.urls_found,
+            stats.urls_after_dedup,
+            extra=stats.asdict(),
+        )
+        return urls
 
 # ------------ ZIP building (to memory; send as document) ------------
 async def _fetch_one(session: aiohttp.ClientSession, url: str, idx: int, stats: ZipStats) -> Optional[tuple[str, bytes]]:
