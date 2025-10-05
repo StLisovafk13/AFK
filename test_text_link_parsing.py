@@ -23,8 +23,13 @@ def vsco_module(tmp_path, monkeypatch):
     sys.modules.pop("zip_profile", None)
     vsco_bot = importlib.import_module("vsco_bot")
     vsco_bot.init_db()
+    async def _empty_playwright(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0):  # type: ignore[override]
+        return []
+
     async def _empty_scan(session, profile_url, **kwargs):  # type: ignore[override]
         return []
+
+    monkeypatch.setattr(vsco_bot, "playwright_scan_profile", _empty_playwright, raising=False)
     monkeypatch.setattr(vsco_bot, "scan_profile_media", _empty_scan, raising=False)
     yield vsco_bot
     asyncio.run(vsco_bot.bot.session.close())
@@ -69,10 +74,10 @@ def test_profile_link_scans_direct_media(monkeypatch, vsco_module):
         "https://cdn.example.com/video1.mp4",
     ]
 
-    async def fake_scan(session, profile_url, **kwargs):  # type: ignore[override]
+    async def fake_scan(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0):  # type: ignore[override]
         return assets
 
-    monkeypatch.setattr(vsco_module, "scan_profile_media", fake_scan, raising=False)
+    monkeypatch.setattr(vsco_module, "playwright_scan_profile", fake_scan, raising=False)
 
     pairs = [{"url": "https://vsco.co/sampleuser", "comment": "wow"}]
 
@@ -96,6 +101,44 @@ def test_profile_link_scans_direct_media(monkeypatch, vsco_module):
     gallery_users = vsco_module.fetch_gallery_users("chat", 200)
     assert gallery_users and gallery_users[0]["username"] == "sampleuser"
     assert set(gallery_users[0]["images"]) == set(assets)
+
+
+def test_on_text_creates_profile_urls_file(monkeypatch, vsco_module):
+    assets = [
+        "https://cdn.example.com/photo1.jpg",
+        "https://cdn.example.com/photo1.jpg",
+        "https://cdn.example.com/photo2.jpg",
+    ]
+
+    async def fake_playwright(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0):  # type: ignore[override]
+        return assets
+
+    monkeypatch.setattr(vsco_module, "playwright_scan_profile", fake_playwright, raising=False)
+
+    msg = DummyMessage(chat_id=321, user_id=999)
+    msg.text = "https://vsco.co/sampleuser"
+    msg.entities = None
+    msg.from_user.username = "tester"
+
+    asyncio.run(vsco_module.on_text(msg))
+
+    ses = vsco_module.get_session(321)
+    expected_dir = ses.dir / "profiles" / "sampleuser"
+    urls_file = expected_dir / "urls_extracted.txt"
+    assert urls_file.exists()
+    lines = urls_file.read_text(encoding="utf-8").splitlines()
+    assert lines == ["https://cdn.example.com/photo1.jpg", "https://cdn.example.com/photo2.jpg"]
+
+    conn = vsco_module.db_connect()
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM items WHERE chat_id=?", (321,)).fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 2
+
+    assert msg.answer_calls, "bot should respond"
+    text, _ = msg.answer_calls[-1]
+    assert "profiles/sampleuser/urls_extracted.txt" in text
 
 
 def test_text_link_with_emoji_preserves_comment(vsco_module):

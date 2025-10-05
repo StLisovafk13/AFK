@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Iterable, Optional, Sequence
+from typing import Any, Iterable, Optional, Sequence
 from urllib.parse import (
     parse_qsl,
     urlencode,
@@ -381,4 +381,188 @@ async def scan_profile_media(
         urls = urls[:limit]
 
     return urls
+
+
+async def playwright_scan_profile(
+    profile_url: str,
+    *,
+    max_width: int = 2048,
+    session: Any = None,
+    logger: Optional[logging.Logger] = None,
+    delay: float = 0.4,
+    target_count: int = 0,
+) -> list[str]:
+    """Extract profile media via Playwright with graceful HTTP fallback."""
+
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as exc:  # pragma: no cover - optional dependency
+        if logger is not None:
+            logger.info(
+                "playwright_scan_profile: Playwright unavailable, falling back: %s",
+                exc,
+            )
+        if session is not None:
+            return await scan_profile_media(
+                session,
+                profile_url,
+                max_width=max_width,
+                logger=logger,
+            )
+        return []
+
+    gallery_url = profile_url.rstrip("/")
+    if not gallery_url.endswith("/gallery"):
+        gallery_url = f"{gallery_url}/gallery"
+
+    browser = context = page = None
+    collected: list[str] = []
+
+    async def _extract_current_urls() -> list[str]:
+        html = await page.content()
+        root = getattr(page, "url", None) or gallery_url
+        urls = extract_media_urls_from_html(html, max_width=max_width, root=root)
+        if urls:
+            return urls
+
+        fallback: list[str] = []
+        for candidate in extract_vsco_media_urls(
+            html,
+            sources=("og", "twitter", "responsive", "inline"),
+        ):
+            normalized = normalize_media_url(candidate, root=root)
+            if not normalized:
+                continue
+            final_url = upscale_w_param(normalized, max_width)
+            if is_media_url(final_url) and not is_vsco_logo_url(final_url):
+                fallback.append(final_url)
+        return dedupe_keep_order(fallback)
+
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context()
+            page = await context.new_page()
+            await page.goto(gallery_url, wait_until="networkidle")
+
+            collected = dedupe_keep_order(await _extract_current_urls())
+            if logger is not None and collected:
+                logger.info(
+                    "playwright_scan_profile: initial %d asset(s)", len(collected)
+                )
+
+            max_scrolls = 120
+            stagnation_limit = 5
+            no_growth_click_limit = 3
+            max_clicks = 500
+            load_clicks = 0
+            stagnation = 0
+            prev_count = len(collected)
+
+            for _ in range(max_scrolls):
+                btn = page.locator("#loadMore-Button").first
+                try:
+                    btn_count = await btn.count()
+                    btn_exists = btn_count > 0
+                    btn_visible = btn_exists and await btn.is_visible()
+                    disabled_attr = await btn.get_attribute("disabled") if btn_exists else None
+                    aria_disabled = (
+                        await btn.get_attribute("aria-disabled") if btn_exists else None
+                    )
+                    btn_disabled = (
+                        disabled_attr is not None
+                        or (aria_disabled or "").lower() in {"true", "1"}
+                    )
+                except Exception:
+                    btn_exists = btn_visible = False
+                    btn_disabled = True
+
+                clicked = False
+                if (
+                    btn_exists
+                    and btn_visible
+                    and not btn_disabled
+                    and load_clicks < max_clicks
+                ):
+                    try:
+                        await btn.scroll_into_view_if_needed()
+                    except Exception:
+                        pass
+                    try:
+                        await btn.click()
+                        load_clicks += 1
+                        clicked = True
+                        try:
+                            await page.wait_for_load_state("networkidle", timeout=2000)
+                        except Exception:
+                            await page.wait_for_timeout(int(max(0.1, delay) * 1000))
+                    except Exception as exc:
+                        if logger is not None:
+                            logger.debug(
+                                "playwright_scan_profile: load more click failed: %s",
+                                exc,
+                            )
+
+                await page.evaluate(
+                    "() => { window.scrollBy(0, Math.floor(window.innerHeight * 0.9)); }"
+                )
+                await page.wait_for_timeout(int(max(0.1, delay) * 1000))
+
+                extracted = dedupe_keep_order(await _extract_current_urls())
+                combined = dedupe_keep_order(collected + extracted)
+                new_count = len(combined)
+                if logger is not None and new_count > prev_count:
+                    logger.info("playwright_scan_profile: progress %d", new_count)
+                collected = combined
+
+                if target_count and new_count >= target_count:
+                    break
+
+                if new_count > prev_count:
+                    stagnation = 0
+                    prev_count = new_count
+                    continue
+
+                stagnation += 1
+                if (not btn_exists or not btn_visible or btn_disabled) and stagnation >= stagnation_limit:
+                    break
+                if clicked and stagnation >= no_growth_click_limit:
+                    break
+                if not clicked and stagnation >= stagnation_limit:
+                    break
+
+            if collected:
+                return collected
+    except Exception as exc:
+        if logger is not None:
+            logger.warning(
+                "playwright_scan_profile: failed to scan via Playwright, falling back: %s",
+                exc,
+            )
+    finally:
+        for handle in (page, context, browser):
+            if handle is None:
+                continue
+            try:
+                await handle.close()  # type: ignore[func-returns-value]
+            except Exception:  # pragma: no cover - cleanup best-effort
+                pass
+
+    if collected:
+        return collected
+
+    if session is not None:
+        fallback_urls = await scan_profile_media(
+            session,
+            gallery_url,
+            max_width=max_width,
+            logger=logger,
+        )
+        if fallback_urls and logger is not None:
+            logger.info(
+                "playwright_scan_profile: HTTP fallback yielded %d asset(s)",
+                len(fallback_urls),
+            )
+        return fallback_urls
+    return []
 
