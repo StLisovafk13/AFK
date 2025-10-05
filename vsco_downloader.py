@@ -415,20 +415,6 @@ def post_validate(logger: logging.Logger, items: List[Dict[str, Any]]) -> bool:
 # -----------------------------
 # ZIP-АРХИВАЦИЯ (моно и мульти)
 # -----------------------------
-def _estimate_zip_footprint(files: List[Path]) -> int:
-    """
-    Грубая оценка веса ZIP (без сжатия для уже сжатых форматов).
-    Для JPEG/WEBP/MP4/WEBM/MOV считаем, что выигрыш небольшой,
-    поэтому используем сырой вес + накладные ~2КБ/файл.
-    """
-    total = 0
-    for f in files:
-        try:
-            total += f.stat().st_size + 2048
-        except Exception:
-            pass
-    return total
-
 def _split_into_parts(candidates: List[Path], limit_bytes: int) -> List[List[Path]]:
     """
     Делит файлы на части по оценке суммарного веса (жадно).
