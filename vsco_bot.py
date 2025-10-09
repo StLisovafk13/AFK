@@ -2467,7 +2467,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
             <a class="btn" href="${{safeProfileUrl}}" target="_blank">View Profile</a>
           </div>
           <div class="meta">${{latStr ? latStr + ' • ' : ''}}${{imageCount}} item(s) • ${{commentCount}} comment(s)</div>
-          ${createdHtml}
+          ${{createdHtml}}
           ${chipsHtml}
           <div class="meta added">Добавил: ${{addedBy || '—'}}</div>
           <div class="thumbs">${{thumbs}}</div>
