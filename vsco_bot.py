@@ -56,6 +56,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     CallbackQuery,
     MessageEntity,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
@@ -4502,6 +4504,19 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def functions_reply_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="/dl"), KeyboardButton(text="/export")],
+            [KeyboardButton(text="/links"), KeyboardButton(text="/stats")],
+            [KeyboardButton(text="/qstat"), KeyboardButton(text="/tutorial")],
+            [KeyboardButton(text="/help")],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выберите функцию",
+    )
+
+
 @dp.message(Command("start", "help"))
 async def cmd_help(msg: Message):
     if not await ensure_user_has_access(msg):
@@ -4530,6 +4545,10 @@ async def cmd_help(msg: Message):
         "👇 Быстрые действия доступны на кнопках ниже."
     )
     await msg.answer(text, reply_markup=main_menu_keyboard())
+    await msg.answer(
+        "👇 Быстрый доступ к функциям также доступен через клавиатуру.",
+        reply_markup=functions_reply_keyboard(),
+    )
 
 
 @dp.callback_query(F.data.startswith("menu:"))
