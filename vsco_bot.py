@@ -56,6 +56,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     CallbackQuery,
     MessageEntity,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
@@ -3109,11 +3111,12 @@ async def on_text(msg: Message):
         return
 
     ses = get_session(msg.chat.id)
+    text = (msg.text or "").strip()
+
+    if not text:
+        return
+
     if ses.pending_action == "download":
-        text = (msg.text or "").strip()
-        if not text:
-            await msg.answer("Отправьте username или ссылку профиля VSCO для скачивания.")
-            return
         parts = text.split()
         target = parts[0]
         extra_flags = [p for p in parts[1:] if p.startswith("--")]
@@ -3124,11 +3127,43 @@ async def on_text(msg: Message):
             getattr(msg.from_user, "id", None),
         )
         ses.pending_action = None
-        if not success:
-            await msg.answer("Если нужно попробовать снова, нажмите кнопку «Скачать профиль» ещё раз.")
         return
 
-    pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_message(msg.text, msg.entities))
+    if text == "📥 Скачать профиль":
+        if msg.chat.type in ("group", "supergroup"):
+            await msg.answer("Скачивание доступно только в личных сообщениях. Напишите мне в ЛС.")
+            return
+        ses.pending_action = "download"
+        await msg.answer(
+            "Отправьте username или ссылку профиля VSCO, чтобы поставить скачивание в очередь."
+            " Можно добавить флаги, например: <code>username --max 100</code>."
+        )
+        return
+
+    if text == "📤 Экспорт":
+        if msg.chat.type in ("group", "supergroup"):
+            await msg.answer("Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.")
+            return
+        await cmd_export(msg, user_id=getattr(msg.from_user, "id", None))
+        return
+
+    if text == "🔗 Ссылки за 24ч":
+        await cmd_links(msg, user_id=getattr(msg.from_user, "id", None))
+        return
+
+    if text == "📈 Статистика":
+        await cmd_stats(msg, user_id=getattr(msg.from_user, "id", None))
+        return
+
+    if text == "📊 Очередь":
+        await cmd_qstat(msg, user_id=getattr(msg.from_user, "id", None))
+        return
+
+    if text == "📚 Туториал":
+        await cmd_tutorial(msg, user_id=getattr(msg.from_user, "id", None))
+        return
+
+    pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_message(text, msg.entities))
     if not pairs:
         return  # без ответа
     profile_files = persist_profile_media_urls(pairs, ses.dir)
@@ -3526,6 +3561,20 @@ async def _enqueue_download_request(
         await msg.answer("Отправьте username или ссылку профиля VSCO для скачивания.")
         return False
 
+    username_hint = _extract_username_from_target(clean_target)
+    if username_hint is None:
+        if clean_target.startswith("--"):
+            await msg.answer(
+                "Сначала укажите username или ссылку профиля, затем дополнительные флаги. "
+                "Скачивание отменено. Нажмите «Скачать профиль» и попробуйте снова."
+            )
+        else:
+            await msg.answer(
+                "Не распознал ссылку или username VSCO. Скачивание отменено. "
+                "Нажмите «Скачать профиль» и отправьте корректную ссылку."
+            )
+        return False
+
     maybe_url = clean_target if "://" in clean_target else f"https://{clean_target}"
     slug = vsco_short_slug(maybe_url)
     if slug:
@@ -3807,17 +3856,25 @@ def _extract_username_from_target(target: str) -> Optional[str]:
         text = text[1:]
     if USERNAME_RE.match(text):
         return text
+    normalized = text if "://" in text else f"https://{text}"
     info = classify_vsco_path(text)
+    if not info:
+        info = classify_vsco_path(normalized)
     username = None
     if isinstance(info, dict):
         username = info.get("username") or info.get("slug")
     if isinstance(username, str) and username.strip():
         return username.strip()
-    if is_vsco_url(text):
-        extracted = username_from_vsco_co(text)
+    if is_vsco_url(text) or is_vsco_url(normalized):
+        candidate_url = text if is_vsco_url(text) else normalized
+        extracted = username_from_vsco_co(candidate_url)
         if extracted:
             return extracted
-        slug = vsco_short_slug(text if "://" in text else f"https://{text}")
+        slug = vsco_short_slug(candidate_url)
+        if slug:
+            return slug
+    else:
+        slug = vsco_short_slug(normalized)
         if slug:
             return slug
     return None
@@ -4502,6 +4559,27 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def functions_reply_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="📥 Скачать профиль"),
+                KeyboardButton(text="📤 Экспорт"),
+            ],
+            [
+                KeyboardButton(text="🔗 Ссылки за 24ч"),
+                KeyboardButton(text="📈 Статистика"),
+            ],
+            [
+                KeyboardButton(text="📊 Очередь"),
+                KeyboardButton(text="📚 Туториал"),
+            ],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выберите функцию",
+    )
+
+
 @dp.message(Command("start", "help"))
 async def cmd_help(msg: Message):
     if not await ensure_user_has_access(msg):
@@ -4530,6 +4608,10 @@ async def cmd_help(msg: Message):
         "👇 Быстрые действия доступны на кнопках ниже."
     )
     await msg.answer(text, reply_markup=main_menu_keyboard())
+    await msg.answer(
+        "👇 Быстрый доступ к функциям также доступен через клавиатуру.",
+        reply_markup=functions_reply_keyboard(),
+    )
 
 
 @dp.callback_query(F.data.startswith("menu:"))
