@@ -3127,8 +3127,6 @@ async def on_text(msg: Message):
             getattr(msg.from_user, "id", None),
         )
         ses.pending_action = None
-        if not success:
-            await msg.answer("Если нужно попробовать снова, нажмите кнопку «Скачать профиль» ещё раз.")
         return
 
     if text == "📥 Скачать профиль":
@@ -3563,6 +3561,20 @@ async def _enqueue_download_request(
         await msg.answer("Отправьте username или ссылку профиля VSCO для скачивания.")
         return False
 
+    username_hint = _extract_username_from_target(clean_target)
+    if username_hint is None:
+        if clean_target.startswith("--"):
+            await msg.answer(
+                "Сначала укажите username или ссылку профиля, затем дополнительные флаги. "
+                "Скачивание отменено. Нажмите «Скачать профиль» и попробуйте снова."
+            )
+        else:
+            await msg.answer(
+                "Не распознал ссылку или username VSCO. Скачивание отменено. "
+                "Нажмите «Скачать профиль» и отправьте корректную ссылку."
+            )
+        return False
+
     maybe_url = clean_target if "://" in clean_target else f"https://{clean_target}"
     slug = vsco_short_slug(maybe_url)
     if slug:
@@ -3844,17 +3856,25 @@ def _extract_username_from_target(target: str) -> Optional[str]:
         text = text[1:]
     if USERNAME_RE.match(text):
         return text
+    normalized = text if "://" in text else f"https://{text}"
     info = classify_vsco_path(text)
+    if not info:
+        info = classify_vsco_path(normalized)
     username = None
     if isinstance(info, dict):
         username = info.get("username") or info.get("slug")
     if isinstance(username, str) and username.strip():
         return username.strip()
-    if is_vsco_url(text):
-        extracted = username_from_vsco_co(text)
+    if is_vsco_url(text) or is_vsco_url(normalized):
+        candidate_url = text if is_vsco_url(text) else normalized
+        extracted = username_from_vsco_co(candidate_url)
         if extracted:
             return extracted
-        slug = vsco_short_slug(text if "://" in text else f"https://{text}")
+        slug = vsco_short_slug(candidate_url)
+        if slug:
+            return slug
+    else:
+        slug = vsco_short_slug(normalized)
         if slug:
             return slug
     return None
