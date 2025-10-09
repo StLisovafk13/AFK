@@ -382,6 +382,7 @@ if _required_group:
 
 ACCESS_CACHE_TTL = int(os.getenv("BOT_REQUIRED_ACCESS_CACHE_TTL", "30") or "30")
 _ACCESS_CACHE: Dict[int, Tuple[float, bool]] = {}
+_ACCESS_PENDING: Dict[int, asyncio.Task[bool]] = {}
 
 
 def _access_message_html() -> str:
@@ -415,6 +416,29 @@ def _is_positive_membership_status(member: Any) -> bool:
     return False
 
 
+async def _check_required_chat_membership(chat: RequiredChat, user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat.chat_id, user_id)
+    except TelegramBadRequest as err:
+        log.warning(
+            "Failed to check membership for user %s in %s: %s",
+            user_id,
+            chat.chat_id,
+            err,
+        )
+        return False
+    except TelegramNetworkError as err:
+        log.error(
+            "Network error while checking membership for %s in %s",
+            user_id,
+            chat.chat_id,
+            exc_info=err,
+        )
+        return False
+
+    return _is_positive_membership_status(member)
+
+
 async def _is_user_allowed(user_id: int) -> bool:
     if not REQUIRED_CHATS:
         return True
@@ -424,24 +448,38 @@ async def _is_user_allowed(user_id: int) -> bool:
     if cached and now - cached[0] <= ACCESS_CACHE_TTL:
         return cached[1]
 
-    allowed = True
-    for chat in REQUIRED_CHATS:
-        try:
-            member = await bot.get_chat_member(chat.chat_id, user_id)
-        except TelegramBadRequest as err:
-            log.warning("Failed to check membership for user %s in %s: %s", user_id, chat.chat_id, err)
-            allowed = False
-            break
-        except TelegramNetworkError as err:
-            log.error("Network error while checking membership for %s in %s", user_id, chat.chat_id, exc_info=err)
-            allowed = False
-            break
-        if not _is_positive_membership_status(member):
-            allowed = False
-            break
+    pending = _ACCESS_PENDING.get(user_id)
+    if pending:
+        return await pending
 
-    _ACCESS_CACHE[user_id] = (now, allowed)
-    return allowed
+    async def _compute_and_cache() -> bool:
+        tasks = [
+            asyncio.create_task(_check_required_chat_membership(chat, user_id))
+            for chat in REQUIRED_CHATS
+        ]
+        allowed = True
+        try:
+            for task in asyncio.as_completed(tasks):
+                result = await task
+                if not result:
+                    allowed = False
+                    break
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                with contextlib.suppress(Exception):
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            _ACCESS_CACHE[user_id] = (time.time(), allowed)
+        return allowed
+
+    task = asyncio.create_task(_compute_and_cache())
+    _ACCESS_PENDING[user_id] = task
+    try:
+        return await task
+    finally:
+        _ACCESS_PENDING.pop(user_id, None)
 
 
 async def ensure_user_has_access(message: Message, user_id: Optional[int] = None) -> bool:
