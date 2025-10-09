@@ -248,17 +248,63 @@ setup_logging()
 log = logging.getLogger("vsco-bot")
 
 
+_PRIVATE_CHAT_LINK_RE = re.compile(r"^https?://t\.me/c/(\d{1,15})(?:/|$)", re.IGNORECASE)
+
+
+def _normalize_positive_chat_id(value: int) -> int:
+    """Convert positive identifiers into Telegram chat ids with a leading ``-``.
+
+    Operators usually obtain chat identifiers for required communities from
+    three different sources:
+
+    1. ``-1001234567890`` — already valid and returned unchanged elsewhere.
+    2. ``1001234567890`` — absolute value from logs/``Chat.id``.
+    3. ``1234567890`` — fragment from ``https://t.me/c/<id>/...`` links.
+    4. ``123456`` — legacy basic groups where the minus sign was omitted.
+
+    The third variant uses the documented formula
+    ``chat_id = -1000000000000 - fragment``.
+    Smaller numbers are assumed to be legacy/basic group ids that simply miss
+    the minus sign.
+    """
+
+    if value >= 1_000_000_000_000:
+        # Already an absolute chat id (e.g. 1001234567890).
+        return -value
+    if value >= 1_000_000_000:
+        # Fragment from t.me/c links (e.g. 1234567890).
+        return -1_000_000_000_000 - value
+    # Legacy/basic group identifier without the minus sign.
+    return -value
+
+
 def _parse_channel_id_value(raw: str, *, env_name: str) -> Optional[int | str]:
     text = (raw or "").strip()
     if not text:
         return None
     if text.startswith("@"):
         return text
-    try:
-        return int(text)
-    except ValueError:
-        log.warning("%s is not a numeric id, using raw value: %s", env_name, text)
-        return text
+
+    link_match = _PRIVATE_CHAT_LINK_RE.match(text)
+    if link_match:
+        fragment = int(link_match.group(1))
+        chat_id = _normalize_positive_chat_id(fragment)
+        log.info("Resolved %s private link fragment %s to chat id %s", env_name, fragment, chat_id)
+        return chat_id
+
+    digits = text.lstrip("+-")
+    if digits.isdigit():
+        number = int(digits)
+        if text.startswith("-"):
+            return -number
+        normalized = _normalize_positive_chat_id(number)
+        if normalized != number:
+            log.info("Normalized %s value %s to chat id %s", env_name, text, normalized)
+            return normalized
+        return number
+
+    log.warning("%s is not a numeric id, using raw value: %s", env_name, text)
+    return text
 
 
 def _resolve_channel_ids() -> None:
