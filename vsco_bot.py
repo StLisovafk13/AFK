@@ -115,6 +115,12 @@ ARCHIVE_ADMIN_CHANNEL_ID_ENV = os.getenv("BOT_ARCHIVE_ADMIN_CHANNEL_ID", "").str
 ARCHIVE_SUMMARY_CHANNEL_ID_ENV = os.getenv("BOT_ARCHIVE_SUMMARY_CHANNEL_ID", "").strip()
 ARCHIVE_ADMIN_CHANNEL_ID: Optional[int | str] = None
 ARCHIVE_SUMMARY_CHANNEL_ID: Optional[int | str] = None
+REQUIRED_CHANNEL_ID_ENV = os.getenv("BOT_REQUIRED_CHANNEL_ID", "").strip()
+REQUIRED_GROUP_ID_ENV = os.getenv("BOT_REQUIRED_GROUP_ID", "").strip()
+REQUIRED_CHANNEL_LABEL = os.getenv("BOT_REQUIRED_CHANNEL_LABEL", "").strip()
+REQUIRED_GROUP_LABEL = os.getenv("BOT_REQUIRED_GROUP_LABEL", "").strip()
+REQUIRED_CHANNEL_LINK = os.getenv("BOT_REQUIRED_CHANNEL_LINK", "").strip()
+REQUIRED_GROUP_LINK = os.getenv("BOT_REQUIRED_GROUP_LINK", "").strip()
 MEDIA_PAGE_MAX_WIDTH = int(os.getenv("BOT_MEDIA_SCAN_MAX_WIDTH", "2048") or "2048")
 
 
@@ -270,6 +276,175 @@ def _resolve_channel_ids() -> None:
 
 
 _resolve_channel_ids()
+
+
+@dataclass(frozen=True)
+class RequiredChat:
+    chat_id: int | str
+    label: str
+    invite_link: str
+
+
+def _make_required_chat(
+    raw_id: str,
+    *,
+    env_name: str,
+    label: str,
+    invite_link: str,
+) -> Optional[RequiredChat]:
+    chat_id = _parse_channel_id_value(raw_id, env_name=env_name)
+    if chat_id is None:
+        return None
+
+    display_label = label.strip() if label else ""
+    link = invite_link.strip() if invite_link else ""
+
+    if not display_label:
+        if link:
+            display_label = link
+        elif isinstance(chat_id, str) and chat_id.startswith("@"):
+            display_label = chat_id
+        else:
+            display_label = str(chat_id)
+
+    if not link and isinstance(chat_id, str) and chat_id.startswith("@"):
+        link = f"https://t.me/{chat_id[1:]}"
+
+    return RequiredChat(chat_id=chat_id, label=display_label, invite_link=link)
+
+
+REQUIRED_CHATS: List[RequiredChat] = []
+
+_required_channel = _make_required_chat(
+    REQUIRED_CHANNEL_ID_ENV,
+    env_name="BOT_REQUIRED_CHANNEL_ID",
+    label=REQUIRED_CHANNEL_LABEL,
+    invite_link=REQUIRED_CHANNEL_LINK,
+)
+if _required_channel:
+    REQUIRED_CHATS.append(_required_channel)
+
+_required_group = _make_required_chat(
+    REQUIRED_GROUP_ID_ENV,
+    env_name="BOT_REQUIRED_GROUP_ID",
+    label=REQUIRED_GROUP_LABEL,
+    invite_link=REQUIRED_GROUP_LINK,
+)
+if _required_group:
+    REQUIRED_CHATS.append(_required_group)
+
+
+ACCESS_CACHE_TTL = int(os.getenv("BOT_REQUIRED_ACCESS_CACHE_TTL", "30") or "30")
+_ACCESS_CACHE: Dict[int, Tuple[float, bool]] = {}
+
+
+def _access_message_html() -> str:
+    if not REQUIRED_CHATS:
+        return ""
+
+    lines = [
+        "🚫 <b>Доступ ограничен</b>.",
+        "Для использования бота вступите в следующие сообщества:",
+    ]
+    for chat in REQUIRED_CHATS:
+        if chat.invite_link:
+            link = escape(chat.invite_link, quote=True)
+            label = escape(chat.label)
+            lines.append(f"• <a href=\"{link}\">{label}</a>")
+        else:
+            lines.append(f"• {escape(chat.label)}")
+    lines.append("После вступления повторите команду.")
+    return "\n".join(lines)
+
+
+ACCESS_MESSAGE_HTML = _access_message_html()
+
+
+def _is_positive_membership_status(member: Any) -> bool:
+    status = getattr(member, "status", None)
+    if status in {"creator", "administrator", "member"}:
+        return True
+    if status == "restricted":
+        return bool(getattr(member, "is_member", False))
+    return False
+
+
+async def _is_user_allowed(user_id: int) -> bool:
+    if not REQUIRED_CHATS:
+        return True
+
+    now = time.time()
+    cached = _ACCESS_CACHE.get(user_id)
+    if cached and now - cached[0] <= ACCESS_CACHE_TTL:
+        return cached[1]
+
+    allowed = True
+    for chat in REQUIRED_CHATS:
+        try:
+            member = await bot.get_chat_member(chat.chat_id, user_id)
+        except TelegramBadRequest as err:
+            log.warning("Failed to check membership for user %s in %s: %s", user_id, chat.chat_id, err)
+            allowed = False
+            break
+        except TelegramNetworkError as err:
+            log.error("Network error while checking membership for %s in %s", user_id, chat.chat_id, exc_info=err)
+            allowed = False
+            break
+        if not _is_positive_membership_status(member):
+            allowed = False
+            break
+
+    _ACCESS_CACHE[user_id] = (now, allowed)
+    return allowed
+
+
+async def ensure_user_has_access(message: Message, user_id: Optional[int] = None) -> bool:
+    if not REQUIRED_CHATS:
+        return True
+
+    if user_id is None:
+        user = getattr(message, "from_user", None)
+        user_id = getattr(user, "id", None) if user else None
+    if user_id is None:
+        return False
+
+    if is_admin_id(user_id):
+        return True
+
+    allowed = await _is_user_allowed(user_id)
+    if allowed:
+        return True
+
+    if ACCESS_MESSAGE_HTML:
+        with contextlib.suppress(Exception):
+            await message.answer(ACCESS_MESSAGE_HTML)
+    return False
+
+
+async def ensure_callback_access(cq: CallbackQuery) -> bool:
+    if not REQUIRED_CHATS:
+        return True
+
+    user = cq.from_user
+    user_id = getattr(user, "id", None) if user else None
+    if user_id is None:
+        return False
+
+    if is_admin_id(user_id):
+        return True
+
+    allowed = await _is_user_allowed(user_id)
+    if allowed:
+        return True
+
+    text = ACCESS_MESSAGE_HTML or "Доступ ограничен."
+    with contextlib.suppress(Exception):
+        await cq.answer(text, show_alert=True)
+    if cq.message:
+        with contextlib.suppress(Exception):
+            await cq.message.answer(text)
+    return False
+
 
 # ---------------------- VSCO constants ----------------------
 VSCO_RESERVED = {
@@ -2723,6 +2898,9 @@ def get_session(chat_id: int) -> Session:
 
 @dp.message(F.document)
 async def on_document(msg: Message):
+    if not await ensure_user_has_access(msg):
+        return
+
     ses = get_session(msg.chat.id)
     found = added_items = added_comments = 0
     new_links: List[str] = []
@@ -2843,6 +3021,9 @@ async def on_document(msg: Message):
 # ---------- plain text ----------
 @dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(msg: Message):
+    if not await ensure_user_has_access(msg):
+        return
+
     ses = get_session(msg.chat.id)
     if ses.pending_action == "download":
         text = (msg.text or "").strip()
@@ -2911,7 +3092,10 @@ def kb_struct(kb: InlineKeyboardMarkup | None):
     )
 
 @dp.message(Command("export"))
-async def cmd_export(msg: Message):
+async def cmd_export(msg: Message, user_id: Optional[int] = None):
+    if not await ensure_user_has_access(msg, user_id=user_id):
+        return
+
     if msg.chat.type in ("group", "supergroup"):
         await msg.answer("🚫 Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.")
         return
@@ -2927,6 +3111,9 @@ async def cmd_export(msg: Message):
 
 @dp.callback_query(F.data.startswith("export:"))
 async def on_export_click(cq: CallbackQuery):
+    if not await ensure_callback_access(cq):
+        return
+
     chat_id = cq.message.chat.id
     if cq.message.chat.type in ("group", "supergroup"):
         await cq.answer("Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.", show_alert=True)
@@ -3037,7 +3224,10 @@ def stats_scope_keyboard(ses: Session) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[scope, actions])
 
 @dp.message(Command("stats"))
-async def cmd_stats(msg: Message):
+async def cmd_stats(msg: Message, user_id: Optional[int] = None):
+    if not await ensure_user_has_access(msg, user_id=user_id):
+        return
+
     ses = get_session(msg.chat.id)
     s = get_stats(msg.chat.id, ses.export_scope)
     txt = format_stats_text(s, ses.export_scope)
@@ -3045,6 +3235,9 @@ async def cmd_stats(msg: Message):
 
 @dp.callback_query(F.data.startswith("stats:"))
 async def on_stats_click(cq: CallbackQuery):
+    if not await ensure_callback_access(cq):
+        return
+
     chat_id = cq.message.chat.id
     ses = get_session(chat_id)
     parts = cq.data.split(":")
@@ -3143,7 +3336,10 @@ def _render_links_text(chat_id: int, scope: str, page: int) -> Tuple[str, int]:
     return txt, total
 
 @dp.message(Command("links"))
-async def cmd_links(msg: Message):
+async def cmd_links(msg: Message, user_id: Optional[int] = None):
+    if not await ensure_user_has_access(msg, user_id=user_id):
+        return
+
     ses = get_session(msg.chat.id)
     page = 1
     txt, total = _render_links_text(msg.chat.id, ses.export_scope, page)
@@ -3151,6 +3347,9 @@ async def cmd_links(msg: Message):
 
 @dp.callback_query(F.data.startswith("links:"))
 async def on_links_click(cq: CallbackQuery):
+    if not await ensure_callback_access(cq):
+        return
+
     chat_id = cq.message.chat.id
     ses = get_session(chat_id)
     parts = cq.data.split(":")
@@ -3208,7 +3407,10 @@ async def on_links_click(cq: CallbackQuery):
 
 # ---------- reset ----------
 @dp.message(Command("reset"))
-async def cmd_reset(msg: Message):
+async def cmd_reset(msg: Message, user_id: Optional[int] = None):
+    if not await ensure_user_has_access(msg, user_id=user_id):
+        return
+
     ses = get_session(msg.chat.id)
     for p in ses.dir.glob("*"):
         try: p.unlink()
@@ -3300,11 +3502,14 @@ def _dl_script_path() -> Path:
 
 
 @dp.message(Command("dl"))
-async def cmd_dl_enqueue(msg: Message):
+async def cmd_dl_enqueue(msg: Message, user_id: Optional[int] = None):
     """
     /dl <vsco_username | profile_url> [--flags ...]
     Кладёт задание в очередь. Выполняет воркер по одному.
     """
+    if not await ensure_user_has_access(msg, user_id=user_id):
+        return
+
     parts = (msg.text or "").split()
     if len(parts) < 2:
         await msg.answer("Usage: <code>/dl &lt;username|profile_url&gt; [--flags...]</code>\n"
@@ -3322,7 +3527,10 @@ async def cmd_dl_enqueue(msg: Message):
 
 
 @dp.message(Command("qstat"))
-async def cmd_qstat(msg: Message):
+async def cmd_qstat(msg: Message, user_id: Optional[int] = None):
+    if not await ensure_user_has_access(msg, user_id=user_id):
+        return
+
     q = _DL_QUEUE
     size = q.qsize() if q else 0
     await msg.answer(f"📊 В очереди заданий: {size}. Один воркер обрабатывает по одному.")
@@ -3378,7 +3586,10 @@ def _admin_keyboard() -> InlineKeyboardMarkup:
 
 
 @dp.message(Command("admin"))
-async def cmd_admin(msg: Message):
+async def cmd_admin(msg: Message, user_id: Optional[int] = None):
+    if not await ensure_user_has_access(msg, user_id=user_id):
+        return
+
     if not require_admin(msg):
         await msg.answer("🚫 Команда доступна только администраторам.")
         return
@@ -3390,6 +3601,9 @@ async def cmd_admin(msg: Message):
 
 @dp.callback_query(F.data.startswith("admin:"))
 async def on_admin_click(cq: CallbackQuery):
+    if not await ensure_callback_access(cq):
+        return
+
     if not is_admin_id(getattr(cq.from_user, "id", None)):
         await cq.answer("🚫 Недостаточно прав", show_alert=True)
         return
@@ -3425,6 +3639,9 @@ async def on_admin_click(cq: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("cancel:"))
 async def cq_cancel_job(cq: CallbackQuery):
+    if not await ensure_callback_access(cq):
+        return
+
     global _CURRENT_JOB
     try:
         job_id = int(cq.data.split(":", 1)[1])
@@ -4156,7 +4373,10 @@ async def _dl_worker():
 
 
 @dp.message(Command("tutorial"))
-async def cmd_tutorial(msg: Message):
+async def cmd_tutorial(msg: Message, user_id: Optional[int] = None):
+    if not await ensure_user_has_access(msg, user_id=user_id):
+        return
+
     text = (
         "❗ <b>Tutorial:</b>\n"
         "<b>Как получать ссылки профилей и ссылки фоток с координатами.</b>\n\n"
@@ -4200,6 +4420,9 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 @dp.message(Command("start", "help"))
 async def cmd_help(msg: Message):
+    if not await ensure_user_has_access(msg):
+        return
+
     text = (
         "🆘 <b>Справка</b>\n\n"
         "Этот бот скачивает медиа из VSCO через очередь заданий, собирает статистику\n"
@@ -4227,6 +4450,9 @@ async def cmd_help(msg: Message):
 
 @dp.callback_query(F.data.startswith("menu:"))
 async def on_menu_click(cq: CallbackQuery):
+    if not await ensure_callback_access(cq):
+        return
+
     if not cq.data:
         await cq.answer()
         return
@@ -4248,12 +4474,12 @@ async def on_menu_click(cq: CallbackQuery):
         return
 
     if action == "links":
-        await cmd_links(cq.message)
+        await cmd_links(cq.message, user_id=getattr(cq.from_user, "id", None))
         await cq.answer("Готово")
         return
 
     if action == "stats":
-        await cmd_stats(cq.message)
+        await cmd_stats(cq.message, user_id=getattr(cq.from_user, "id", None))
         await cq.answer("Готово")
         return
 
@@ -4261,17 +4487,17 @@ async def on_menu_click(cq: CallbackQuery):
         if cq.message and cq.message.chat.type in ("group", "supergroup"):
             await cq.answer("Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.", show_alert=True)
             return
-        await cmd_export(cq.message)
+        await cmd_export(cq.message, user_id=getattr(cq.from_user, "id", None))
         await cq.answer("Открываю экспорт")
         return
 
     if action == "qstat":
-        await cmd_qstat(cq.message)
+        await cmd_qstat(cq.message, user_id=getattr(cq.from_user, "id", None))
         await cq.answer("Готово")
         return
 
     if action == "tutorial":
-        await cmd_tutorial(cq.message)
+        await cmd_tutorial(cq.message, user_id=getattr(cq.from_user, "id", None))
         await cq.answer()
         return
 
