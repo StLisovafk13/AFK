@@ -1446,9 +1446,15 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     all_ids = [iid for lst in ids_by_user.values() for iid in lst]
     comments_map: Dict[int,List[str]] = {}
     if all_ids:
-        q = ",".join("?" for _ in all_ids)
-        for iid, c in conn.execute(f"SELECT item_id,comment FROM comments WHERE item_id IN ({q}) ORDER BY id ASC", all_ids):
-            comments_map.setdefault(iid, []).append(c)
+        chunk_size = 500
+        for i in range(0, len(all_ids), chunk_size):
+            chunk = all_ids[i : i + chunk_size]
+            q = ",".join("?" for _ in chunk)
+            for iid, c in conn.execute(
+                f"SELECT item_id,comment FROM comments WHERE item_id IN ({q}) ORDER BY id ASC",
+                chunk,
+            ):
+                comments_map.setdefault(iid, []).append(c)
 
     out = []
     for uname, g in groups.items():
@@ -1506,9 +1512,16 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
         conn.close(); return []
     ids = [r[0] for r in rows]
     comments_map: Dict[int,List[str]] = {}
-    q = ",".join("?" for _ in ids)
-    for iid, c in conn.execute(f"SELECT item_id,comment FROM comments WHERE item_id IN ({q}) ORDER BY id ASC", ids):
-        comments_map.setdefault(iid, []).append(c)
+    if ids:
+        chunk_size = 500
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i : i + chunk_size]
+            q = ",".join("?" for _ in chunk)
+            for iid, c in conn.execute(
+                f"SELECT item_id,comment FROM comments WHERE item_id IN ({q}) ORDER BY id ASC",
+                chunk,
+            ):
+                comments_map.setdefault(iid, []).append(c)
     out = []
     for iid, uname, purl, img, lat, lon, added_by, source, source_file, created_at in rows:
         try: lat = float(lat) if lat not in ("", None, "None") else None
