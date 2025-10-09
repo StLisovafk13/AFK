@@ -1737,7 +1737,8 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             for key in sorted(sources_dict.keys(), key=lambda k: (sources_dict[k] or "").lower())
             if key and sources_dict.get(key)
         ]
-        city_list = sorted(g.get("cities", []))  # type: ignore
+        city_list = sorted(str(city) for city in g.get("cities", []))  # type: ignore
+        added_key = (display or "").strip().lower()
         out.append({
             "username": uname,
             "profile_url": g["profile_url"],
@@ -1749,6 +1750,7 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "added_by": display,
             "added_by_link": link or "",
             "added_by_raw": raw_added,
+            "added_by_key": added_key,
             "datasets": datasets,
             "cities": city_list,
             "first_created": g.get("first_at"),
@@ -1829,8 +1831,32 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     .wrap {{ max-width: 1400px; margin: 24px auto; padding: 0 16px; }}
     h1 {{ margin: 0 0 4px 0; }}
     .sub {{ color:#6b7280; margin-bottom: 16px; }}
-    .toolbar {{ display:grid; grid-template-columns: 1.5fr 0.8fr 0.8fr 0.8fr 0.8fr 1.1fr auto auto; gap:10px; margin-bottom:14px; }}
-    .toolbar input,.toolbar select,.toolbar button {{ padding:8px 10px; border:1px solid #e5e7eb; border-radius:8px; background:#fff; }}
+    .toolbar {{
+      display:grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap:12px;
+      margin-bottom:16px;
+      background:#fff;
+      padding:16px;
+      border-radius:16px;
+      box-shadow:0 1px 4px rgba(15,23,42,0.08);
+    }}
+    .toolbar .field {{ display:flex; flex-direction:column; gap:6px; font-size:12px; color:#6b7280; }}
+    .toolbar .field.inline {{ flex-direction:row; align-items:center; gap:8px; }}
+    .toolbar label {{ font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; color:#6b7280; }}
+    .toolbar input,.toolbar select,.toolbar button {{ padding:8px 10px; border:1px solid #e5e7eb; border-radius:8px; background:#fff; font-size:13px; color:#111827; }}
+    .toolbar input[type="number"] {{ font-variant-numeric: tabular-nums; }}
+    .toolbar .field--button {{ align-self:flex-end; display:flex; flex-direction:column; justify-content:flex-end; }}
+    .toolbar .field--button button {{ width:100%; font-weight:600; cursor:pointer; transition:background .15s ease, color .15s ease; }}
+    .toolbar .field--button.primary button {{ background:#111827; color:#fff; }}
+    .toolbar .field--button.primary button:hover {{ background:#1f2937; }}
+    .toolbar .field--button.secondary button {{ background:#f3f4f6; color:#111827; }}
+    .toolbar .field--button.secondary button:hover {{ background:#e5e7eb; }}
+    .chips {{ display:flex; flex-wrap:wrap; gap:6px; margin:6px 0; }}
+    .chip {{ display:inline-flex; align-items:center; padding:4px 8px; border-radius:999px; font-size:11px; background:#f3f4f6; color:#374151; }}
+    .chip-city {{ background:#dbeafe; color:#1d4ed8; }}
+    .chip-data {{ background:#dcfce7; color:#047857; }}
+    .meta.created {{ color:#4b5563; }}
     .stats {{ color:#6b7280; margin: 6px 0 10px 0; }}
     .grid {{ display:grid; grid-template-columns: repeat(auto-fill,minmax(300px,1fr)); gap:14px; }}
     .card {{ background:#fff; border-radius:14px; padding:12px; box-shadow:0 1px 4px rgba(0,0,0,.06); }}
@@ -1892,21 +1918,82 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     <div class=\"sub\">{escape(subtitle)}</div>
 
     <div class=\"toolbar\">
-      <input id=\"q\" placeholder=\"Filter by username\" />
-      <input id=\"latMin\" placeholder=\"Lat min\" type=\"number\" step=\"0.0001\"/>
-      <input id=\"latMax\" placeholder=\"Lat max\" type=\"number\" step=\"0.0001\"/>
-      <input id=\"lonMin\" placeholder=\"Lon min\" type=\"number\" step=\"0.0001\"/>
-      <input id=\"lonMax\" placeholder=\"Lon max\" type=\"number\" step=\"0.0001\"/>
-      <select id=\"sort\">
-        <option value=\"img_desc\">More images first</option>
-        <option value=\"img_asc\">Fewer images first</option>
-        <option value=\"cm_desc\">More comments first</option>
-        <option value=\"cm_asc\">Fewer comments first</option>
-        <option value=\"name_asc\">Username A–Z</option>
-        <option value=\"name_desc\">Username Z–A</option>
-      </select>
-      <button id=\"apply\">Apply</button>
-      <button id=\"reset\" type=\"button\">Reset</button>
+      <div class=\"field\">
+        <label for=\"q\">Поиск</label>
+        <input id=\"q\" placeholder=\"Username, города, комментарии\" />
+      </div>
+      <div class=\"field\">
+        <label for=\"datasetSelect\">Данные</label>
+        <select id=\"datasetSelect\"></select>
+      </div>
+      <div class=\"field\">
+        <label for=\"cityInput\">Город (ввод)</label>
+        <input id=\"cityInput\" list=\"cityOptionsList\" placeholder=\"Начните вводить город\" />
+        <datalist id=\"cityOptionsList\"></datalist>
+      </div>
+      <div class=\"field\">
+        <label for=\"citySelect\">Город (выбор)</label>
+        <select id=\"citySelect\"></select>
+      </div>
+      <div class=\"field\">
+        <label for=\"commentInput\">Комментарий содержит</label>
+        <input id=\"commentInput\" placeholder=\"Текст комментария\" />
+      </div>
+      <div class=\"field\">
+        <label for=\"hasComments\">Комментарии</label>
+        <select id=\"hasComments\">
+          <option value=\"\">Все</option>
+          <option value=\"with\">Есть комментарии</option>
+          <option value=\"without\">Без комментариев</option>
+        </select>
+      </div>
+      <div class=\"field\">
+        <label for=\"addedSelect\">Добавил</label>
+        <select id=\"addedSelect\"></select>
+      </div>
+      <div class=\"field\">
+        <label for=\"dateFrom\">Дата с</label>
+        <input id=\"dateFrom\" type=\"date\" />
+      </div>
+      <div class=\"field\">
+        <label for=\"dateTo\">Дата по</label>
+        <input id=\"dateTo\" type=\"date\" />
+      </div>
+      <div class=\"field\">
+        <label for=\"latMin\">Lat min</label>
+        <input id=\"latMin\" type=\"number\" step=\"0.0001\" placeholder=\"Lat min\" />
+      </div>
+      <div class=\"field\">
+        <label for=\"latMax\">Lat max</label>
+        <input id=\"latMax\" type=\"number\" step=\"0.0001\" placeholder=\"Lat max\" />
+      </div>
+      <div class=\"field\">
+        <label for=\"lonMin\">Lon min</label>
+        <input id=\"lonMin\" type=\"number\" step=\"0.0001\" placeholder=\"Lon min\" />
+      </div>
+      <div class=\"field\">
+        <label for=\"lonMax\">Lon max</label>
+        <input id=\"lonMax\" type=\"number\" step=\"0.0001\" placeholder=\"Lon max\" />
+      </div>
+      <div class=\"field\">
+        <label for=\"sort\">Сортировка</label>
+        <select id=\"sort\">
+          <option value=\"date_desc\" selected>Новые сначала</option>
+          <option value=\"date_asc\">Старые сначала</option>
+          <option value=\"img_desc\">Больше медиа</option>
+          <option value=\"img_asc\">Меньше медиа</option>
+          <option value=\"cm_desc\">Больше комментариев</option>
+          <option value=\"cm_asc\">Меньше комментариев</option>
+          <option value=\"name_asc\">Username A–Z</option>
+          <option value=\"name_desc\">Username Z–A</option>
+        </select>
+      </div>
+      <div class=\"field field--button primary\">
+        <button id=\"apply\">Применить</button>
+      </div>
+      <div class=\"field field--button secondary\">
+        <button id=\"reset\" type=\"button\">Сбросить</button>
+      </div>
     </div>
 
     <div class=\"stats\" id=\"stats\"></div>
@@ -1937,6 +2024,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
   </div>
 
   <script>
+
     const DATA = {data_json};
     const DATA_MAP = new Map();
     DATA.forEach(u => DATA_MAP.set((u.username || '').toLowerCase(), u));
@@ -1956,14 +2044,267 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     const profileGrid = document.getElementById('profileGrid');
     const profileEmpty = document.getElementById('profileEmpty');
 
+    const searchInput = document.getElementById('q');
+    const datasetSelect = document.getElementById('datasetSelect');
+    const cityInput = document.getElementById('cityInput');
+    const citySelect = document.getElementById('citySelect');
+    const cityDatalist = document.getElementById('cityOptionsList');
+    const commentInput = document.getElementById('commentInput');
+    const hasCommentsSelect = document.getElementById('hasComments');
+    const addedSelect = document.getElementById('addedSelect');
+    const dateFromInput = document.getElementById('dateFrom');
+    const dateToInput = document.getElementById('dateTo');
+    const latMinInput = document.getElementById('latMin');
+    const latMaxInput = document.getElementById('latMax');
+    const lonMinInput = document.getElementById('lonMin');
+    const lonMaxInput = document.getElementById('lonMax');
+    const sortSelect = document.getElementById('sort');
+    const applyBtn = document.getElementById('apply');
+    const resetBtn = document.getElementById('reset');
+    const statsEl = document.getElementById('stats');
+    const gridEl = document.getElementById('grid');
+
+    function debounce(fn, delay) {{
+      let timer;
+      return function() {{
+        const ctx = this, args = arguments;
+        clearTimeout(timer);
+        timer = setTimeout(function() {{ fn.apply(ctx, args); }}, delay);
+      }};
+    }}
+
+    function parseDatasetList(rawList) {{
+      const result = [];
+      if (!Array.isArray(rawList)) return result;
+      rawList.forEach(entry => {{
+        if (!entry) return;
+        if (typeof entry === 'object') {{
+          const value = (entry.value || '').toString();
+          const label = (entry.label || value).toString();
+          if (!value && !label) return;
+          result.push({{ value, label, valueLower: value.toLowerCase(), labelLower: label.toLowerCase() }});
+        }} else {{
+          const value = entry.toString();
+          if (!value) return;
+          const lower = value.toLowerCase();
+          result.push({{ value, label: value, valueLower: lower, labelLower: lower }});
+        }}
+      }});
+      return result;
+    }}
+
+    function fillSelectOptions(select, placeholder, options) {{
+      if (!select) return;
+      const frag = document.createDocumentFragment();
+      const optAll = document.createElement('option');
+      optAll.value = '';
+      optAll.textContent = placeholder;
+      frag.appendChild(optAll);
+      Object.keys(options).sort((a,b) => {{
+        const labelA = (options[a] || '').toString();
+        const labelB = (options[b] || '').toString();
+        return labelA.localeCompare(labelB, undefined, {{ sensitivity: 'accent' }});
+      }}).forEach(value => {{
+        const opt = document.createElement('option');
+        opt.value = value;
+        opt.textContent = options[value];
+        frag.appendChild(opt);
+      }});
+      select.innerHTML = '';
+      select.appendChild(frag);
+    }}
+
+    function fillDatalistOptions(datalist, options) {{
+      if (!datalist) return;
+      const frag = document.createDocumentFragment();
+      Object.keys(options).sort((a,b) => {{
+        const labelA = (options[a] || '').toString();
+        const labelB = (options[b] || '').toString();
+        return labelA.localeCompare(labelB, undefined, {{ sensitivity: 'accent' }});
+      }}).forEach(key => {{
+        const opt = document.createElement('option');
+        opt.value = options[key];
+        frag.appendChild(opt);
+      }});
+      datalist.innerHTML = '';
+      datalist.appendChild(frag);
+    }}
+
+    function parseDateValue(raw) {{
+      if (!raw && raw !== 0) return null;
+      const str = ('' + raw).trim();
+      if (!str) return null;
+      const normalized = str.includes('T') ? str : str.replace(' ', 'T');
+      let ts = Date.parse(normalized);
+      if (!Number.isFinite(ts)) {{
+        ts = Date.parse(normalized + 'Z');
+      }}
+      return Number.isFinite(ts) ? ts : null;
+    }}
+
+    function formatDateLabel(ts) {{
+      if (ts == null || !Number.isFinite(ts)) return '';
+      const d = new Date(ts);
+      if (Number.isNaN(d.getTime())) return '';
+      const y = d.getFullYear();
+      const m = String(d.getMonth()+1).padStart(2,'0');
+      const day = String(d.getDate()).padStart(2,'0');
+      return `${{y}}-${{m}}-${{day}}`;
+    }}
+
+    function formatDateInput(ts) {{
+      return formatDateLabel(ts);
+    }}
+
+    function toDateRangeValue(value, endOfDay) {{
+      if (!value) return null;
+      const str = ('' + value).trim();
+      if (!str) return null;
+      const base = str.length > 10 ? str : str + (endOfDay ? 'T23:59:59.999' : 'T00:00:00');
+      return parseDateValue(base);
+    }}
+
+    function getNewestTs(u) {{
+      if (u && u._lastTs != null) return u._lastTs;
+      if (u && u._firstTs != null) return u._firstTs;
+      return -Infinity;
+    }}
+
+    function getOldestTs(u) {{
+      if (u && u._firstTs != null) return u._firstTs;
+      if (u && u._lastTs != null) return u._lastTs;
+      return Infinity;
+    }}
+
+    function compareByName(a, b) {{
+      const nameA = (a && a.username ? a.username : '') || '';
+      const nameB = (b && b.username ? b.username : '') || '';
+      return nameA.localeCompare(nameB, undefined, {{ sensitivity: 'accent' }});
+    }}
+
+    const datasetOptions = {{}};
+    const cityOptions = {{}};
+    const addedOptions = {{}};
+
+    let globalFirstTs = null;
+    let globalLastTs = null;
+
+    DATA.forEach(u => {{
+      const comments = Array.isArray(u.comments) ? u.comments.filter(c => c !== null && c !== undefined && c !== '') : [];
+      u._commentText = comments.map(c => ('' + c).toLowerCase()).join(' ');
+      const datasetList = parseDatasetList(u.datasets);
+      u._datasetList = datasetList;
+      datasetList.forEach(ds => {{
+        if (ds.value && !datasetOptions[ds.value]) {{
+          datasetOptions[ds.value] = ds.label || ds.value;
+        }}
+      }});
+      const citiesRaw = Array.isArray(u.cities) ? u.cities : [];
+      const preparedCities = [];
+      citiesRaw.forEach(city => {{
+        const label = (city || '').toString().trim();
+        if (!label) return;
+        const lower = label.toLowerCase();
+        preparedCities.push({{ label, lower }});
+        if (!cityOptions[label]) cityOptions[label] = label;
+      }});
+      u._cityList = preparedCities;
+      u._cityText = preparedCities.map(entry => entry.lower).join(' ');
+      const addedLabel = (u.added_by || '').toString();
+      const addedKey = (u.added_by_key || addedLabel).toString().trim().toLowerCase();
+      u._addedKey = addedKey;
+      if (addedKey && !addedOptions[addedKey]) {{
+        addedOptions[addedKey] = addedLabel || addedKey;
+      }}
+      const searchParts = [];
+      const username = (u.username || '').toString();
+      if (username) searchParts.push(username.toLowerCase());
+      if (u._commentText) searchParts.push(u._commentText);
+      if (addedLabel) searchParts.push(addedLabel.toLowerCase());
+      datasetList.forEach(ds => {{
+        if (ds.labelLower) searchParts.push(ds.labelLower);
+        if (ds.valueLower) searchParts.push(ds.valueLower);
+      }});
+      preparedCities.forEach(entry => searchParts.push(entry.lower));
+      u._searchText = searchParts.join(' ');
+      const firstTs = parseDateValue(u.first_created);
+      const lastTs = parseDateValue(u.last_created);
+      u._firstTs = firstTs;
+      u._lastTs = lastTs;
+      if (firstTs != null && (globalFirstTs == null || firstTs < globalFirstTs)) globalFirstTs = firstTs;
+      if (lastTs != null && (globalLastTs == null || lastTs > globalLastTs)) globalLastTs = lastTs;
+      const firstLabel = formatDateLabel(firstTs);
+      const lastLabel = formatDateLabel(lastTs);
+      let rangeLabel = '';
+      if (firstLabel && lastLabel) {{
+        rangeLabel = firstLabel === lastLabel ? firstLabel : firstLabel + ' → ' + lastLabel;
+      }} else {{
+        rangeLabel = firstLabel || lastLabel || '';
+      }}
+      u._createdRangeLabel = rangeLabel;
+    }});
+
+    fillSelectOptions(datasetSelect, 'Все данные', datasetOptions);
+    fillSelectOptions(citySelect, 'Все города', cityOptions);
+    fillDatalistOptions(cityDatalist, cityOptions);
+    fillSelectOptions(addedSelect, 'Все добавившие', addedOptions);
+
+    const minDateLabel = formatDateInput(globalFirstTs);
+    const maxDateLabel = formatDateInput(globalLastTs);
+    if (dateFromInput) {{
+      if (minDateLabel) dateFromInput.min = minDateLabel;
+      if (maxDateLabel) dateFromInput.max = maxDateLabel;
+    }}
+    if (dateToInput) {{
+      if (minDateLabel) dateToInput.min = minDateLabel;
+      if (maxDateLabel) dateToInput.max = maxDateLabel;
+    }}
+
     function sortData(arr, mode) {{
       switch(mode) {{
-        case 'img_desc': return arr.sort((a,b)=> (b.images_count-a.images_count)||a.username.localeCompare(b.username));
-        case 'img_asc':  return arr.sort((a,b)=> (a.images_count-b.images_count)||a.username.localeCompare(b.username));
-        case 'cm_desc':  return arr.sort((a,b)=> (b.comments_count-a.comments_count)||a.username.localeCompare(b.username));
-        case 'cm_asc':   return arr.sort((a,b)=> (a.comments_count-b.comments_count)||a.username.localeCompare(b.username));
-        case 'name_desc':return arr.sort((a,b)=> b.username.localeCompare(a.username));
-        default:         return arr.sort((a,b)=> a.username.localeCompare(b.username));
+        case 'img_desc':
+          return arr.sort((a,b) => {{
+            const diff = (b.images_count || 0) - (a.images_count || 0);
+            if (diff !== 0) return diff;
+            return compareByName(a,b);
+          }});
+        case 'img_asc':
+          return arr.sort((a,b) => {{
+            const diff = (a.images_count || 0) - (b.images_count || 0);
+            if (diff !== 0) return diff;
+            return compareByName(a,b);
+          }});
+        case 'cm_desc':
+          return arr.sort((a,b) => {{
+            const diff = (b.comments_count || 0) - (a.comments_count || 0);
+            if (diff !== 0) return diff;
+            return compareByName(a,b);
+          }});
+        case 'cm_asc':
+          return arr.sort((a,b) => {{
+            const diff = (a.comments_count || 0) - (b.comments_count || 0);
+            if (diff !== 0) return diff;
+            return compareByName(a,b);
+          }});
+        case 'name_desc':
+          return arr.sort((a,b) => compareByName(b,a));
+        case 'date_desc':
+          return arr.sort((a,b) => {{
+            const aTs = getNewestTs(a);
+            const bTs = getNewestTs(b);
+            if (bTs === aTs) return compareByName(a,b);
+            return bTs - aTs;
+          }});
+        case 'date_asc':
+          return arr.sort((a,b) => {{
+            const aTs = getOldestTs(a);
+            const bTs = getOldestTs(b);
+            if (aTs === bTs) return compareByName(a,b);
+            return aTs - bTs;
+          }});
+        case 'name_asc':
+        default:
+          return arr.sort((a,b) => compareByName(a,b));
       }}
     }}
 
@@ -1979,7 +2320,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     }}
 
     function escapeHtml(s) {{
-      return (''+s).replace(/[&<>\"']/g, function(m) {{ return {{'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}}[m]; }});
+      return (''+s).replace(/[&<>"']/g, function(m) {{ return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[m]; }});
     }}
 
     function renderProfile(user, updateHash=true) {{
@@ -2075,47 +2416,64 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
 
     profileBack.addEventListener('click', () => showGallery(true));
 
-    function render(list) {{
-      const grid=document.getElementById('grid'), stats=document.getElementById('stats');
-      grid.innerHTML='';
-      let entries=0; list.forEach(u=>{{ entries += (u.images?u.images.length:0); }});
-      stats.textContent = `Users: ${{list.length}} • Entries: ${{entries}}`;
 
+    function render(list) {{
+      if (!gridEl || !statsEl) return;
+      gridEl.innerHTML='';
+      let entries=0;
       list.forEach(u=>{{
-        const images=(u.images||[]).slice(0,4);
-        const cm=(u.comments||[]);
+        const allImages = Array.isArray(u.images) ? u.images.filter(Boolean) : [];
+        const imageCount = typeof u.images_count === 'number' ? u.images_count : allImages.length;
+        const previews = allImages.slice(0,4);
+        const cm = Array.isArray(u.comments) ? u.comments : [];
+        const commentCount = typeof u.comments_count === 'number' ? u.comments_count : cm.length;
+        entries += imageCount;
         let cmHtml='';
-        if (cm.length===0) cmHtml = '<div class=\"empty\">нет комментариев</div>';
+        if (cm.length===0) cmHtml = '<div class="empty">нет комментариев</div>';
         else {{
-          const head = cm.slice(0,3).map(c=>`<li>${{escapeHtml(c)}}</li>`).join('');
-          const more = cm.length>3 ? `<div class=\"more\">и ещё ${{cm.length-3}}…</div>` : '';
-          cmHtml = `<ul>${{head}}</ul>` + more;
+          const head = cm.slice(0,3).map(c=>'<li>' + escapeHtml(c) + '</li>').join('');
+          const more = cm.length>3 ? '<div class="more">и ещё ' + (cm.length-3) + '…</div>' : '';
+          cmHtml = '<ul>' + head + '</ul>' + more;
         }}
-        const thumbs = images.map(src=>`<img src=\"${{escapeHtml(src)}}\" loading=\"lazy\">`).join('');
-        const latStr = (u.lat!=null && u.lon!=null) ? `${{u.lat.toFixed(6)}}, ${{u.lon.toFixed(6)}}` : '';
+        const thumbs = previews.map(src=>'<img src="' + escapeHtml(src) + '" loading="lazy">').join('');
+        const latStr = (u.lat!=null && u.lon!=null) ? u.lat.toFixed(6) + ', ' + u.lon.toFixed(6) : '';
         const addedBy = (()=>{{
           if (!u.added_by) return '';
           const label = escapeHtml(u.added_by);
           if (u.added_by_link) {{
-            return `<a href=\"${{escapeHtml(u.added_by_link)}}\" target=\"_blank\">${{label}}</a>`;
+            return '<a href="' + escapeHtml(u.added_by_link) + '" target="_blank">' + label + '</a>';
           }}
           return label;
         }})();
+        const chipParts=[];
+        (u._cityList || []).slice(0,3).forEach(entry=>{{
+          chipParts.push('<span class="chip chip-city">' + escapeHtml(entry.label) + '</span>');
+        }});
+        (u._datasetList || []).slice(0,3).forEach(ds=>{{
+          const label = ds.label || ds.value;
+          if (label) chipParts.push('<span class="chip chip-data">' + escapeHtml(label) + '</span>');
+        }});
+        const chipsHtml = chipParts.length ? '<div class="chips">' + chipParts.join('') + '</div>' : '';
+        const createdHtml = u._createdRangeLabel ? '<div class="meta created">Добавлено: ' + escapeHtml(u._createdRangeLabel) + '</div>' : '';
         const card = document.createElement('div');
         card.className = 'card';
         card.dataset.username = u.username || '';
-        const safeProfileUrl = escapeHtml(u.profile_url || '');
+        const profileUrl = u.profile_url || '';
+        const safeProfileUrl = escapeHtml(profileUrl);
+        const displayName = u.username ? '@' + escapeHtml(u.username) : 'Без username';
         card.innerHTML = `
-          <div class=\"head\">
-            <div class=\"name\"><a href=\"${{safeProfileUrl}}\" target=\"_blank\">@${{escapeHtml(u.username)}}</a></div>
-            <a class=\"btn\" href=\"${{safeProfileUrl}}\" target=\"_blank\">View Profile</a>
+          <div class="head">
+            <div class="name"><a href="${{safeProfileUrl}}" target="_blank">${{displayName}}</a></div>
+            <a class="btn" href="${{safeProfileUrl}}" target="_blank">View Profile</a>
           </div>
-          <div class=\"meta\">${{latStr ? latStr + ' • ' : ''}}${{u.images_count}} item(s) • ${{u.comments_count}} comment(s)</div>
-          <div class=\"meta added\">Добавил: ${{addedBy || '—'}}</div>
-          <div class=\"thumbs\">${{thumbs}}</div>
-          <div class=\"cm\">${{cmHtml}}</div>
-          <div class=\"actions\">
-            <button class=\"btn-secondary profile-btn\" type=\"button\">Открыть галерею</button>
+          <div class="meta">${{latStr ? latStr + ' • ' : ''}}${{imageCount}} item(s) • ${{commentCount}} comment(s)</div>
+          ${createdHtml}
+          ${chipsHtml}
+          <div class="meta added">Добавил: ${{addedBy || '—'}}</div>
+          <div class="thumbs">${{thumbs}}</div>
+          <div class="cm">${{cmHtml}}</div>
+          <div class="actions">
+            <button class="btn-secondary profile-btn" type="button">Открыть галерею</button>
           </div>
         `;
         const openBtn = card.querySelector('.profile-btn');
@@ -2126,32 +2484,92 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
             renderProfile(u);
           }});
         }}
-        grid.appendChild(card);
+        gridEl.appendChild(card);
       }});
+      statsEl.textContent = `Users: ${{list.length}} • Entries: ${{entries}}`;
     }}
 
     function apply() {{
-      const q=document.getElementById('q').value.trim().toLowerCase();
-      const latMin=document.getElementById('latMin').value;
-      const latMax=document.getElementById('latMax').value;
-      const lonMin=document.getElementById('lonMin').value;
-      const lonMax=document.getElementById('lonMax').value;
-      const sort=document.getElementById('sort').value;
+      const q = searchInput ? searchInput.value.trim().toLowerCase() : '';
+      const datasetValue = datasetSelect ? datasetSelect.value : '';
+      const datasetLower = datasetValue ? datasetValue.toLowerCase() : '';
+      const cityValue = citySelect ? citySelect.value : '';
+      const cityLower = cityValue ? cityValue.toLowerCase() : '';
+      const cityQuery = cityInput ? cityInput.value.trim().toLowerCase() : '';
+      const commentValue = commentInput ? commentInput.value.trim().toLowerCase() : '';
+      const hasCommentsValue = hasCommentsSelect ? hasCommentsSelect.value : '';
+      const addedValue = addedSelect ? addedSelect.value : '';
+      const fromTs = dateFromInput ? toDateRangeValue(dateFromInput.value, false) : null;
+      const toTs = dateToInput ? toDateRangeValue(dateToInput.value, true) : null;
+      const latMin = latMinInput ? latMinInput.value : '';
+      const latMax = latMaxInput ? latMaxInput.value : '';
+      const lonMin = lonMinInput ? lonMinInput.value : '';
+      const lonMax = lonMaxInput ? lonMaxInput.value : '';
+      const sortMode = sortSelect ? (sortSelect.value || 'date_desc') : 'date_desc';
 
-      let list = DATA.filter(u => (!q || u.username.toLowerCase().includes(q)) && inBbox(u,latMin,latMax,lonMin,lonMax));
-      sortData(list, sort);
+      const list = DATA.filter(u => {{
+        if (q && (!u._searchText || u._searchText.indexOf(q) === -1)) return false;
+        if (datasetLower) {{
+          const dsList = u._datasetList || [];
+          const datasetMatch = dsList.some(ds => ds.valueLower === datasetLower || ds.labelLower === datasetLower);
+          if (!datasetMatch) return false;
+        }}
+        if (cityLower) {{
+          const matchCity = (u._cityList || []).some(entry => entry.lower === cityLower);
+          if (!matchCity) return false;
+        }}
+        if (cityQuery) {{
+          if (!u._cityText || u._cityText.indexOf(cityQuery) === -1) return false;
+        }}
+        if (commentValue) {{
+          if (!u._commentText || u._commentText.indexOf(commentValue) === -1) return false;
+        }}
+        const commentCount = typeof u.comments_count === 'number' ? u.comments_count : (Array.isArray(u.comments) ? u.comments.length : 0);
+        if (hasCommentsValue === 'with' && commentCount === 0) return false;
+        if (hasCommentsValue === 'without' && commentCount > 0) return false;
+        if (addedValue && u._addedKey !== addedValue) return false;
+        if (!inBbox(u, latMin, latMax, lonMin, lonMax)) return false;
+        if (fromTs != null && getNewestTs(u) < fromTs) return false;
+        if (toTs != null && getOldestTs(u) > toTs) return false;
+        return true;
+      }});
+      sortData(list, sortMode);
       render(list);
+      return list;
     }}
 
     function reset() {{
-      document.getElementById('q').value='';
-      ['latMin','latMax','lonMin','lonMax'].forEach(id=>document.getElementById(id).value='');
-      document.getElementById('sort').value='img_desc';
+      if (searchInput) searchInput.value='';
+      if (datasetSelect) datasetSelect.value='';
+      if (cityInput) cityInput.value='';
+      if (citySelect) citySelect.value='';
+      if (commentInput) commentInput.value='';
+      if (hasCommentsSelect) hasCommentsSelect.value='';
+      if (addedSelect) addedSelect.value='';
+      if (dateFromInput) dateFromInput.value='';
+      if (dateToInput) dateToInput.value='';
+      if (latMinInput) latMinInput.value='';
+      if (latMaxInput) latMaxInput.value='';
+      if (lonMinInput) lonMinInput.value='';
+      if (lonMaxInput) lonMaxInput.value='';
+      if (sortSelect) sortSelect.value='date_desc';
       apply();
     }}
 
-    document.getElementById('apply').addEventListener('click', apply);
-    document.getElementById('reset').addEventListener('click', reset);
+    if (applyBtn) applyBtn.addEventListener('click', apply);
+    if (resetBtn) resetBtn.addEventListener('click', reset);
+
+    const debouncedApply = debounce(apply, 200);
+    if (searchInput) searchInput.addEventListener('input', debouncedApply);
+    if (cityInput) cityInput.addEventListener('input', debouncedApply);
+    if (commentInput) commentInput.addEventListener('input', debouncedApply);
+
+    [datasetSelect, citySelect, hasCommentsSelect, addedSelect, sortSelect].forEach(el => {{
+      if (el) el.addEventListener('change', apply);
+    }});
+    if (dateFromInput) dateFromInput.addEventListener('change', apply);
+    if (dateToInput) dateToInput.addEventListener('change', apply);
+
     reset();
 
     function handleHashNavigation() {{
