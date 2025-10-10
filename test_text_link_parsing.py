@@ -23,7 +23,7 @@ def vsco_module(tmp_path, monkeypatch):
     sys.modules.pop("zip_profile", None)
     vsco_bot = importlib.import_module("vsco_bot")
     vsco_bot.init_db()
-    async def _empty_playwright(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0):  # type: ignore[override]
+    async def _empty_playwright(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0, request_kwargs=None):  # type: ignore[override]
         return []
 
     async def _empty_scan(session, profile_url, **kwargs):  # type: ignore[override]
@@ -74,7 +74,7 @@ def test_profile_link_scans_direct_media(monkeypatch, vsco_module):
         "https://cdn.example.com/video1.mp4",
     ]
 
-    async def fake_scan(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0):  # type: ignore[override]
+    async def fake_scan(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0, request_kwargs=None):  # type: ignore[override]
         return assets
 
     monkeypatch.setattr(vsco_module, "playwright_scan_profile", fake_scan, raising=False)
@@ -110,7 +110,7 @@ def test_on_text_creates_profile_urls_file(monkeypatch, vsco_module):
         "https://cdn.example.com/photo2.jpg",
     ]
 
-    async def fake_playwright(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0):  # type: ignore[override]
+    async def fake_playwright(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0, request_kwargs=None):  # type: ignore[override]
         return assets
 
     monkeypatch.setattr(vsco_module, "playwright_scan_profile", fake_playwright, raising=False)

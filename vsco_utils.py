@@ -22,6 +22,10 @@ except Exception:  # pragma: no cover - optional dependency
 
 VSCO_LOGO_MARKERS = ("vsco-logo-white",)
 
+DEFAULT_HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; VSCO-Bot/1.0; +https://example.org/bot)",
+}
+
 # --- Domains & regexes shared between the bot and the ZIP helper ---
 VSCO_HOSTS = {"vsco.co", "www.vsco.co"}
 VSCO_SHORT_HOSTS = {"vs.co", "www.vs.co"}
@@ -44,6 +48,12 @@ INLINE_IMG_RE = re.compile(
     r'https://[^"\']+\.(?:jpg|jpeg|png|webp)(?:\?[^"\']*)?',
     re.IGNORECASE,
 )
+
+_SITE_ID_RE_LIST = [
+    re.compile(r'"site_id"\s*:\s*(\d+)', re.IGNORECASE),
+    re.compile(r'data-site-id=["\'](\d+)["\']', re.IGNORECASE),
+    re.compile(r'\bsiteId\s*:\s*(\d+)\b', re.IGNORECASE),
+]
 
 
 def is_vsco_logo_url(url: Optional[str]) -> bool:
@@ -134,6 +144,109 @@ def dedupe_keep_order(items: Iterable[str]) -> list[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+def _extract_site_id_from_html(html: str) -> Optional[str]:
+    """Try to locate the VSCO ``site_id`` marker within the HTML markup."""
+
+    if not html:
+        return None
+    for rx in _SITE_ID_RE_LIST:
+        match = rx.search(html)
+        if match:
+            return match.group(1)
+    return None
+
+
+async def _fetch_vsco_api_media(
+    session,
+    site_id: str,
+    *,
+    max_width: int = 2048,
+    limit: int = 0,
+    logger: Optional[logging.Logger] = None,
+) -> list[str]:
+    """Collect media URLs from the public VSCO API using ``site_id``."""
+
+    if not site_id:
+        return []
+
+    page = 1
+    size = 100
+    urls: list[str] = []
+
+    while True:
+        if limit and len(urls) >= limit:
+            break
+
+        api_url = f"https://vsco.co/api/2.0/medias?site_id={site_id}&page={page}&size={size}"
+        try:
+            async with session.get(
+                api_url,
+                allow_redirects=True,
+                timeout=15,
+                headers=DEFAULT_HTTP_HEADERS,
+            ) as resp:
+                if resp.status != 200:
+                    if logger is not None:
+                        logger.debug(
+                            "_fetch_vsco_api_media: non-200 status=%s site_id=%s page=%s",
+                            resp.status,
+                            site_id,
+                            page,
+                        )
+                    break
+                data = await resp.json(content_type=None)
+        except Exception as exc:
+            if logger is not None:
+                logger.warning(
+                    "_fetch_vsco_api_media: request failed for site_id=%s page=%s: %s",
+                    site_id,
+                    page,
+                    exc,
+                )
+            break
+
+        items = (data or {}).get("medias") or (data or {}).get("media") or []
+        if not items:
+            break
+
+        for item in items:
+            candidates = []
+            if isinstance(item, dict):
+                candidates.extend(
+                    c
+                    for c in [
+                        item.get("responsive_url"),
+                        item.get("image", {}).get("cdn_url"),
+                        item.get("image", {}).get("url"),
+                        item.get("image", {}).get("path"),
+                        item.get("url"),
+                    ]
+                    if isinstance(c, str)
+                )
+                variants = item.get("images") or item.get("variants") or []
+                if isinstance(variants, list):
+                    for variant in variants:
+                        if isinstance(variant, dict):
+                            vu = variant.get("url") or variant.get("cdn_url")
+                            if isinstance(vu, str):
+                                candidates.append(vu)
+
+            for candidate in candidates:
+                normalized = normalize_media_url(candidate)
+                if not normalized:
+                    continue
+                final = upscale_w_param(normalized, max_width)
+                if is_media_url(final) and not is_vsco_logo_url(final):
+                    urls.append(final)
+
+        page += 1
+
+    urls = dedupe_keep_order(urls)
+    if limit and len(urls) > limit:
+        urls = urls[:limit]
+    return urls
 
 
 def generate_media_filename(url: str, idx: int, *, default_ext: str = "jpg") -> str:
@@ -355,6 +468,8 @@ async def scan_profile_media(
     kwargs = {"allow_redirects": True}
     if request_kwargs:
         kwargs.update(request_kwargs)
+    kwargs.setdefault("headers", DEFAULT_HTTP_HEADERS)
+    kwargs.setdefault("timeout", 15)
 
     try:
         async with session.get(profile_url, **kwargs) as resp:
@@ -377,8 +492,25 @@ async def scan_profile_media(
                 fallback.append(final_url)
         urls = dedupe_keep_order(fallback)
 
+    urls = dedupe_keep_order(urls)
     if limit and len(urls) > limit:
         urls = urls[:limit]
+
+    site_id = _extract_site_id_from_html(html)
+    should_try_api = bool(site_id) and (not limit or len(urls) < limit)
+    if should_try_api:
+        api_urls = await _fetch_vsco_api_media(
+            session,
+            site_id or "",
+            max_width=max_width,
+            limit=limit,
+            logger=logger,
+        )
+        if api_urls:
+            combined = dedupe_keep_order(urls + api_urls)
+            if limit and len(combined) > limit:
+                combined = combined[:limit]
+            urls = combined
 
     return urls
 
@@ -391,6 +523,7 @@ async def playwright_scan_profile(
     logger: Optional[logging.Logger] = None,
     delay: float = 0.4,
     target_count: int = 0,
+    request_kwargs: Optional[dict] = None,
 ) -> list[str]:
     """Extract profile media via Playwright with graceful HTTP fallback."""
 
@@ -407,7 +540,9 @@ async def playwright_scan_profile(
                 session,
                 profile_url,
                 max_width=max_width,
+                limit=target_count if target_count else 0,
                 logger=logger,
+                request_kwargs=request_kwargs,
             )
         return []
 
@@ -534,7 +669,9 @@ async def playwright_scan_profile(
             session,
             gallery_url,
             max_width=max_width,
+            limit=target_count if target_count else 0,
             logger=logger,
+            request_kwargs=request_kwargs,
         )
     return []
 
