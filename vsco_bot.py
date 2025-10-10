@@ -3720,8 +3720,11 @@ async def on_export_click(cq: CallbackQuery):
                 subtitle=("All DB" if ses.export_scope=='all' else "Current Chat"))
             out = ses.dir / f"export_gallery_{ses.export_scope}.html"
             out.write_text(html, encoding="utf-8")
-            await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
-                caption=f"Галерея ({'вся база' if ses.export_scope=='all' else 'текущий чат'})")
+            await cq.message.answer_document(
+                FSInputFile(out),
+                caption=f"Галерея ({'вся база' if ses.export_scope=='all' else 'текущий чат'})",
+                request_timeout=SEND_TIMEOUT,
+            )
             return
 
         if fmt in ("map_users","map","map_images"):
@@ -3743,8 +3746,11 @@ async def on_export_click(cq: CallbackQuery):
                 out = ses.dir / f"export_map_images_{ses.export_scope}.html"
 
             out.write_text(html, encoding="utf-8")
-            await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
-                caption=f"Карта ({'вся база' if ses.export_scope=='all' else 'текущий чат'})")
+            await cq.message.answer_document(
+                FSInputFile(out),
+                caption=f"Карта ({'вся база' if ses.export_scope=='all' else 'текущий чат'})",
+                request_timeout=SEND_TIMEOUT,
+            )
             return
 
         await cq.answer("Неизвестный формат", show_alert=True); return
@@ -3927,8 +3933,11 @@ async def on_links_click(cq: CallbackQuery):
                         "added_by": r[4],
                     }
                 )
-        await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
-                                         caption=f"Ссылки за день — {('вся база' if ses.export_scope=='all' else 'текущий чат')}: {total} шт.")
+        await cq.message.answer_document(
+            FSInputFile(out),
+            caption=f"Ссылки за день — {('вся база' if ses.export_scope=='all' else 'текущий чат')}: {total} шт.",
+            request_timeout=SEND_TIMEOUT,
+        )
         await cq.answer("CSV готово")
         return
     else:
