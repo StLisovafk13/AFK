@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import csv
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -65,6 +67,8 @@ class ExportManager:
 
     def __init__(self, deps: ExportDependencies) -> None:
         self._deps = deps
+        self._zip_trigger_size = int(os.environ.get("VSCO_EXPORT_ZIP_THRESHOLD", 45 * 1024 * 1024))
+        self._telegram_limit = 50 * 1024 * 1024
         self.router = Router()
         self.router.message(Command("export"))(self._cmd_export_handler)
         self.router.callback_query(F.data.startswith("export:"))(self.on_export_click)
@@ -218,10 +222,11 @@ class ExportManager:
         )
         output = session.dir / f"export_gallery_{session.export_scope}.html"
         output.write_text(html, encoding="utf-8")
-        await cq.message.answer_document(
-            FSInputFile(output),
-            caption=f"Галерея ({'вся база' if session.export_scope == 'all' else 'текущий чат'})",
-            request_timeout=self._deps.send_timeout,
+        await self._send_path_document(
+            cq,
+            output,
+            base_caption=f"Галерея ({'вся база' if session.export_scope == 'all' else 'текущий чат'})",
+            allow_zip=True,
         )
 
     async def _export_map(self, cq: CallbackQuery, session: SessionLike, chat_id: int, fmt: str) -> None:
@@ -246,8 +251,66 @@ class ExportManager:
             output = session.dir / f"export_map_images_{session.export_scope}.html"
 
         output.write_text(html, encoding="utf-8")
+        await self._send_path_document(
+            cq,
+            output,
+            base_caption=f"Карта ({'вся база' if session.export_scope == 'all' else 'текущий чат'})",
+            allow_zip=(fmt == "map_images"),
+        )
+
+    async def _send_path_document(
+        self,
+        cq: CallbackQuery,
+        path: Path,
+        *,
+        base_caption: str,
+        allow_zip: bool,
+    ) -> None:
+        """Send a file from disk, compressing if it exceeds Telegram limits."""
+
+        prepared, zipped = self._prepare_document_for_sending(path, allow_zip=allow_zip)
+        if prepared is None:
+            warning = (
+                "Файл экспорта слишком большой для отправки через Telegram. "
+                "Попробуйте сузить область или отфильтруйте данные."
+            )
+            await cq.answer(warning, show_alert=True)
+            try:
+                await cq.message.answer(warning)
+            except Exception:
+                pass
+            return
+
+        caption = base_caption + (" (ZIP)" if zipped else "")
         await cq.message.answer_document(
-            FSInputFile(output),
-            caption=f"Карта ({'вся база' if session.export_scope == 'all' else 'текущий чат'})",
+            FSInputFile(prepared),
+            caption=caption,
             request_timeout=self._deps.send_timeout,
         )
+
+    def _prepare_document_for_sending(
+        self, path: Path, *, allow_zip: bool
+    ) -> Tuple[Optional[Path], bool]:
+        """Ensure that a file fits into Telegram limits, optionally zipping it."""
+
+        size = path.stat().st_size
+        if size < self._telegram_limit and (size <= self._zip_trigger_size or not allow_zip):
+            return path, False
+
+        if size >= self._telegram_limit and not allow_zip:
+            return None, False
+
+        if not allow_zip:
+            return path if size < self._telegram_limit else None, False
+
+        zipped_path = path.with_suffix(path.suffix + ".zip")
+        if zipped_path.exists():
+            zipped_path.unlink()
+        with ZipFile(zipped_path, "w", compression=ZIP_DEFLATED, compresslevel=9) as zf:
+            zf.write(path, arcname=path.name)
+
+        zipped_size = zipped_path.stat().st_size
+        if zipped_size >= self._telegram_limit:
+            return None, False
+
+        return zipped_path, True
