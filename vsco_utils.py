@@ -557,6 +557,7 @@ async def playwright_scan_profile(
         root = getattr(page, "url", None) or gallery_url
         return extract_media_urls_from_html(html, max_width=max_width, root=root)
 
+    collected: list[str] = []
     try:
         async with async_playwright() as playwright:
             browser = await playwright.chromium.launch(headless=True)
@@ -564,9 +565,9 @@ async def playwright_scan_profile(
             page = await context.new_page()
             await page.goto(gallery_url, wait_until="networkidle")
 
-            urls = dedupe_keep_order(await _extract_current_urls())
-            if logger is not None and urls:
-                logger.info("playwright_scan_profile: initial %d asset(s)", len(urls))
+            collected = dedupe_keep_order(await _extract_current_urls())
+            if logger is not None and collected:
+                logger.info("playwright_scan_profile: initial %d asset(s)", len(collected))
 
             max_scrolls = 120
             stagnation_limit = 5
@@ -574,7 +575,7 @@ async def playwright_scan_profile(
             max_clicks = 500
             load_clicks = 0
             stagnation = 0
-            prev_count = len(urls)
+            prev_count = len(collected)
 
             for _ in range(max_scrolls):
                 btn = page.locator("#loadMore-Button").first
@@ -626,11 +627,11 @@ async def playwright_scan_profile(
                 await page.wait_for_timeout(int(max(0.1, delay) * 1000))
 
                 extracted = dedupe_keep_order(await _extract_current_urls())
-                combined = dedupe_keep_order(urls + extracted)
+                combined = dedupe_keep_order(collected + extracted)
                 new_count = len(combined)
                 if logger is not None and new_count > prev_count:
                     logger.info("playwright_scan_profile: progress %d", new_count)
-                urls = combined
+                collected = combined
 
                 if target_count and new_count >= target_count:
                     break
@@ -647,8 +648,6 @@ async def playwright_scan_profile(
                     break
                 if not clicked and stagnation >= stagnation_limit:
                     break
-
-            return urls
     except Exception as exc:
         if logger is not None:
             logger.warning(
@@ -665,7 +664,7 @@ async def playwright_scan_profile(
                 pass
 
     if session is not None:
-        return await scan_profile_media(
+        fallback_urls = await scan_profile_media(
             session,
             gallery_url,
             max_width=max_width,
@@ -673,5 +672,12 @@ async def playwright_scan_profile(
             logger=logger,
             request_kwargs=request_kwargs,
         )
-    return []
+        if collected:
+            combined = dedupe_keep_order(collected + fallback_urls)
+            if target_count and len(combined) > target_count:
+                combined = combined[:target_count]
+            return combined
+        return fallback_urls
+
+    return collected
 
