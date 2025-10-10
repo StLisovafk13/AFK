@@ -75,6 +75,7 @@ import shlex
 from vsco_parser import parse_html_file, dedupe_rows
 
 from zip_profile import zip_router
+from vsco_export import ExportDependencies, ExportManager
 from vsco_utils import (
     VSCO_HOSTS,
     VSCO_PERCEPTION_HOSTS,
@@ -3400,6 +3401,23 @@ def get_session(chat_id: int) -> Session:
         _sessions[chat_id] = Session(chat_id=chat_id, dir=p)
     return _sessions[chat_id]
 
+
+export_manager = ExportManager(
+    ExportDependencies(
+        send_timeout=SEND_TIMEOUT,
+        ensure_user_has_access=ensure_user_has_access,
+        ensure_callback_access=ensure_callback_access,
+        has_daily_data_access=has_daily_data_access,
+        get_session=get_session,
+        fetch_gallery_users=fetch_gallery_users,
+        fetch_items_for_map=fetch_items_for_map,
+        build_rich_gallery=build_rich_gallery,
+        build_map_users=build_map_users,
+        build_map_images=build_map_images,
+    )
+)
+dp.include_router(export_manager.router)
+
 @dp.message(F.document)
 async def on_document(msg: Message):
     if not await ensure_user_has_access(msg):
@@ -3562,7 +3580,7 @@ async def on_text(msg: Message):
         if msg.chat.type in ("group", "supergroup"):
             await msg.answer("Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.")
             return
-        await cmd_export(msg, user_id=getattr(msg.from_user, "id", None))
+        await export_manager.open_menu(msg, user_id=getattr(msg.from_user, "id", None))
         return
 
     if text == "🔗 Ссылки за 24ч":
@@ -3598,158 +3616,6 @@ async def on_text(msg: Message):
     await msg.answer(
         f"Найдено VSCO-ссылок: {len(pairs)}, добавлено записей: {ai}, комментариев: {ac}{links_block}{notice_block}"
     )
-
-# ---------- export ----------
-def export_scope_keyboard(ses: Session) -> InlineKeyboardMarkup:
-    scope = [
-        InlineKeyboardButton(text=("✅ 📌 Текущий чат" if ses.export_scope=="chat" else "📌 Текущий чат"), callback_data="export:scope:chat"),
-        InlineKeyboardButton(text=("✅ 🌐 Вся база" if ses.export_scope=="all" else "🌐 Вся база"), callback_data="export:scope:all"),
-    ]
-    types = [
-        InlineKeyboardButton(text="📄 CSV", callback_data="export:format:csv"),
-        InlineKeyboardButton(text="🖼️ Галерея", callback_data="export:format:gallery"),
-    ]
-    maps = [
-        InlineKeyboardButton(text="🗺️ Карта (польз.)", callback_data="export:format:map_users"),
-        InlineKeyboardButton(text="🗺️ Карта (фото)", callback_data="export:format:map_images"),
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=[scope, types, maps])
-
-
-def kb_struct(kb: InlineKeyboardMarkup | None):
-    """Normalize keyboard for safe equality check."""
-    if kb is None:
-        return None
-    return tuple(
-        tuple(
-            (btn.text, getattr(btn, "callback_data", None), getattr(btn, "url", None))
-            for btn in row
-        )
-        for row in kb.inline_keyboard
-    )
-
-@dp.message(Command("export"))
-async def cmd_export(msg: Message, user_id: Optional[int] = None):
-    if not await ensure_user_has_access(msg, user_id=user_id):
-        return
-
-    if msg.chat.type in ("group", "supergroup"):
-        await msg.answer("🚫 Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.")
-        return
-    allowed, info = has_daily_data_access(msg.chat.id, getattr(msg.from_user, "id", None))
-    if not allowed:
-        await msg.answer(info)
-        return
-    ses = get_session(msg.chat.id)
-    await msg.answer(
-        "Экспорт VSCO:\n• CSV / Галерея\n• Карта: по пользователям или по фото",
-        reply_markup=export_scope_keyboard(ses)
-    )
-
-@dp.callback_query(F.data.startswith("export:"))
-async def on_export_click(cq: CallbackQuery):
-    if not await ensure_callback_access(cq):
-        return
-
-    chat_id = cq.message.chat.id
-    if cq.message.chat.type in ("group", "supergroup"):
-        await cq.answer("Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.", show_alert=True)
-        return
-    allowed, info = has_daily_data_access(chat_id, getattr(cq.from_user, "id", None))
-    if not allowed:
-        await cq.answer(info, show_alert=True)
-        try:
-            await cq.message.answer(info)
-        except Exception:
-            pass
-        return
-    ses = get_session(chat_id)
-    parts = cq.data.split(":")
-    if len(parts)>=3 and parts[1]=="scope":
-        scope = parts[2]
-        if scope in ("chat","all"):
-            ses.export_scope = scope
-            new_kb = export_scope_keyboard(ses)
-            # safe edit: only if changed
-            if kb_struct(cq.message.reply_markup) != kb_struct(new_kb):
-                try:
-                    await cq.message.edit_reply_markup(reply_markup=new_kb)
-                except TelegramBadRequest as e:
-                    if "message is not modified" not in str(e).lower():
-                        raise
-            await cq.answer("Область обновлена")
-        else:
-            await cq.answer("Неизвестная область", show_alert=True)
-        return
-
-    if len(parts)>=3 and parts[1]=="format":
-        fmt = parts[2]
-        if fmt == "csv":
-            users = fetch_gallery_users(ses.export_scope, chat_id)
-            if not users:
-                await cq.answer("Нет данных", show_alert=True)
-                return
-            await cq.answer("Готовлю экспорт…", cache_time=0)
-            flat = [{
-                "username": u["username"], "profile_url": u["profile_url"],
-                "lat": u["lat"], "lon": u["lon"],
-                "images_count": u["images_count"], "comments_count": u["comments_count"],
-                "comments": " | ".join(u["comments"]),
-                "added_by": u.get("added_by_raw", ""),
-                "added_by_display": u.get("added_by", ""),
-                "added_by_link": u.get("added_by_link", ""),
-            } for u in users]
-            out = ses.dir / f"export_{ses.export_scope}.csv"
-            fieldnames = list(flat[0].keys()) if flat else []
-            with out.open("w", encoding="utf-8", newline="") as fh:
-                writer = csv.DictWriter(fh, fieldnames=fieldnames)
-                writer.writeheader()
-                for row in flat:
-                    writer.writerow(row)
-            await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
-                caption=f"CSV ({'вся база' if ses.export_scope=='all' else 'текущий чат'})")
-            return
-
-        if fmt == "gallery":
-            users = fetch_gallery_users(ses.export_scope, chat_id)
-            if not users:
-                await cq.answer("Нет данных", show_alert=True)
-                return
-            await cq.answer("Готовлю экспорт…", cache_time=0)
-            html = build_rich_gallery(users, title="VSCO Gallery",
-                subtitle=("All DB" if ses.export_scope=='all' else "Current Chat"))
-            out = ses.dir / f"export_gallery_{ses.export_scope}.html"
-            out.write_text(html, encoding="utf-8")
-            await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
-                caption=f"Галерея ({'вся база' if ses.export_scope=='all' else 'текущий чат'})")
-            return
-
-        if fmt in ("map_users","map","map_images"):
-            if fmt in ("map","map_users"):
-                users = fetch_gallery_users(ses.export_scope, chat_id)
-                if not users:
-                    await cq.answer("Нет данных", show_alert=True)
-                    return
-                await cq.answer("Готовлю экспорт…", cache_time=0)
-                html = build_map_users(users, title=f"VSCO Profiles — {'Users' if fmt!='map_images' else 'Images'}")
-                out = ses.dir / f"export_map_users_{ses.export_scope}.html"
-            else:
-                items = fetch_items_for_map(ses.export_scope, chat_id)
-                if not items:
-                    await cq.answer("Нет данных", show_alert=True)
-                    return
-                await cq.answer("Готовлю экспорт…", cache_time=0)
-                html = build_map_images(items, title="VSCO Profiles — Images")
-                out = ses.dir / f"export_map_images_{ses.export_scope}.html"
-
-            out.write_text(html, encoding="utf-8")
-            await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
-                caption=f"Карта ({'вся база' if ses.export_scope=='all' else 'текущий чат'})")
-            return
-
-        await cq.answer("Неизвестный формат", show_alert=True); return
-
-    await cq.answer("Неизвестное действие", show_alert=True)
 
 # ---------- stats ----------
 def stats_scope_keyboard(ses: Session) -> InlineKeyboardMarkup:
@@ -3927,8 +3793,11 @@ async def on_links_click(cq: CallbackQuery):
                         "added_by": r[4],
                     }
                 )
-        await cq.message.answer_document(BufferedInputFile(out.read_bytes(), filename=out.name),
-                                         caption=f"Ссылки за день — {('вся база' if ses.export_scope=='all' else 'текущий чат')}: {total} шт.")
+        await cq.message.answer_document(
+            FSInputFile(out),
+            caption=f"Ссылки за день — {('вся база' if ses.export_scope=='all' else 'текущий чат')}: {total} шт.",
+            request_timeout=SEND_TIMEOUT,
+        )
         await cq.answer("CSV готово")
         return
     else:
@@ -5071,7 +4940,8 @@ async def on_menu_click(cq: CallbackQuery):
         if cq.message and cq.message.chat.type in ("group", "supergroup"):
             await cq.answer("Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.", show_alert=True)
             return
-        await cmd_export(cq.message, user_id=getattr(cq.from_user, "id", None))
+        if cq.message is not None:
+            await export_manager.open_menu(cq.message, user_id=getattr(cq.from_user, "id", None))
         await cq.answer("Открываю экспорт")
         return
 
