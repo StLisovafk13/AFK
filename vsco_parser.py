@@ -10,9 +10,17 @@ Supports:
 
 import argparse, json, re
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
-from bs4 import BeautifulSoup
-import pandas as pd
+from typing import Dict, List, Optional, Tuple
+
+try:  # pragma: no cover - optional dependency for HTML parsing
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:  # pragma: no cover - executed when dependency is absent
+    BeautifulSoup = None  # type: ignore
+
+try:  # pragma: no cover - optional dependency for Excel helpers
+    import pandas as pd  # type: ignore
+except Exception:  # pragma: no cover - executed when dependency is absent
+    pd = None  # type: ignore
 
 
 def split_coords(s: str) -> Tuple[Optional[float], Optional[float]]:
@@ -65,6 +73,8 @@ def _extract_users_from_script(html: str) -> List[Dict[str, object]]:
 
 
 def parse_html_file(path: Path) -> List[Dict[str, object]]:
+    if BeautifulSoup is None:
+        raise RuntimeError("BeautifulSoup is required to parse HTML. Install bs4 to enable this feature.")
     html = path.read_text(encoding="utf-8", errors="ignore")
     soup = BeautifulSoup(html, "html.parser")
     rows: List[Dict[str, object]] = []
@@ -125,12 +135,16 @@ def parse_html_file(path: Path) -> List[Dict[str, object]]:
 
 
 def write_excel(rows: List[Dict[str, object]], out_path: Path, sheet: str = "data"):
+    if pd is None:
+        raise RuntimeError("pandas is required to export Excel files. Install pandas to enable this feature.")
     df = pd.DataFrame(rows, columns=["username", "latitude", "longitude", "profile_url", "image_url"])
     with pd.ExcelWriter(Path(out_path), engine="openpyxl") as w:
         df.to_excel(w, sheet_name=sheet, index=False)
 
 
 def read_excel(xlsx_path: Path, sheet: str = "data") -> List[Dict[str, object]]:
+    if pd is None:
+        raise RuntimeError("pandas is required to read Excel files. Install pandas to enable this feature.")
     df = pd.read_excel(xlsx_path, sheet_name=sheet)
     for col in ["username", "latitude", "longitude"]:
         if col not in df.columns:
