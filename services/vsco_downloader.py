@@ -42,7 +42,7 @@ from typing import List, Dict, Any, Optional, Tuple, NamedTuple
 
 from urllib.parse import urlsplit
 
-from vsco_utils import (
+from core.vsco_utils import (
     dedupe_keep_order,
     extract_media_urls_from_html,
     generate_media_filename,
