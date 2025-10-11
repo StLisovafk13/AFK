@@ -3420,7 +3420,11 @@ dp.include_router(export_manager.router)
 
 @dp.message(F.document)
 async def on_document(msg: Message):
-    if not await ensure_user_has_access(msg):
+    doc = msg.document
+    low_name = (doc.file_name or "").lower()
+    is_html_upload = low_name.endswith((".html", ".htm"))
+
+    if not is_html_upload and not await ensure_user_has_access(msg):
         return
 
     ses = get_session(msg.chat.id)
@@ -3442,8 +3446,8 @@ async def on_document(msg: Message):
         )
         added_items += ai; added_comments += ac; new_links.extend(links)
 
-    p = ses.dir / (msg.document.file_name or "file.bin")
-    await msg.bot.download(msg.document, destination=p)
+    p = ses.dir / (doc.file_name or "file.bin")
+    await msg.bot.download(doc, destination=p)
     low = (p.name or "").lower()
 
     if low.endswith(".csv"):
