@@ -20,7 +20,7 @@ def vsco_module(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_ADMIN_IDS", "42, 99")
 
     sys.modules.pop("vsco_bot", None)
-    sys.modules.pop("zip_profile", None)
+    sys.modules.pop("services.zip_profile", None)
     vsco_bot = importlib.import_module("vsco_bot")
     vsco_bot.init_db()
     async def _empty_playwright(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0):  # type: ignore[override]

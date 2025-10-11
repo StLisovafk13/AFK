@@ -18,7 +18,7 @@ from aiogram import Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import Message, BufferedInputFile
 
-from vsco_utils import (
+from core.vsco_utils import (
     build_perception_gallery_url,
     dedupe_keep_order,
     extract_vsco_media_urls,
