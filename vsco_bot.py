@@ -2321,14 +2321,20 @@ async def _enqueue_download_request(
         return False
 
     ses = get_session(msg.chat.id)
-    out_base = ses.dir / "downloads"
-    out_base.mkdir(parents=True, exist_ok=True)
+    downloads_root = ses.dir / "downloads"
+    downloads_root.mkdir(parents=True, exist_ok=True)
 
     global _DL_QUEUE, _DL_COUNTER
     if _DL_QUEUE is None:
         _DL_QUEUE = asyncio.Queue()
 
     _DL_COUNTER += 1
+
+    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    username_part = username_hint or "profile"
+    username_part = re.sub(r"[^a-z0-9_-]+", "_", username_part.lower()).strip("_") or "profile"
+    out_base = downloads_root / f"job_{_DL_COUNTER:04d}_{username_part}_{ts}"
+    out_base.mkdir(parents=True, exist_ok=True)
     safe_flags = [f for f in extra_flags if f.startswith("--")]
     requested_by = resolve_added_by(msg.from_user)
     job = DLJob(
