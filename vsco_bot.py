@@ -3543,16 +3543,16 @@ async def on_document(msg: Message):
 # ---------- plain text ----------
 @dp.message(F.text & ~F.text.startswith("/"))
 async def on_text(msg: Message):
-    if not await ensure_user_has_access(msg):
-        return
-
-    ses = get_session(msg.chat.id)
     text = (msg.text or "").strip()
 
     if not text:
         return
 
+    ses = get_session(msg.chat.id)
+
     if ses.pending_action == "download":
+        if not await ensure_user_has_access(msg):
+            return
         parts = text.split()
         target = parts[0]
         extra_flags = [p for p in parts[1:] if p.startswith("--")]
@@ -3566,6 +3566,8 @@ async def on_text(msg: Message):
         return
 
     if text == "📥 Скачать профиль":
+        if not await ensure_user_has_access(msg):
+            return
         if msg.chat.type in ("group", "supergroup"):
             await msg.answer("Скачивание доступно только в личных сообщениях. Напишите мне в ЛС.")
             return
@@ -3577,6 +3579,8 @@ async def on_text(msg: Message):
         return
 
     if text == "📤 Экспорт":
+        if not await ensure_user_has_access(msg):
+            return
         if msg.chat.type in ("group", "supergroup"):
             await msg.answer("Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.")
             return
@@ -3584,23 +3588,32 @@ async def on_text(msg: Message):
         return
 
     if text == "🔗 Ссылки за 24ч":
+        if not await ensure_user_has_access(msg):
+            return
         await cmd_links(msg, user_id=getattr(msg.from_user, "id", None))
         return
 
     if text == "📈 Статистика":
+        if not await ensure_user_has_access(msg):
+            return
         await cmd_stats(msg, user_id=getattr(msg.from_user, "id", None))
         return
 
     if text == "📊 Очередь":
+        if not await ensure_user_has_access(msg):
+            return
         await cmd_qstat(msg, user_id=getattr(msg.from_user, "id", None))
         return
 
     if text == "📚 Туториал":
+        if not await ensure_user_has_access(msg):
+            return
         await cmd_tutorial(msg, user_id=getattr(msg.from_user, "id", None))
         return
 
     pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_message(text, msg.entities))
     if not pairs:
+        await ensure_user_has_access(msg)
         return  # без ответа
     profile_files = persist_profile_media_urls(pairs, ses.dir)
     added_by = resolve_added_by(msg.from_user)
