@@ -1297,7 +1297,12 @@ def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_f
         conn.close()
 
 
-def ingest_download_results(job: "DLJob", user_dir: Path) -> Tuple[int, bool]:
+def ingest_download_results(
+    job: "DLJob",
+    user_dir: Path,
+    *,
+    min_mtime: float | None = None,
+) -> Tuple[int, bool]:
     """Ingest downloaded VSCO media links from the downloader manifest into the DB.
 
     Returns a tuple ``(items_added, profile_link_added)``.
@@ -1312,37 +1317,69 @@ def ingest_download_results(job: "DLJob", user_dir: Path) -> Tuple[int, bool]:
     manifest_meta: Dict[str, Any] = {}
     items_data: List[Dict[str, Any]] = []
 
+    manifest_ok = False
+    urls_ok = False
     if manifest_path.exists():
         try:
-            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except Exception:
-            log.warning("Job #%s: failed to read manifest %s", job.id, manifest_path)
-        else:
-            if isinstance(raw, dict):
-                manifest_meta = raw
-                maybe_items = raw.get("items")
-                if isinstance(maybe_items, list):
-                    items_data = [x for x in maybe_items if isinstance(x, dict)]
-            elif isinstance(raw, list):
-                items_data = [x for x in raw if isinstance(x, dict)]
-            log.debug(
-                "ingest_download_results: manifest loaded items=%d",
-                len(items_data),
+            mtime = manifest_path.stat().st_mtime
+        except FileNotFoundError:
+            mtime = None
+        if min_mtime is not None and (mtime is None or mtime < min_mtime):
+            log.info(
+                "Job #%s: ignore manifest older than cutoff (mtime=%.3f, cutoff=%.3f)",
+                job.id,
+                mtime or -1.0,
+                min_mtime,
             )
+        else:
+            try:
+                raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                log.warning("Job #%s: failed to read manifest %s", job.id, manifest_path)
+            else:
+                manifest_ok = True
+                if isinstance(raw, dict):
+                    manifest_meta = raw
+                    maybe_items = raw.get("items")
+                    if isinstance(maybe_items, list):
+                        items_data = [x for x in maybe_items if isinstance(x, dict)]
+                elif isinstance(raw, list):
+                    items_data = [x for x in raw if isinstance(x, dict)]
+                log.debug(
+                    "ingest_download_results: manifest loaded items=%d",
+                    len(items_data),
+                )
 
     if not items_data:
         urls_path = user_dir / "urls_extracted.txt"
         if urls_path.exists():
             try:
-                urls = [line.strip() for line in urls_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-            except Exception:
-                urls = []
-            if urls:
-                items_data = [{"url": u, "ok": True} for u in urls]
-                log.debug(
-                    "ingest_download_results: fallback to urls_extracted.txt entries=%d",
-                    len(items_data),
+                urls_mtime = urls_path.stat().st_mtime
+            except FileNotFoundError:
+                urls_mtime = None
+            if min_mtime is not None and (urls_mtime is None or urls_mtime < min_mtime):
+                log.info(
+                    "Job #%s: ignore urls_extracted older than cutoff (mtime=%.3f, cutoff=%.3f)",
+                    job.id,
+                    urls_mtime or -1.0,
+                    min_mtime,
                 )
+            else:
+                try:
+                    urls = [
+                        line.strip()
+                        for line in urls_path.read_text(encoding="utf-8").splitlines()
+                        if line.strip()
+                    ]
+                except Exception:
+                    urls = []
+                if urls:
+                    urls_ok = True
+                    items_data = [{"url": u, "ok": True} for u in urls]
+                    log.debug(
+                        "ingest_download_results: fallback to urls_extracted.txt entries=%d",
+                        len(items_data),
+                    )
 
     username = _extract_username_from_target(job.target)
     if not username:
@@ -1389,6 +1426,8 @@ def ingest_download_results(job: "DLJob", user_dir: Path) -> Tuple[int, bool]:
     username = (username or "").strip().lstrip("@")
     profile_url = (profile_url or "").strip()
 
+    if not manifest_ok and not urls_ok:
+        log.info("Job #%s: no fresh manifest/urls to ingest", job.id)
     if not username and not profile_url:
         log.info("Job #%s: skipped DB ingest — username/profile unresolved", job.id)
         return (0, False)
@@ -2321,20 +2360,14 @@ async def _enqueue_download_request(
         return False
 
     ses = get_session(msg.chat.id)
-    downloads_root = ses.dir / "downloads"
-    downloads_root.mkdir(parents=True, exist_ok=True)
+    out_base = ses.dir / "downloads"
+    out_base.mkdir(parents=True, exist_ok=True)
 
     global _DL_QUEUE, _DL_COUNTER
     if _DL_QUEUE is None:
         _DL_QUEUE = asyncio.Queue()
 
     _DL_COUNTER += 1
-
-    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    username_part = username_hint or "profile"
-    username_part = re.sub(r"[^a-z0-9_-]+", "_", username_part.lower()).strip("_") or "profile"
-    out_base = downloads_root / f"job_{_DL_COUNTER:04d}_{username_part}_{ts}"
-    out_base.mkdir(parents=True, exist_ok=True)
     safe_flags = [f for f in extra_flags if f.startswith("--")]
     requested_by = resolve_added_by(msg.from_user)
     job = DLJob(
@@ -2361,6 +2394,7 @@ class DLJob:
     out_base: Path        # базовая папка для выдачи
     cancelled: bool = False
     requested_by: str = ""
+    started_at: float = 0.0
 
 def _dl_script_path() -> Path:
     # vsco_downloader.py теперь находится в services/
@@ -2534,7 +2568,7 @@ async def cq_cancel_job(cq: CallbackQuery):
         await cq.answer("Задание не выполняется", show_alert=True)
 
 
-def rebuild_urls_extracted(user_dir: Path) -> None:
+def rebuild_urls_extracted(user_dir: Path, *, min_mtime: float | None = None) -> None:
     """Recreate urls_extracted.txt from manifest.json using full image URLs.
 
     Some external downloaders deduplicate entries by filename which causes
@@ -2545,6 +2579,18 @@ def rebuild_urls_extracted(user_dir: Path) -> None:
     man = user_dir / "manifest.json"
     if not man.exists():
         return
+    if min_mtime is not None:
+        try:
+            if man.stat().st_mtime < min_mtime:
+                log.debug(
+                    "rebuild_urls_extracted: skip %s (mtime %.3f < cutoff %.3f)",
+                    man,
+                    man.stat().st_mtime,
+                    min_mtime,
+                )
+                return
+        except FileNotFoundError:
+            return
     try:
         data = json.loads(man.read_text(encoding="utf-8"))
     except Exception:
@@ -2936,6 +2982,7 @@ async def _dl_worker():
         job: DLJob = await _DL_QUEUE.get()
         try:
             job_started = time.time()
+            job.started_at = job_started
             log.info("Job #%s: start for %s", job.id, job.target)
             cancel_kb = InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="Отменить", callback_data=f"cancel:{job.id}")]]
@@ -3149,9 +3196,14 @@ async def _dl_worker():
             db_link_added = False
 
             if user_dir is not None:
-                rebuild_urls_extracted(user_dir)
+                cutoff = max(job.started_at - 1.0, 0.0) if job.started_at else None
+                rebuild_urls_extracted(user_dir, min_mtime=cutoff)
                 try:
-                    db_items_added, db_link_added = ingest_download_results(job, user_dir)
+                    db_items_added, db_link_added = ingest_download_results(
+                        job,
+                        user_dir,
+                        min_mtime=cutoff,
+                    )
                     if db_items_added or db_link_added:
                         log.info(
                             "Job #%s: ingested %d items%s into DB",
