@@ -3120,7 +3120,7 @@ async def _dl_worker():
                 log.info("Job #%s: downloader exited with code %s", job.id, rc)
             finally:
                 stop_evt.set()
-                with contextlib.suppress(Exception):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
                     await fs_task
 
             if job.cancelled:
@@ -3446,8 +3446,12 @@ async def main():
     finally:
         if _DL_WORKER_TASK:
             _DL_WORKER_TASK.cancel()
-            with contextlib.suppress(Exception):
+            try:
                 await _DL_WORKER_TASK
+            except asyncio.CancelledError:
+                log.debug("Download worker task cancelled during shutdown")
+            except Exception:
+                log.exception("Download worker task failed during shutdown")
         with contextlib.suppress(Exception):
             await bot.session.close()
 if __name__ == "__main__":
