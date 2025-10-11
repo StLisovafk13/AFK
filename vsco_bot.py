@@ -1820,6 +1820,24 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     return out
 
 # ---------------------- HTML builders (gallery/maps) ----------------------
+def _normalize_created_value(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        text = str(value)
+    except Exception:
+        return ""
+    return text.strip()
+
+
+def _format_created_range(first: Any, last: Any) -> str:
+    first_text = _normalize_created_value(first)
+    last_text = _normalize_created_value(last)
+    if first_text and last_text:
+        return first_text if first_text == last_text else f"{first_text} → {last_text}"
+    return first_text or last_text
+
+
 def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtitle=""):
     data_json = json.dumps(users, ensure_ascii=False)
     html = f"""<!DOCTYPE html>
@@ -2622,6 +2640,7 @@ def _map_html(
     .panel .row .meta .chip-city::before {{ content:"📍"; }}
     .panel .row .meta .chip-data {{ background:#fef3c7; color:#92400e; }}
     .panel .row .meta .chip-data::before {{ content:"💾"; }}
+    .panel .row .created-range {{ grid-column:1 / -1; font-size:11px; color:#4b5563; }}
     .panel .row .ab {{ grid-column:1 / -1; font-size:12px; color:#4b5563; }}
     .panel .row.row-user .u {{ grid-column:1 / -1; }}
     @media (max-width: 900px) {{
@@ -2678,6 +2697,14 @@ def _map_html(
             <select id="filterAdded">
               <option value="">Все добавившие</option>
             </select>
+          </div>
+          <div class="field">
+            <label for="filterDateFrom">Дата от</label>
+            <input id="filterDateFrom" type="date" />
+          </div>
+          <div class="field">
+            <label for="filterDateTo">Дата до</label>
+            <input id="filterDateTo" type="date" />
           </div>
           <div class="field field--button">
             <label>&nbsp;</label>
@@ -2770,6 +2797,36 @@ def _map_html(
       }});
       datalist.innerHTML='';
       datalist.appendChild(frag);
+    }}
+    function parseDateValue(raw) {{
+      if (!raw && raw !== 0) return null;
+      var str=('' + raw).trim();
+      if (!str) return null;
+      var normalized = str.indexOf('T') !== -1 ? str : str.replace(' ', 'T');
+      var ts = Date.parse(normalized);
+      if (!Number.isFinite(ts)) {{
+        ts = Date.parse(normalized + 'Z');
+      }}
+      return Number.isFinite(ts) ? ts : null;
+    }}
+    function formatDateLabel(ts) {{
+      if (ts == null || !Number.isFinite(ts)) return '';
+      var d = new Date(ts);
+      if (Number.isNaN(d.getTime())) return '';
+      var y = d.getFullYear();
+      var m = String(d.getMonth()+1).padStart(2,'0');
+      var day = String(d.getDate()).padStart(2,'0');
+      return y + '-' + m + '-' + day;
+    }}
+    function formatDateInput(ts) {{
+      return formatDateLabel(ts);
+    }}
+    function toDateRangeValue(value, endOfDay) {{
+      if (!value) return null;
+      var str=('' + value).trim();
+      if (!str) return null;
+      var base = str.length > 10 ? str : str + (endOfDay ? 'T23:59:59.999' : 'T00:00:00');
+      return parseDateValue(base);
     }}
     var filteringReady=false;
     var filteringStateValue=null;
@@ -2892,6 +2949,8 @@ def _map_html(
       var commentInput=document.getElementById('filterComment');
       var hasCommentsSelect=document.getElementById('filterHasComments');
       var addedSelect=document.getElementById('filterAdded');
+      var dateFromInput=document.getElementById('filterDateFrom');
+      var dateToInput=document.getElementById('filterDateTo');
       var resetBtn=document.getElementById('filtersReset');
       var baseText = summary ? (summary.dataset.text || summary.textContent || '') : '';
       var totals = summary ? {{
@@ -2902,6 +2961,8 @@ def _map_html(
       var cityOptions={{}};
       var cityLookup={{}};
       var addedOptions={{}};
+      var globalMinTs=null;
+      var globalMaxTs=null;
       var changeHandlers=[];
       var lastKeys=[];
       rows.forEach(function(row) {{
@@ -2914,6 +2975,18 @@ def _map_html(
         row._commentsCount=parseInt(row.dataset.commentsCount || '0', 10) || 0;
         row._datasets=parseDatasetList(row.dataset.datasets);
         row._cities=parseJsonArray(row.dataset.cities).map(function(city) {{ return city ? city.toString() : ''; }}).filter(function(city) {{ return !!city; }});
+        row._firstTs=parseDateValue(row.dataset.firstCreated);
+        row._lastTs=parseDateValue(row.dataset.lastCreated);
+        row._minTs=row._firstTs!=null ? row._firstTs : (row._lastTs!=null ? row._lastTs : null);
+        row._maxTs=row._lastTs!=null ? row._lastTs : (row._firstTs!=null ? row._firstTs : null);
+        var candidateMin=row._minTs!=null ? row._minTs : (row._maxTs!=null ? row._maxTs : null);
+        var candidateMax=row._maxTs!=null ? row._maxTs : (row._minTs!=null ? row._minTs : null);
+        if (candidateMin!=null) {{
+          if (globalMinTs==null || candidateMin<globalMinTs) globalMinTs=candidateMin;
+        }}
+        if (candidateMax!=null) {{
+          if (globalMaxTs==null || candidateMax>globalMaxTs) globalMaxTs=candidateMax;
+        }}
         row._datasets.forEach(function(ds) {{
           var value=(ds.value || '').toString();
           if (!value) return;
@@ -2932,6 +3005,16 @@ def _map_html(
       fillSelectOptions(datasetSelect, datasetOptions, 'Все данные');
       fillDatalistOptions(cityDatalist, cityOptions);
       fillSelectOptions(addedSelect, addedOptions, 'Все добавившие');
+      var minDateLabel=formatDateInput(globalMinTs);
+      var maxDateLabel=formatDateInput(globalMaxTs);
+      if (dateFromInput) {{
+        dateFromInput.min=minDateLabel || '';
+        dateFromInput.max=maxDateLabel || '';
+      }}
+      if (dateToInput) {{
+        dateToInput.min=minDateLabel || '';
+        dateToInput.max=maxDateLabel || '';
+      }}
       function notify(keys) {{
         lastKeys=keys.slice();
         changeHandlers.forEach(function(fn) {{
@@ -2948,6 +3031,10 @@ def _map_html(
         var commentValue=(commentInput && commentInput.value ? commentInput.value : '').trim().toLowerCase();
         var hasCommentsValue=hasCommentsSelect ? hasCommentsSelect.value : '';
         var addedKey=(addedSelect && addedSelect.value ? addedSelect.value : '');
+        var dateFromValue=(dateFromInput && dateFromInput.value ? dateFromInput.value : '').trim();
+        var dateToValue=(dateToInput && dateToInput.value ? dateToInput.value : '').trim();
+        var fromTs=dateFromValue ? toDateRangeValue(dateFromValue, false) : null;
+        var toTs=dateToValue ? toDateRangeValue(dateToValue, true) : null;
         var visible=[];
         var visibleKeys=[];
         rows.forEach(function(row) {{
@@ -2982,6 +3069,14 @@ def _map_html(
           if (match && addedKey) {{
             match=row._addedKey===addedKey;
           }}
+          if (match && fromTs!=null) {{
+            var newest=row._maxTs!=null ? row._maxTs : (row._minTs!=null ? row._minTs : null);
+            if (newest==null || newest<fromTs) match=false;
+          }}
+          if (match && toTs!=null) {{
+            var oldest=row._minTs!=null ? row._minTs : (row._maxTs!=null ? row._maxTs : null);
+            if (oldest==null || oldest>toTs) match=false;
+          }}
           row.style.display = match ? '' : 'none';
           if (match) {{
             visible.push(row);
@@ -2989,7 +3084,7 @@ def _map_html(
           }}
         }});
         if (summary) {{
-          if (!q && !dsValue && !cityValueLower && !commentValue && !addedKey && !hasCommentsValue) {{
+          if (!q && !dsValue && !cityValueLower && !commentValue && !addedKey && !hasCommentsValue && !dateFromValue && !dateToValue) {{
             summary.textContent = baseText;
           }} else {{
             var coordsShown = visible.filter(function(row) {{ return row._hasCoords; }}).length;
@@ -3006,6 +3101,14 @@ def _map_html(
       if (cityInput) cityInput.addEventListener('change', applyFilter);
       if (addedSelect) addedSelect.addEventListener('change', applyFilter);
       if (hasCommentsSelect) hasCommentsSelect.addEventListener('change', applyFilter);
+      if (dateFromInput) {{
+        dateFromInput.addEventListener('input', debouncedApply);
+        dateFromInput.addEventListener('change', applyFilter);
+      }}
+      if (dateToInput) {{
+        dateToInput.addEventListener('input', debouncedApply);
+        dateToInput.addEventListener('change', applyFilter);
+      }}
       if (resetBtn) resetBtn.addEventListener('click', function() {{
         if (input) input.value='';
         if (datasetSelect) datasetSelect.value='';
@@ -3013,6 +3116,8 @@ def _map_html(
         if (commentInput) commentInput.value='';
         if (addedSelect) addedSelect.value='';
         if (hasCommentsSelect) hasCommentsSelect.value='';
+        if (dateFromInput) dateFromInput.value='';
+        if (dateToInput) dateToInput.value='';
         applyFilter();
       }});
       applyFilter();
@@ -3197,6 +3302,15 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
         comment_filter_text = " ".join(str(x or "") for x in cm).lower()
         added_filter_text = (added_display or "").lower()
 
+        first_created = _normalize_created_value(u.get("first_created"))
+        last_created = _normalize_created_value(u.get("last_created"))
+        created_label = _format_created_range(u.get("first_created"), u.get("last_created"))
+        created_block = (
+            f"<div class='created-range'>Добавлено: {escape(created_label)}</div>"
+            if created_label
+            else ""
+        )
+
         attrs = [
             f"data-has-coords=\"{1 if has_coord else 0}\"",
             f"data-search=\"{escape(search_text, quote=True)}\"",
@@ -3208,6 +3322,10 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
             f"data-added-key=\"{escape(added_key, quote=True)}\"",
             f"data-added-label=\"{escape(added_display or '', quote=True)}\"",
         ]
+        if first_created:
+            attrs.append(f"data-first-created=\"{escape(first_created, quote=True)}\"")
+        if last_created:
+            attrs.append(f"data-last-created=\"{escape(last_created, quote=True)}\"")
         if has_coord:
             attrs.extend(
                 [
@@ -3230,6 +3348,7 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
             <div class=\"u\"><a href=\"{link}\" target=\"_blank\">@{uname}</a></div>
             {meta_block}
             {cm_txt}
+            {created_block}
             {added_block}
           </div>"""
         )
@@ -3382,6 +3501,12 @@ def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"
 
         comment_filter_text = " ".join(str(x or "") for x in cm).lower()
         added_filter_text = (added_display or "").lower()
+        created_single = _normalize_created_value(r.get("created_at"))
+        created_block = (
+            f"<div class='created-range'>Добавлено: {escape(created_single)}</div>"
+            if created_single
+            else ""
+        )
 
         attrs = [
             f"data-has-coords=\"{1 if has_coord else 0}\"",
@@ -3394,6 +3519,9 @@ def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"
             f"data-added-key=\"{escape(added_key, quote=True)}\"",
             f"data-added-label=\"{escape(added_display or '', quote=True)}\"",
         ]
+        if created_single:
+            attrs.append(f"data-first-created=\"{escape(created_single, quote=True)}\"")
+            attrs.append(f"data-last-created=\"{escape(created_single, quote=True)}\"")
         if has_coord:
             attrs.extend(
                 [
@@ -3417,6 +3545,7 @@ def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"
             <div class=\"t\">{thumb_html}</div>
             {meta_block}
             {cm_txt}
+            {created_block}
             {added_block}
           </div>"""
         )
