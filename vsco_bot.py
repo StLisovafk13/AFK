@@ -2984,14 +2984,18 @@ async def _dl_worker():
                 while not stop_evt.is_set():
                     try:
                         if user_dir is None:
-                            cand = [p for p in job.out_base.glob("*") if p.is_dir()]
+                            cand = [
+                                p
+                                for p in job.out_base.glob("*")
+                                if p.is_dir() and p.stat().st_mtime >= cutoff
+                            ]
                             if cand:
                                 user_dir = max(cand, key=lambda p: p.stat().st_mtime)
                                 log.debug("Job #%s: working directory %s", job.id, user_dir)
                         progress_dirty = False
                         if user_dir:
                             man = user_dir / "manifest.json"
-                            if man.exists():
+                            if man.exists() and man.stat().st_mtime >= cutoff:
                                 mtime = man.stat().st_mtime
                                 if mtime >= cutoff and mtime > last_manifest_mtime:
                                     last_manifest_mtime = mtime
@@ -3002,7 +3006,7 @@ async def _dl_worker():
                                     if bump_total(infer_media_total_from_manifest(data), "manifest"):
                                         progress_dirty = True
                             urls = user_dir / "urls_extracted.txt"
-                            if urls.exists():
+                            if urls.exists() and urls.stat().st_mtime >= cutoff:
                                 mtime = urls.stat().st_mtime
                                 if mtime >= cutoff and mtime > last_urls_mtime:
                                     last_urls_mtime = mtime
@@ -3123,6 +3127,8 @@ async def _dl_worker():
                 with contextlib.suppress(Exception):
                     await fs_task
 
+            success = rc == 0
+
             if job.cancelled:
                 await _safe_edit(
                     job.chat_id,
@@ -3135,8 +3141,21 @@ async def _dl_worker():
                 _CURRENT_JOB = None
                 continue
 
+            if not success:
+                err_text = f"❌ Загрузчик завершился с ошибкой (код {rc})."
+                await _safe_edit(job.chat_id, progress.message_id, err_text, reply_markup=None)
+                await bot.send_message(job.chat_id, f"❌ Задание #{job.id} завершилось ошибкой. Код {rc}.")
+                log.warning("Job #%s: downloader failed with code %s", job.id, rc)
+                _CURRENT_JOB = None
+                continue
+
             # Отправка результатов
-            user_dirs = [p for p in job.out_base.glob("*") if p.is_dir()]
+            cutoff = max(job_started - 1.0, 0.0)
+            user_dirs = [
+                p
+                for p in job.out_base.glob("*")
+                if p.is_dir() and p.stat().st_mtime >= cutoff
+            ]
             user_dir = max(user_dirs, key=lambda p: p.stat().st_mtime, default=None)
 
             db_items_added = 0
@@ -3209,20 +3228,32 @@ async def _dl_worker():
                     await _safe_edit(job.chat_id, progress.message_id, "\n".join(lines))
                     if man.exists():
                         log.info("Job #%s: sending manifest", job.id)
-                        await bot.send_document(
-                            job.chat_id,
-                            BufferedInputFile(man.read_bytes(), filename=man.name),
-                            caption="manifest.json",
-                            request_timeout=SEND_TIMEOUT,
-                        )
+                        if man.stat().st_mtime >= cutoff:
+                            await bot.send_document(
+                                job.chat_id,
+                                BufferedInputFile(man.read_bytes(), filename=man.name),
+                                caption="manifest.json",
+                                request_timeout=SEND_TIMEOUT,
+                            )
+                        else:
+                            log.info(
+                                "Job #%s: skipping manifest send, file is older than current run",
+                                job.id,
+                            )
                     if urls.exists():
                         log.info("Job #%s: sending urls_extracted", job.id)
-                        await bot.send_document(
-                            job.chat_id,
-                            BufferedInputFile(urls.read_bytes(), filename=urls.name),
-                            caption="urls_extracted.txt",
-                            request_timeout=SEND_TIMEOUT,
-                        )
+                        if urls.stat().st_mtime >= cutoff:
+                            await bot.send_document(
+                                job.chat_id,
+                                BufferedInputFile(urls.read_bytes(), filename=urls.name),
+                                caption="urls_extracted.txt",
+                                request_timeout=SEND_TIMEOUT,
+                            )
+                        else:
+                            log.info(
+                                "Job #%s: skipping urls_extracted send, file is older than current run",
+                                job.id,
+                            )
 
             await bot.send_message(job.chat_id, f"✅ Задание #{job.id} завершено.")
             log.info("Job #%s: finished", job.id)
