@@ -2570,7 +2570,16 @@ def _map_html(
 <html>
 <head>
   <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
   <title>{escape(title)}</title>
+  <link rel="dns-prefetch" href="https://unpkg.com"/>
+  <link rel="preconnect" href="https://unpkg.com" crossorigin/>
+  <link rel="dns-prefetch" href="https://a.tile.openstreetmap.org"/>
+  <link rel="dns-prefetch" href="https://b.tile.openstreetmap.org"/>
+  <link rel="dns-prefetch" href="https://c.tile.openstreetmap.org"/>
+  <link rel="preconnect" href="https://a.tile.openstreetmap.org" crossorigin/>
+  <link rel="preconnect" href="https://b.tile.openstreetmap.org" crossorigin/>
+  <link rel="preconnect" href="https://c.tile.openstreetmap.org" crossorigin/>
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
   <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
@@ -2582,6 +2591,13 @@ def _map_html(
     .panel .head {{ position: sticky; top:0; background:#fff; border-bottom:1px solid #e5e7eb; padding:12px 14px 10px; z-index:1; }}
     .panel .title {{ font-weight:600; margin-bottom:6px; }}
     .panel .summary {{ font-size:12px; color:#4b5563; margin-bottom:10px; }}
+    .panel .loading {{ font-size:12px; color:#1f2937; background:#ffffff; border:1px solid #e5e7eb; border-radius:8px; padding:10px 12px; margin-bottom:12px; box-shadow:0 1px 2px rgba(15,23,42,0.08); display:flex; flex-direction:column; gap:6px; }}
+    .panel .loading[hidden] {{ display:none !important; }}
+    .panel .loading__label {{ font-weight:600; display:flex; align-items:center; gap:6px; }}
+    .panel .loading__label::before {{ content:"⏳"; }}
+    .panel .loading__bar {{ display:flex; align-items:center; gap:8px; }}
+    .panel .loading progress {{ flex:1 1 auto; width:100%; height:8px; accent-color:#2563eb; }}
+    .panel .loading__details {{ min-width:80px; text-align:right; font-variant-numeric:tabular-nums; color:#4b5563; font-size:11px; }}
     .panel .search label {{ display:block; font-size:11px; color:#6b7280; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px; }}
     .panel .search input {{ width:100%; padding:6px 8px; border:1px solid #d1d5db; border-radius:6px; font-size:14px; }}
     .panel .filters {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr)); gap:8px; margin-top:12px; }}
@@ -2622,6 +2638,13 @@ def _map_html(
       <div class="head">
         <div class="title">Список / превью</div>
         <div class="summary" id="summary"{summary_attrs}>{escape(summary_text)}</div>
+        <div class="loading" id="loadingIndicator" hidden>
+          <div class="loading__label">Загрузка карты…</div>
+          <div class="loading__bar">
+            <progress id="loadingProgress" max="100" value="0"></progress>
+            <span class="loading__details" id="loadingDetails">0%</span>
+          </div>
+        </div>
         <div class="search">
           <label for="filter">Поиск</label>
           <input id="filter" type="search" placeholder="Поиск по нику, комментариям или добавившему" autocomplete="off"/>
@@ -2747,6 +2770,117 @@ def _map_html(
       }});
       datalist.innerHTML='';
       datalist.appendChild(frag);
+    }}
+    var filteringReady=false;
+    var filteringStateValue=null;
+    var filteringCallbacks=[];
+    function withFiltering(callback) {{
+      if (typeof callback !== 'function') return;
+      if (filteringReady) {{
+        try {{ callback(filteringStateValue); }} catch (err) {{ if (typeof console !== 'undefined' && console.error) console.error(err); }}
+      }} else {{
+        filteringCallbacks.push(callback);
+      }}
+    }}
+    function resolveFilteringState(state) {{
+      if (filteringReady) return;
+      filteringReady=true;
+      filteringStateValue=state;
+      while (filteringCallbacks.length) {{
+        var cb=filteringCallbacks.shift();
+        try {{ cb && cb(state); }} catch (err) {{ if (typeof console !== 'undefined' && console.error) console.error(err); }}
+      }}
+    }}
+    function initFilteringAsync() {{
+      var run=function() {{
+        try {{
+          resolveFilteringState(setupFiltering());
+        }} catch (err) {{
+          if (typeof console !== 'undefined' && console.error) console.error(err);
+          resolveFilteringState({{ onChange:function() {{}}, refresh:function() {{}} }});
+        }}
+      }};
+      if (typeof window !== 'undefined' && window.requestIdleCallback) {{
+        window.requestIdleCallback(run, {{ timeout: 500 }});
+      }} else {{
+        setTimeout(run, 0);
+      }}
+    }}
+    function createLoadingController() {{
+      var indicator=document.getElementById('loadingIndicator');
+      var bar=document.getElementById('loadingProgress');
+      var details=document.getElementById('loadingDetails');
+      var summary=document.getElementById('summary');
+      var totalMarkers=summary ? parseInt(summary.dataset.withcoords || '0', 10) || 0 : 0;
+      var displayThreshold=150;
+      var active=false;
+      var lastUpdate=0;
+      function hideIndicator() {{
+        if (!indicator) return;
+        indicator.hidden=true;
+        indicator.setAttribute('aria-hidden','true');
+      }}
+      function showIndicator() {{
+        if (!indicator) return;
+        indicator.hidden=false;
+        indicator.setAttribute('aria-hidden','false');
+      }}
+      function formatDetails(processed, total) {{
+        if (!details) return;
+        if (!total) {{
+          details.textContent=processed ? processed.toString() : '…';
+          return;
+        }}
+        var percent=Math.min(100, Math.max(0, Math.round((processed/total)*100)));
+        details.textContent=processed + ' / ' + total + ' (' + percent + '%)';
+      }}
+      if (!indicator || totalMarkers <= displayThreshold) {{
+        hideIndicator();
+        return {{
+          start:function() {{}},
+          update:function() {{}},
+          finish:function() {{ hideIndicator(); }}
+        }};
+      }}
+      hideIndicator();
+      return {{
+        start:function(total) {{
+          var target=total && total>0 ? total : totalMarkers;
+          active=true;
+          showIndicator();
+          if (bar) {{
+            bar.max=100;
+            bar.value=0;
+          }}
+          formatDetails(0, target);
+          lastUpdate=Date.now();
+        }},
+        update:function(processed, total) {{
+          if (!active) this.start(total);
+          var target=total && total>0 ? total : totalMarkers;
+          var percent=target ? Math.min(100, Math.max(0, Math.round((processed/target)*100))) : 0;
+          if (bar) {{
+            bar.max=100;
+            bar.value=percent;
+          }}
+          formatDetails(processed, target || 0);
+          lastUpdate=Date.now();
+        }},
+        finish:function() {{
+          if (!indicator) return;
+          if (bar) {{
+            bar.max=100;
+            bar.value=100;
+          }}
+          if (totalMarkers) {{
+            formatDetails(totalMarkers, totalMarkers);
+          }} else if (details) {{
+            details.textContent='Готово';
+          }}
+          var delay=Math.max(0, 400 - (Date.now()-lastUpdate));
+          setTimeout(hideIndicator, delay);
+        }}
+      }};
     }}
     function setupFiltering() {{
       var rows=Array.prototype.slice.call(document.querySelectorAll('.panel .row'));
@@ -2988,11 +3122,12 @@ def _map_html(
       }});
     }}
     document.addEventListener('DOMContentLoaded', function() {{
-      var filteringState = setupFiltering();
+      initFilteringAsync();
+      var loadingController=createLoadingController();
       ensureLeaflet(function() {{
         ensureCluster(function() {{
-          var map=L.map('map');
-          L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{attribution:'&copy; OpenStreetMap contributors'}}).addTo(map);
+          var map=L.map('map', {{ preferCanvas:true }});
+          L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{attribution:'&copy; OpenStreetMap contributors', maxZoom:19, minZoom:1, updateWhenIdle:true, keepBuffer:4, reuseTiles:true, detectRetina:true}}).addTo(map);
           {chr(10).join(marker_js)}
         }});
       }});
@@ -3111,9 +3246,11 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
     marker_js: List[str] = []
     if with_coords:
         marker_js += [
+            f"if(loadingController && loadingController.start){{ loadingController.start({with_coords}); }}",
             "var bounds=L.latLngBounds();",
-            "var markers=L.markerClusterGroup();",
+            "var markers=L.markerClusterGroup({chunkedLoading:true,chunkDelay:20,chunkInterval:200,removeOutsideVisibleBounds:true,spiderfyDistanceMultiplier:1.1,chunkProgress:function(processed,total){ if(loadingController && loadingController.update){ loadingController.update(processed,total); } }});",
             "var markerByKey={};",
+            "if(markers.on){ markers.on('chunkedLoadingEnd', function(){ if(loadingController && loadingController.finish){ loadingController.finish(); }}); } else if(loadingController && loadingController.finish){ loadingController.finish(); }",
         ]
         for u, lat, lon, key, has_coord in meta:
             if not has_coord:
@@ -3153,13 +3290,18 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
         marker_js += [
             "map.addLayer(markers);",
             "if(bounds.isValid()){map.fitBounds(bounds.pad(0.1));}else{map.setView([20,0],2);}",
-            "setupListInteractions(map, markerByKey, markers, filteringState);",
-            "bindFilteringToMarkers(filteringState, map, markers, markerByKey);",
+            "withFiltering(function(filteringState){",
+            "  setupListInteractions(map, markerByKey, markers, filteringState);",
+            "  bindFilteringToMarkers(filteringState, map, markers, markerByKey);",
+            "});",
         ]
     else:
         marker_js.append("map.setView([20,0],2);")
-        marker_js.append("setupListInteractions(map, {}, null, filteringState);")
-        marker_js.append("bindFilteringToMarkers(filteringState, map, null, {});")
+        marker_js.append("if(loadingController && loadingController.finish){ loadingController.finish(); }")
+        marker_js.append("withFiltering(function(filteringState){")
+        marker_js.append("  setupListInteractions(map, {}, null, filteringState);")
+        marker_js.append("  bindFilteringToMarkers(filteringState, map, null, {});")
+        marker_js.append("});")
 
     return _map_html(
         title,
@@ -3292,9 +3434,11 @@ def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"
     marker_js: List[str] = []
     if with_coords:
         marker_js += [
+            f"if(loadingController && loadingController.start){{ loadingController.start({with_coords}); }}",
             "var bounds=L.latLngBounds();",
-            "var markers=L.markerClusterGroup();",
+            "var markers=L.markerClusterGroup({chunkedLoading:true,chunkDelay:20,chunkInterval:200,removeOutsideVisibleBounds:true,spiderfyDistanceMultiplier:1.1,chunkProgress:function(processed,total){ if(loadingController && loadingController.update){ loadingController.update(processed,total); } }});",
             "var markerByKey={};",
+            "if(markers.on){ markers.on('chunkedLoadingEnd', function(){ if(loadingController && loadingController.finish){ loadingController.finish(); }}); } else if(loadingController && loadingController.finish){ loadingController.finish(); }",
         ]
         for r, lat, lon, key, has_coord in meta:
             if not has_coord:
@@ -3342,13 +3486,18 @@ def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"
         marker_js += [
             "map.addLayer(markers);",
             "if(bounds.isValid()){map.fitBounds(bounds.pad(0.1));}else{map.setView([20,0],2);}",
-            "setupListInteractions(map, markerByKey, markers, filteringState);",
-            "bindFilteringToMarkers(filteringState, map, markers, markerByKey);",
+            "withFiltering(function(filteringState){",
+            "  setupListInteractions(map, markerByKey, markers, filteringState);",
+            "  bindFilteringToMarkers(filteringState, map, markers, markerByKey);",
+            "});",
         ]
     else:
         marker_js.append("map.setView([20,0],2);")
-        marker_js.append("setupListInteractions(map, {}, null, filteringState);")
-        marker_js.append("bindFilteringToMarkers(filteringState, map, null, {});")
+        marker_js.append("if(loadingController && loadingController.finish){ loadingController.finish(); }")
+        marker_js.append("withFiltering(function(filteringState){")
+        marker_js.append("  setupListInteractions(map, {}, null, filteringState);")
+        marker_js.append("  bindFilteringToMarkers(filteringState, map, null, {});")
+        marker_js.append("});")
 
     return _map_html(
         title,
