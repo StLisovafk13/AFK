@@ -294,8 +294,11 @@ def extract_media_urls_from_html(
     ``root`` when provided.
     """
 
-    if not html or not BeautifulSoup:
+    if not html:
         return []
+
+    if not BeautifulSoup:
+        return _extract_media_urls_without_bs4(html, max_width=max_width, root=root)
 
     soup = BeautifulSoup(html, "html.parser")
     urls: list[str] = []
@@ -328,6 +331,62 @@ def extract_media_urls_from_html(
         for source in video.find_all("source"):
             push(source.get("src"))
             srcset = source.get("srcset")
+            if srcset:
+                push(select_best_from_srcset(srcset))
+
+    return dedupe_keep_order(urls)
+
+
+def _extract_media_urls_without_bs4(
+    html: str,
+    *,
+    max_width: int,
+    root: Optional[str],
+) -> list[str]:
+    """Fallback HTML parser when BeautifulSoup is unavailable."""
+
+    base_root = root or "https://vsco.co/"
+    urls: list[str] = []
+
+    def push(candidate: Optional[str]):
+        if not candidate:
+            return
+        normalized = normalize_media_url(candidate, root=base_root)
+        if not normalized or not is_media_url(normalized):
+            return
+        final_url = upscale_w_param(normalized, max_width)
+        if not is_vsco_logo_url(final_url):
+            urls.append(final_url)
+
+    def extract_attr(fragment: str, name: str) -> Optional[str]:
+        pattern = rf"{name}\s*=\s*['\"]([^'\"]+)['\"]"
+        match = re.search(pattern, fragment, flags=re.IGNORECASE)
+        return match.group(1) if match else None
+
+    for match in re.finditer(r"<img[^>]*>", html, flags=re.IGNORECASE):
+        tag = match.group(0)
+        srcset = extract_attr(tag, "srcset")
+        candidate = select_best_from_srcset(srcset or "") if srcset else None
+        if not candidate:
+            candidate = extract_attr(tag, "src")
+        push(candidate)
+
+    for match in re.finditer(r"<picture[^>]*>(.*?)</picture>", html, flags=re.IGNORECASE | re.DOTALL):
+        fragment = match.group(1)
+        for source in re.finditer(r"<source[^>]*>", fragment, flags=re.IGNORECASE):
+            tag = source.group(0)
+            srcset = extract_attr(tag, "srcset")
+            candidate = select_best_from_srcset(srcset or "") if srcset else None
+            push(candidate or extract_attr(tag, "src"))
+
+    for match in re.finditer(r"<video[^>]*>(.*?)</video>", html, flags=re.IGNORECASE | re.DOTALL):
+        tag = match.group(0)
+        push(extract_attr(tag, "src"))
+        inner = match.group(1)
+        for source in re.finditer(r"<source[^>]*>", inner, flags=re.IGNORECASE):
+            source_tag = source.group(0)
+            push(extract_attr(source_tag, "src"))
+            srcset = extract_attr(source_tag, "srcset")
             if srcset:
                 push(select_best_from_srcset(srcset))
 
