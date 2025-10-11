@@ -38,7 +38,7 @@ import sys
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, NamedTuple
 
 from urllib.parse import urlsplit
 
@@ -126,6 +126,19 @@ def normalize_profile(username: Optional[str], profile_url: Optional[str]) -> Tu
 # -----------------------------
 POSTER_HINT_RE = re.compile(r"(?i)(poster|thumb|thumbnail|cover|preview|frame)")
 
+
+class _MediaInfo(NamedTuple):
+    url: str
+    stem: str
+    normalized: str
+    has_hint: bool
+
+
+def _media_info(url: str) -> _MediaInfo:
+    stem = _stem_no_ext(urlsplit(url).path)
+    normalized = stem.replace("-", "_")
+    return _MediaInfo(url, stem, normalized, bool(POSTER_HINT_RE.search(stem)))
+
 # -----------------------------
 # ПОСТЕРЫ ВИДЕО: ЭВРИСТИКИ И ПАРИНГ
 # -----------------------------
@@ -134,33 +147,42 @@ def _stem_no_ext(path: str) -> str:
     stem = Path(name).stem
     return stem
 
-def looks_like_video_poster(img_url: str, video_url: str) -> bool:
-    """Эвристика: img — постер для video (одинаковый stem или явные суффиксы)."""
-    ip = urlsplit(img_url).path
-    vp = urlsplit(video_url).path
-    ist, vst = _stem_no_ext(ip), _stem_no_ext(vp)
-    if ist == vst:
-        return True
-    if ist.replace("-", "_").startswith(vst.replace("-", "_")) and POSTER_HINT_RE.search(ist):
-        return True
-    if vst.replace("-", "_").startswith(ist.replace("-", "_")) and POSTER_HINT_RE.search(vst):
-        return True
-    return False
-
 def pair_thumbnails_with_videos(urls: List[str], skip_thumbs: bool) -> Tuple[List[str], Dict[str, str]]:
     """
     Возвращает:
       - финальный список URL к скачиванию (с учётом skip_thumbs),
       - словарь {img_url: video_url} для постеров.
     """
-    videos = [u for u in urls if re.search(r"\.(mp4|webm|mov)(\?|$)", u, re.I)]
-    images = [u for u in urls if re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", u, re.I)]
+    videos = [_media_info(u) for u in urls if re.search(r"\.(mp4|webm|mov)(\?|$)", u, re.I)]
+    images = [_media_info(u) for u in urls if re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", u, re.I)]
     pairs: Dict[str, str] = {}
+
+    video_by_stem = {info.stem: info for info in videos if info.stem}
+    video_by_norm: Dict[str, List[_MediaInfo]] = {}
+    for info in videos:
+        video_by_norm.setdefault(info.normalized, []).append(info)
+
     for img in images:
-        for vid in videos:
-            if looks_like_video_poster(img, vid):
-                pairs[img] = vid
-                break
+        match: Optional[_MediaInfo] = None
+
+        if img.stem and img.stem in video_by_stem:
+            match = video_by_stem[img.stem]
+        else:
+            norm_candidates = video_by_norm.get(img.normalized)
+            if norm_candidates and (img.has_hint or any(c.has_hint for c in norm_candidates)):
+                match = norm_candidates[0]
+            else:
+                for vid in videos:
+                    if img.normalized.startswith(vid.normalized) and img.has_hint:
+                        match = vid
+                        break
+                    if vid.normalized.startswith(img.normalized) and vid.has_hint:
+                        match = vid
+                        break
+
+        if match:
+            pairs[img.url] = match.url
+
     if skip_thumbs:
         filtered = [u for u in urls if u not in pairs]
         return filtered, pairs
