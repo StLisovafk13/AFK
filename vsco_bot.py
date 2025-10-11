@@ -1928,13 +1928,9 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         <select id=\"datasetSelect\"></select>
       </div>
       <div class=\"field\">
-        <label for=\"cityInput\">Город (ввод)</label>
-        <input id=\"cityInput\" list=\"cityOptionsList\" placeholder=\"Начните вводить город\" />
+        <label for=\"cityInput\">Город</label>
+        <input id=\"cityInput\" list=\"cityOptionsList\" placeholder=\"Начните вводить город или выберите из списка\" />
         <datalist id=\"cityOptionsList\"></datalist>
-      </div>
-      <div class=\"field\">
-        <label for=\"citySelect\">Город (выбор)</label>
-        <select id=\"citySelect\"></select>
       </div>
       <div class=\"field\">
         <label for=\"commentInput\">Комментарий содержит</label>
@@ -1959,22 +1955,6 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       <div class=\"field\">
         <label for=\"dateTo\">Дата по</label>
         <input id=\"dateTo\" type=\"date\" />
-      </div>
-      <div class=\"field\">
-        <label for=\"latMin\">Lat min</label>
-        <input id=\"latMin\" type=\"number\" step=\"0.0001\" placeholder=\"Lat min\" />
-      </div>
-      <div class=\"field\">
-        <label for=\"latMax\">Lat max</label>
-        <input id=\"latMax\" type=\"number\" step=\"0.0001\" placeholder=\"Lat max\" />
-      </div>
-      <div class=\"field\">
-        <label for=\"lonMin\">Lon min</label>
-        <input id=\"lonMin\" type=\"number\" step=\"0.0001\" placeholder=\"Lon min\" />
-      </div>
-      <div class=\"field\">
-        <label for=\"lonMax\">Lon max</label>
-        <input id=\"lonMax\" type=\"number\" step=\"0.0001\" placeholder=\"Lon max\" />
       </div>
       <div class=\"field\">
         <label for=\"sort\">Сортировка</label>
@@ -2048,17 +2028,12 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     const searchInput = document.getElementById('q');
     const datasetSelect = document.getElementById('datasetSelect');
     const cityInput = document.getElementById('cityInput');
-    const citySelect = document.getElementById('citySelect');
     const cityDatalist = document.getElementById('cityOptionsList');
     const commentInput = document.getElementById('commentInput');
     const hasCommentsSelect = document.getElementById('hasComments');
     const addedSelect = document.getElementById('addedSelect');
     const dateFromInput = document.getElementById('dateFrom');
     const dateToInput = document.getElementById('dateTo');
-    const latMinInput = document.getElementById('latMin');
-    const latMaxInput = document.getElementById('latMax');
-    const lonMinInput = document.getElementById('lonMin');
-    const lonMaxInput = document.getElementById('lonMax');
     const sortSelect = document.getElementById('sort');
     const applyBtn = document.getElementById('apply');
     const resetBtn = document.getElementById('reset');
@@ -2185,6 +2160,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
 
     const datasetOptions = {{}};
     const cityOptions = {{}};
+    const cityLookup = {{}};
     const addedOptions = {{}};
 
     let globalFirstTs = null;
@@ -2208,6 +2184,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         const lower = label.toLowerCase();
         preparedCities.push({{ label, lower }});
         if (!cityOptions[label]) cityOptions[label] = label;
+        if (lower && !cityLookup[lower]) cityLookup[lower] = label;
       }});
       u._cityList = preparedCities;
       u._cityText = preparedCities.map(entry => entry.lower).join(' ');
@@ -2246,7 +2223,6 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     }});
 
     fillSelectOptions(datasetSelect, 'Все данные', datasetOptions);
-    fillSelectOptions(citySelect, 'Все города', cityOptions);
     fillDatalistOptions(cityDatalist, cityOptions);
     fillSelectOptions(addedSelect, 'Все добавившие', addedOptions);
 
@@ -2307,17 +2283,6 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         default:
           return arr.sort((a,b) => compareByName(a,b));
       }}
-    }}
-
-    function inBbox(u, latMin, latMax, lonMin, lonMax) {{
-      if (latMin===''&&latMax===''&&lonMin===''&&lonMax==='') return true;
-      const lat=u.lat, lon=u.lon;
-      if (lat==null || lon==null) return false;
-      if (latMin!=='' && lat<parseFloat(latMin)) return false;
-      if (latMax!=='' && lat>parseFloat(latMax)) return false;
-      if (lonMin!=='' && lon<parseFloat(lonMin)) return false;
-      if (lonMax!=='' && lon>parseFloat(lonMax)) return false;
-      return true;
     }}
 
     function escapeHtml(s) {{
@@ -2494,18 +2459,14 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       const q = searchInput ? searchInput.value.trim().toLowerCase() : '';
       const datasetValue = datasetSelect ? datasetSelect.value : '';
       const datasetLower = datasetValue ? datasetValue.toLowerCase() : '';
-      const cityValue = citySelect ? citySelect.value : '';
-      const cityLower = cityValue ? cityValue.toLowerCase() : '';
-      const cityQuery = cityInput ? cityInput.value.trim().toLowerCase() : '';
+      const cityRaw = cityInput ? cityInput.value.trim() : '';
+      const cityLower = cityRaw.toLowerCase();
+      const hasExactCity = cityLower && Object.prototype.hasOwnProperty.call(cityLookup, cityLower);
       const commentValue = commentInput ? commentInput.value.trim().toLowerCase() : '';
       const hasCommentsValue = hasCommentsSelect ? hasCommentsSelect.value : '';
       const addedValue = addedSelect ? addedSelect.value : '';
       const fromTs = dateFromInput ? toDateRangeValue(dateFromInput.value, false) : null;
       const toTs = dateToInput ? toDateRangeValue(dateToInput.value, true) : null;
-      const latMin = latMinInput ? latMinInput.value : '';
-      const latMax = latMaxInput ? latMaxInput.value : '';
-      const lonMin = lonMinInput ? lonMinInput.value : '';
-      const lonMax = lonMaxInput ? lonMaxInput.value : '';
       const sortMode = sortSelect ? (sortSelect.value || 'date_desc') : 'date_desc';
 
       const list = DATA.filter(u => {{
@@ -2516,11 +2477,12 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
           if (!datasetMatch) return false;
         }}
         if (cityLower) {{
-          const matchCity = (u._cityList || []).some(entry => entry.lower === cityLower);
-          if (!matchCity) return false;
-        }}
-        if (cityQuery) {{
-          if (!u._cityText || u._cityText.indexOf(cityQuery) === -1) return false;
+          if (hasExactCity) {{
+            const matchCity = (u._cityList || []).some(entry => entry.lower === cityLower);
+            if (!matchCity) return false;
+          }} else {{
+            if (!u._cityText || u._cityText.indexOf(cityLower) === -1) return false;
+          }}
         }}
         if (commentValue) {{
           if (!u._commentText || u._commentText.indexOf(commentValue) === -1) return false;
@@ -2529,7 +2491,6 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         if (hasCommentsValue === 'with' && commentCount === 0) return false;
         if (hasCommentsValue === 'without' && commentCount > 0) return false;
         if (addedValue && u._addedKey !== addedValue) return false;
-        if (!inBbox(u, latMin, latMax, lonMin, lonMax)) return false;
         if (fromTs != null && getNewestTs(u) < fromTs) return false;
         if (toTs != null && getOldestTs(u) > toTs) return false;
         return true;
@@ -2543,16 +2504,11 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       if (searchInput) searchInput.value='';
       if (datasetSelect) datasetSelect.value='';
       if (cityInput) cityInput.value='';
-      if (citySelect) citySelect.value='';
       if (commentInput) commentInput.value='';
       if (hasCommentsSelect) hasCommentsSelect.value='';
       if (addedSelect) addedSelect.value='';
       if (dateFromInput) dateFromInput.value='';
       if (dateToInput) dateToInput.value='';
-      if (latMinInput) latMinInput.value='';
-      if (latMaxInput) latMaxInput.value='';
-      if (lonMinInput) lonMinInput.value='';
-      if (lonMaxInput) lonMaxInput.value='';
       if (sortSelect) sortSelect.value='date_desc';
       apply();
     }}
@@ -2565,7 +2521,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     if (cityInput) cityInput.addEventListener('input', debouncedApply);
     if (commentInput) commentInput.addEventListener('input', debouncedApply);
 
-    [datasetSelect, citySelect, hasCommentsSelect, addedSelect, sortSelect].forEach(el => {{
+    [datasetSelect, hasCommentsSelect, addedSelect, sortSelect].forEach(el => {{
       if (el) el.addEventListener('change', apply);
     }});
     if (dateFromInput) dateFromInput.addEventListener('change', apply);
@@ -2679,9 +2635,8 @@ def _map_html(
           </div>
           <div class="field">
             <label for="filterCity">Город</label>
-            <select id="filterCity">
-              <option value="">Все города</option>
-            </select>
+            <input id="filterCity" type="search" list="filterCityOptions" placeholder="Начните вводить город или выберите из списка" autocomplete="off"/>
+            <datalist id="filterCityOptions"></datalist>
           </div>
           <div class="field">
             <label for="filterComment">Комментарий</label>
@@ -2778,12 +2733,28 @@ def _map_html(
       select.innerHTML='';
       select.appendChild(frag);
     }}
+    function fillDatalistOptions(datalist, options) {{
+      if (!datalist) return;
+      var frag=document.createDocumentFragment();
+      Object.keys(options).sort(function(a,b) {{
+        var labelA=(options[a]||'').toString();
+        var labelB=(options[b]||'').toString();
+        return labelA.localeCompare(labelB, undefined, {{ sensitivity:'accent' }});
+      }}).forEach(function(value) {{
+        var opt=document.createElement('option');
+        opt.value=options[value] || value;
+        frag.appendChild(opt);
+      }});
+      datalist.innerHTML='';
+      datalist.appendChild(frag);
+    }}
     function setupFiltering() {{
       var rows=Array.prototype.slice.call(document.querySelectorAll('.panel .row'));
       var summary=document.getElementById('summary');
       var input=document.getElementById('filter');
       var datasetSelect=document.getElementById('filterData');
-      var citySelect=document.getElementById('filterCity');
+      var cityInput=document.getElementById('filterCity');
+      var cityDatalist=document.getElementById('filterCityOptions');
       var commentInput=document.getElementById('filterComment');
       var hasCommentsSelect=document.getElementById('filterHasComments');
       var addedSelect=document.getElementById('filterAdded');
@@ -2795,6 +2766,7 @@ def _map_html(
       }} : {{ total: rows.length, withCoords: rows.filter(function(r) {{ return r.dataset.hasCoords==='1'; }}).length }};
       var datasetOptions={{}};
       var cityOptions={{}};
+      var cityLookup={{}};
       var addedOptions={{}};
       var changeHandlers=[];
       var lastKeys=[];
@@ -2816,13 +2788,15 @@ def _map_html(
         }});
         row._cities.forEach(function(city) {{
           if (!cityOptions[city]) cityOptions[city]=city;
+          var lowerCity=city.toLowerCase();
+          if (lowerCity && !cityLookup[lowerCity]) cityLookup[lowerCity]=city;
         }});
         if (row._addedKey && !addedOptions[row._addedKey]) {{
           addedOptions[row._addedKey]=row._addedLabel || row._addedKey;
         }}
       }});
       fillSelectOptions(datasetSelect, datasetOptions, 'Все данные');
-      fillSelectOptions(citySelect, cityOptions, 'Все города');
+      fillDatalistOptions(cityDatalist, cityOptions);
       fillSelectOptions(addedSelect, addedOptions, 'Все добавившие');
       function notify(keys) {{
         lastKeys=keys.slice();
@@ -2834,8 +2808,9 @@ def _map_html(
         var q=(input && input.value ? input.value : '').trim().toLowerCase();
         var dsValue=datasetSelect ? datasetSelect.value : '';
         var dsValueLower=dsValue ? dsValue.toLowerCase() : '';
-        var cityValue=citySelect ? citySelect.value : '';
-        var cityValueLower=cityValue ? cityValue.toLowerCase() : '';
+        var cityRaw=cityInput && cityInput.value ? cityInput.value.trim() : '';
+        var cityValueLower=cityRaw.toLowerCase();
+        var hasExactCity = cityValueLower && Object.prototype.hasOwnProperty.call(cityLookup, cityValueLower);
         var commentValue=(commentInput && commentInput.value ? commentInput.value : '').trim().toLowerCase();
         var hasCommentsValue=hasCommentsSelect ? hasCommentsSelect.value : '';
         var addedKey=(addedSelect && addedSelect.value ? addedSelect.value : '');
@@ -2851,10 +2826,16 @@ def _map_html(
               return val===dsValueLower || label===dsValueLower;
             }});
           }}
-          if (match && cityValue) {{
-            match=row._cities && row._cities.some(function(city) {{
-              return city.toLowerCase()===cityValueLower;
-            }});
+          if (match && cityValueLower) {{
+            if (hasExactCity) {{
+              match=row._cities && row._cities.some(function(city) {{
+                return city.toLowerCase()===cityValueLower;
+              }});
+            }} else {{
+              match=row._cities && row._cities.some(function(city) {{
+                return city.toLowerCase().indexOf(cityValueLower)!==-1;
+              }});
+            }}
           }}
           if (match && commentValue) {{
             match=row._commentsText.indexOf(commentValue)!==-1;
@@ -2874,7 +2855,7 @@ def _map_html(
           }}
         }});
         if (summary) {{
-          if (!q && !dsValue && !cityValue && !commentValue && !addedKey && !hasCommentsValue) {{
+          if (!q && !dsValue && !cityValueLower && !commentValue && !addedKey && !hasCommentsValue) {{
             summary.textContent = baseText;
           }} else {{
             var coordsShown = visible.filter(function(row) {{ return row._hasCoords; }}).length;
@@ -2885,15 +2866,16 @@ def _map_html(
       }}
       var debouncedApply=debounce(applyFilter, 150);
       if (input) input.addEventListener('input', debouncedApply);
+      if (cityInput) cityInput.addEventListener('input', debouncedApply);
       if (commentInput) commentInput.addEventListener('input', debouncedApply);
       if (datasetSelect) datasetSelect.addEventListener('change', applyFilter);
-      if (citySelect) citySelect.addEventListener('change', applyFilter);
+      if (cityInput) cityInput.addEventListener('change', applyFilter);
       if (addedSelect) addedSelect.addEventListener('change', applyFilter);
       if (hasCommentsSelect) hasCommentsSelect.addEventListener('change', applyFilter);
       if (resetBtn) resetBtn.addEventListener('click', function() {{
         if (input) input.value='';
         if (datasetSelect) datasetSelect.value='';
-        if (citySelect) citySelect.value='';
+        if (cityInput) cityInput.value='';
         if (commentInput) commentInput.value='';
         if (addedSelect) addedSelect.value='';
         if (hasCommentsSelect) hasCommentsSelect.value='';
