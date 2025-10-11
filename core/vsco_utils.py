@@ -110,18 +110,51 @@ def upscale_w_param(url: str, max_width: int) -> str:
         return url
     if re.search(r"\.(mp4|webm|mov)(\?|$)", url, re.IGNORECASE):
         return url
+
     parts = urlsplit(url)
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    if "w" in query:
-        try:
-            current = int(query["w"])
-        except (ValueError, TypeError):
-            return url
-        if current < max_width:
-            query["w"] = str(max_width)
-            new_query = urlencode(query, doseq=True)
-            return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
-    return url
+    query_items = parse_qsl(parts.query, keep_blank_values=True)
+    if not query_items:
+        return url
+
+    query: dict[str, str] = {}
+    for key, value in query_items:
+        if key not in query:
+            query[key] = value
+
+    if "w" not in query:
+        return url
+
+    # Signed CDN links often include additional security parameters. Tweaking
+    # ``w`` for such URLs invalidates the signature and results in HTTP 403.
+    sensitive_keys = {
+        "token",
+        "signature",
+        "sig",
+        "expires",
+        "exp",
+        "s",
+        "policy",
+        "keypairid",
+        "x-amz-security-token",
+        "x-amz-signature",
+        "x-amz-credential",
+        "x-amz-date",
+    }
+    extra_keys = {key.lower() for key in query if key.lower() != "w"}
+    if extra_keys & sensitive_keys:
+        return url
+
+    try:
+        current = int(query.get("w", "0"))
+    except (ValueError, TypeError):
+        return url
+
+    if current >= max_width:
+        return url
+
+    query["w"] = str(max_width)
+    new_query = urlencode(query, doseq=True)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
 
 
 def dedupe_keep_order(items: Iterable[str]) -> list[str]:

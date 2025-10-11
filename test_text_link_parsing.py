@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 from aiogram.types import MessageEntity
 
+from core.vsco_utils import upscale_w_param
+
 
 @pytest.fixture()
 def vsco_module(tmp_path, monkeypatch):
@@ -65,6 +67,11 @@ def test_text_link_message_inserts_profile(vsco_module):
     assert link_row == ("anast2010", "https://vsco.co/anast2010")
     assert item_row == ("anast2010", "https://vsco.co/anast2010")
     assert comment_row == ("hi",)
+
+
+def test_upscale_w_param_skips_signed_urls():
+    original = "https://cdn.example.com/photo.jpg?w=400&token=abc123&exp=1700000000"
+    assert upscale_w_param(original, 2048) == original
 
 
 def test_profile_link_scans_direct_media(monkeypatch, vsco_module):
