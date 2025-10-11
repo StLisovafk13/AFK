@@ -42,6 +42,11 @@ from typing import List, Dict, Any, Optional, Tuple, NamedTuple
 
 from urllib.parse import urlsplit
 
+# Ensure imports work when the script is executed directly from the services/ directory.
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
 from core.vsco_utils import (
     dedupe_keep_order,
     extract_media_urls_from_html,
