@@ -1659,9 +1659,17 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "lat_sum":0.0, "lon_sum":0.0, "lat_n":0, "lon_n":0,
             "images": set(), "added_by": "",
             "sources": {}, "cities": set(), "first_at": None, "last_at": None,
+            "has_collection": False, "has_journal": False,
         })
         if purl and not g["profile_url"]:
             g["profile_url"] = purl
+        purl_lower = (purl or "").strip().lower()
+        source_lower = (source or "").strip().lower()
+        source_file_lower = (source_file or "").strip().lower()
+        if "/collection/1" in purl_lower or "/collection/1" in source_lower or "/collection/1" in source_file_lower:
+            g["has_collection"] = True
+        if "/journal/p/1" in purl_lower or "/journal/p/1" in source_lower or "/journal/p/1" in source_file_lower:
+            g["has_journal"] = True
         if img: g["images"].add(img)
         if lat is not None and lon is not None:
             try:
@@ -1739,6 +1747,8 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "cities": city_list,
             "first_created": g.get("first_at"),
             "last_created": g.get("last_at"),
+            "has_collection_link": bool(g.get("has_collection")),
+            "has_journal_link": bool(g.get("has_journal")),
         })
     conn.close()
     return out
