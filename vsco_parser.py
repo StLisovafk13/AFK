@@ -266,7 +266,7 @@ def build_gallery_html(items, title="VSCO Gallery", subtitle="Merged"):
 body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
 .header {{ text-align:center; background:#fff; padding:16px; border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,.1); }}
 .controls, .stats {{ background:#fff; padding:12px; border-radius:10px; box-shadow:0 2px 10px rgba(0,0,0,.1); margin: 16px 0; }}
-.controls {{ display:grid; grid-template-columns: repeat(7, minmax(120px,1fr)); gap:10px; }}
+.controls {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr)); gap:10px; }}
 .controls input, .controls select {{ padding:8px 10px; border:1px solid #ddd; border-radius:6px; }}
 .controls button {{ padding:10px 14px; border:none; border-radius:6px; cursor:pointer; }}
 .btn-apply {{ background:#007bff; color:#fff; }}
@@ -307,6 +307,16 @@ body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
     <option value="count-desc" selected>More images first</option>
     <option value="count-asc">Fewer images first</option>
   </select>
+  <select id="f-collection">
+    <option value="any" selected>Collection link: Any</option>
+    <option value="with">With /collection/1</option>
+    <option value="without">Without /collection/1</option>
+  </select>
+  <select id="f-journal">
+    <option value="any" selected>Journal link: Any</option>
+    <option value="with">With /journal/p/1</option>
+    <option value="without">Without /journal/p/1</option>
+  </select>
   <div style="display:flex; gap:10px;">
     <button class="btn-apply" id="btn-apply">Apply</button>
     <button class="btn-reset" id="btn-reset">Reset</button>
@@ -323,10 +333,18 @@ function groupByUsername(items) {{
   const groups = new Map();
   for (const it of items) {{
     const key = (it.username || '').toLowerCase();
-    if (!groups.has(key)) groups.set(key, {{ username: it.username || '', profile_url: it.profile_url || '', entries: [] }});
+    if (!groups.has(key)) {{
+      groups.set(key, {{ username: it.username || '', profile_url: it.profile_url || '', entries: [], hasCollection: false, hasJournal: false }});
+    }}
+    const grp = groups.get(key);
     const ent = {{ latitude: it.latitude, longitude: it.longitude, image_url: it.image_url || '' }};
-    groups.get(key).entries.push(ent);
-    if (!groups.get(key).profile_url && it.profile_url) groups.get(key).profile_url = it.profile_url;
+    grp.entries.push(ent);
+    if (!grp.profile_url && it.profile_url) grp.profile_url = it.profile_url;
+    const urlsToCheck = [];
+    if (it.profile_url) urlsToCheck.push(String(it.profile_url).toLowerCase());
+    if (it.image_url) urlsToCheck.push(String(it.image_url).toLowerCase());
+    if (!grp.hasCollection && urlsToCheck.some(url => url.includes('/collection/1'))) grp.hasCollection = true;
+    if (!grp.hasJournal && urlsToCheck.some(url => url.includes('/journal/p/1'))) grp.hasJournal = true;
   }}
   return Array.from(groups.values());
 }}
@@ -344,16 +362,25 @@ function render(groups) {{
     const avgLat = avg(grp.entries.map(e=>e.latitude));
     const avgLon = avg(grp.entries.map(e=>e.longitude));
     const count = grp.entries.length;
+    const extras = [];
+    if (avgLat != null && avgLon != null) extras.push(`avg: ${{avgLat.toFixed(6)}}, ${{avgLon.toFixed(6)}}`);
+    const tags = [];
+    if (grp.hasCollection) tags.push('/collection/1');
+    if (grp.hasJournal) tags.push('/journal/p/1');
+    if (tags.length) extras.push(`links: ${{tags.join(', ')}}`);
+    const subText = [`${{count}} item(s)`].concat(extras).join(' • ');
     const block = document.createElement('div');
     block.className = 'user-block';
     block.dataset.username = (grp.username || '').toLowerCase();
     block.dataset.count = count;
     block.dataset.avgLat = avgLat ?? '';
     block.dataset.avgLon = avgLon ?? '';
+    block.dataset.hasCollection = grp.hasCollection ? 'true' : 'false';
+    block.dataset.hasJournal = grp.hasJournal ? 'true' : 'false';
     block.innerHTML = `
       <div class="user-header">
         <div><span class="username">@${{grp.username || '(no username)'}} </span>
-          <span class="user-sub">${{count}} item(s)${{avgLat!=null&&avgLon!=null?` • avg: ${{avgLat.toFixed(6)}}, ${{avgLon.toFixed(6)}}`:''}}</span>
+          <span class="user-sub">${{subText}}</span>
         </div>
         <a href="${{grp.profile_url || '#'}}" target="_blank">View Profile</a>
       </div>
@@ -386,11 +413,21 @@ function applyFilters() {{
   const lonMin = parseFloat(document.getElementById('f-lon-min').value);
   const lonMax = parseFloat(document.getElementById('f-lon-max').value);
   const key = document.getElementById('sort-by').value;
+  const collectionFilter = document.getElementById('f-collection').value;
+  const journalFilter = document.getElementById('f-journal').value;
 
   const blocks = Array.from(document.querySelectorAll('.user-block'));
   blocks.forEach(b => {{
     const uname = (b.dataset.username || '');
     const nameOk = !name || uname.includes(name);
+    const hasCollection = b.dataset.hasCollection === 'true';
+    const hasJournal = b.dataset.hasJournal === 'true';
+    const collectionOk = collectionFilter === 'any' || (collectionFilter === 'with' ? hasCollection : !hasCollection);
+    const journalOk = journalFilter === 'any' || (journalFilter === 'with' ? hasJournal : !hasJournal);
+    if (!collectionOk || !journalOk) {{
+      b.style.display = 'none';
+      return;
+    }}
     let anyVisible = false;
     const cards = b.querySelectorAll('.image-card');
     cards.forEach(c => {{
@@ -432,6 +469,8 @@ document.getElementById('btn-reset').addEventListener('click', () => {{
   document.getElementById('f-lon-min').value='';
   document.getElementById('f-lon-max').value='';
   document.getElementById('sort-by').value='count-desc';
+  document.getElementById('f-collection').value='any';
+  document.getElementById('f-journal').value='any';
   applyFilters();
 }});
 
