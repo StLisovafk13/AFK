@@ -1676,10 +1676,27 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "lat_sum":0.0, "lon_sum":0.0, "lat_n":0, "lon_n":0,
             "images": set(), "added_by": "",
             "sources": {}, "cities": set(), "first_at": None, "last_at": None,
+            "has_collection": False, "has_journal": False,
         })
         if purl and not g["profile_url"]:
             g["profile_url"] = purl
-        if img: g["images"].add(img)
+        if img:
+            g["images"].add(img)
+        urls_to_check = []
+        if purl:
+            try:
+                urls_to_check.append(str(purl).lower())
+            except Exception:
+                pass
+        if img:
+            try:
+                urls_to_check.append(str(img).lower())
+            except Exception:
+                pass
+        if urls_to_check and not g["has_collection"]:
+            g["has_collection"] = any("/collection/1" in url for url in urls_to_check)
+        if urls_to_check and not g["has_journal"]:
+            g["has_journal"] = any("/journal/p/1" in url for url in urls_to_check)
         if lat is not None and lon is not None:
             try:
                 lat_f = float(lat); lon_f = float(lon)
@@ -1756,6 +1773,8 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "cities": city_list,
             "first_created": g.get("first_at"),
             "last_created": g.get("last_at"),
+            "has_collection": bool(g.get("has_collection")),
+            "has_journal": bool(g.get("has_journal")),
         })
     conn.close()
     return out
@@ -1857,6 +1876,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     .chip {{ display:inline-flex; align-items:center; padding:4px 8px; border-radius:999px; font-size:11px; background:#f3f4f6; color:#374151; }}
     .chip-city {{ background:#dbeafe; color:#1d4ed8; }}
     .chip-data {{ background:#dcfce7; color:#047857; }}
+    .chip-link {{ background:#fee2e2; color:#b91c1c; }}
     .meta.created {{ color:#4b5563; }}
     .stats {{ color:#6b7280; margin: 6px 0 10px 0; }}
     .grid {{ display:grid; grid-template-columns: repeat(auto-fill,minmax(300px,1fr)); gap:14px; }}
@@ -1942,6 +1962,22 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
           <option value=\"\">Все</option>
           <option value=\"with\">Есть комментарии</option>
           <option value=\"without\">Без комментариев</option>
+        </select>
+      </div>
+      <div class=\"field\">
+        <label for=\"collectionFilter\">Коллекции</label>
+        <select id=\"collectionFilter\">
+          <option value=\"\">Все</option>
+          <option value=\"with\">Есть /collection/1</option>
+          <option value=\"without\">Нет /collection/1</option>
+        </select>
+      </div>
+      <div class=\"field\">
+        <label for=\"journalFilter\">Журнал</label>
+        <select id=\"journalFilter\">
+          <option value=\"\">Все</option>
+          <option value=\"with\">Есть /journal/p/1</option>
+          <option value=\"without\">Нет /journal/p/1</option>
         </select>
       </div>
       <div class=\"field\">
@@ -2031,6 +2067,8 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     const cityDatalist = document.getElementById('cityOptionsList');
     const commentInput = document.getElementById('commentInput');
     const hasCommentsSelect = document.getElementById('hasComments');
+    const collectionSelect = document.getElementById('collectionFilter');
+    const journalSelect = document.getElementById('journalFilter');
     const addedSelect = document.getElementById('addedSelect');
     const dateFromInput = document.getElementById('dateFrom');
     const dateToInput = document.getElementById('dateTo');
@@ -2194,6 +2232,14 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       if (addedKey && !addedOptions[addedKey]) {{
         addedOptions[addedKey] = addedLabel || addedKey;
       }}
+      const hasCollection = !!u.has_collection;
+      const hasJournal = !!u.has_journal;
+      u._hasCollection = hasCollection;
+      u._hasJournal = hasJournal;
+      const linkTags = [];
+      if (hasCollection) linkTags.push('/collection/1');
+      if (hasJournal) linkTags.push('/journal/p/1');
+      u._linkTags = linkTags;
       const searchParts = [];
       const username = (u.username || '').toString();
       if (username) searchParts.push(username.toLowerCase());
@@ -2204,6 +2250,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         if (ds.valueLower) searchParts.push(ds.valueLower);
       }});
       preparedCities.forEach(entry => searchParts.push(entry.lower));
+      linkTags.forEach(tag => searchParts.push(tag.toLowerCase()));
       u._searchText = searchParts.join(' ');
       const firstTs = parseDateValue(u.first_created);
       const lastTs = parseDateValue(u.last_created);
@@ -2348,6 +2395,9 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       if (user.last_created && user.last_created !== user.first_created) {{
         infoExtra.push('<span>🕒 Последнее: ' + escapeHtml(user.last_created) + '</span>');
       }}
+      if (user._linkTags && user._linkTags.length) {{
+        infoExtra.push('<span>🔗 ' + user._linkTags.map(tag => escapeHtml(tag)).join(', ') + '</span>');
+      }}
       profileInfoExtra.innerHTML = infoExtra.join('');
       profileInfoExtra.classList.toggle('hidden', infoExtra.length === 0);
 
@@ -2419,6 +2469,9 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
           const label = ds.label || ds.value;
           if (label) chipParts.push('<span class="chip chip-data">' + escapeHtml(label) + '</span>');
         }});
+        (u._linkTags || []).forEach(tag=>{{
+          chipParts.push('<span class="chip chip-link">' + escapeHtml(tag) + '</span>');
+        }});
         const chipsHtml = chipParts.length ? '<div class="chips">' + chipParts.join('') + '</div>' : '';
         const createdHtml = u._createdRangeLabel ? '<div class="meta created">Добавлено: ' + escapeHtml(u._createdRangeLabel) + '</div>' : '';
         const card = document.createElement('div');
@@ -2464,6 +2517,8 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       const hasExactCity = cityLower && Object.prototype.hasOwnProperty.call(cityLookup, cityLower);
       const commentValue = commentInput ? commentInput.value.trim().toLowerCase() : '';
       const hasCommentsValue = hasCommentsSelect ? hasCommentsSelect.value : '';
+      const collectionValue = collectionSelect ? collectionSelect.value : '';
+      const journalValue = journalSelect ? journalSelect.value : '';
       const addedValue = addedSelect ? addedSelect.value : '';
       const fromTs = dateFromInput ? toDateRangeValue(dateFromInput.value, false) : null;
       const toTs = dateToInput ? toDateRangeValue(dateToInput.value, true) : null;
@@ -2490,6 +2545,10 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         const commentCount = typeof u.comments_count === 'number' ? u.comments_count : (Array.isArray(u.comments) ? u.comments.length : 0);
         if (hasCommentsValue === 'with' && commentCount === 0) return false;
         if (hasCommentsValue === 'without' && commentCount > 0) return false;
+        if (collectionValue === 'with' && !u._hasCollection) return false;
+        if (collectionValue === 'without' && u._hasCollection) return false;
+        if (journalValue === 'with' && !u._hasJournal) return false;
+        if (journalValue === 'without' && u._hasJournal) return false;
         if (addedValue && u._addedKey !== addedValue) return false;
         if (fromTs != null && getNewestTs(u) < fromTs) return false;
         if (toTs != null && getOldestTs(u) > toTs) return false;
@@ -2506,6 +2565,8 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       if (cityInput) cityInput.value='';
       if (commentInput) commentInput.value='';
       if (hasCommentsSelect) hasCommentsSelect.value='';
+      if (collectionSelect) collectionSelect.value='';
+      if (journalSelect) journalSelect.value='';
       if (addedSelect) addedSelect.value='';
       if (dateFromInput) dateFromInput.value='';
       if (dateToInput) dateToInput.value='';
@@ -2521,7 +2582,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     if (cityInput) cityInput.addEventListener('input', debouncedApply);
     if (commentInput) commentInput.addEventListener('input', debouncedApply);
 
-    [datasetSelect, hasCommentsSelect, addedSelect, sortSelect].forEach(el => {{
+    [datasetSelect, hasCommentsSelect, collectionSelect, journalSelect, addedSelect, sortSelect].forEach(el => {{
       if (el) el.addEventListener('change', apply);
     }});
     if (dateFromInput) dateFromInput.addEventListener('change', apply);

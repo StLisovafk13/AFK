@@ -103,6 +103,40 @@ def test_profile_link_scans_direct_media(monkeypatch, vsco_module):
     assert set(gallery_users[0]["images"]) == set(assets)
 
 
+def test_gallery_flags_collection_and_journal(vsco_module):
+    pairs = [
+        {
+            "username": "collector",
+            "url": "https://vsco.co/collector",
+            "image_url": "https://vsco.co/collector/collection/1",
+            "comment": "",
+        },
+        {
+            "username": "writer",
+            "url": "https://vsco.co/writer",
+            "image_url": "https://vsco.co/writer/journal/p/1",
+            "comment": "",
+        },
+    ]
+
+    vsco_module.upsert_items_with_comments(
+        chat_id=555,
+        pairs=pairs,
+        source="text",
+        source_file="message",
+        added_by="",
+    )
+
+    gallery_users = vsco_module.fetch_gallery_users("chat", 555)
+    assert gallery_users, "gallery should return inserted users"
+    data = {entry["username"]: entry for entry in gallery_users}
+
+    assert data["collector"]["has_collection"] is True
+    assert data["collector"].get("has_journal") is False
+    assert data["writer"].get("has_collection") is False
+    assert data["writer"]["has_journal"] is True
+
+
 def test_on_text_creates_profile_urls_file(monkeypatch, vsco_module):
     assets = [
         "https://cdn.example.com/photo1.jpg",
