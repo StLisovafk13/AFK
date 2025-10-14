@@ -11,13 +11,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import io
 import logging
 import re
 import sqlite3
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import aiohttp
 
@@ -33,6 +35,12 @@ from vsco_utils import (
 )
 
 
+try:  # pragma: no cover - optional dependency
+    from PIL import ExifTags, Image
+except Exception:  # pragma: no cover - optional dependency
+    Image = None  # type: ignore
+    ExifTags = None  # type: ignore
+
 LOGGER = logging.getLogger("vsco.profile_scanner")
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -40,6 +48,88 @@ DEFAULT_USER_AGENT = (
 )
 DEFAULT_DB = Path("vsco_links.db")
 LOCAL_TZ = timezone(timedelta(hours=3))
+
+
+def _is_image_url(url: str) -> bool:
+    low = url.lower()
+    return low.endswith((".jpg", ".jpeg", ".png", ".webp"))
+
+
+def _rational_to_float(value) -> float:
+    try:
+        if hasattr(value, "numerator") and hasattr(value, "denominator"):
+            denom = float(value.denominator)
+            if not denom:
+                return 0.0
+            return float(value.numerator) / denom
+        if isinstance(value, tuple) and len(value) == 2:
+            num, denom = value
+            denom_f = float(denom)
+            if not denom_f:
+                return 0.0
+            return float(num) / denom_f
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _gps_to_decimal(coord, ref) -> float | None:
+    if not coord or ref is None:
+        return None
+    try:
+        degrees = _rational_to_float(coord[0])
+        minutes = _rational_to_float(coord[1])
+        seconds = _rational_to_float(coord[2])
+    except Exception:
+        return None
+    decimal = degrees + minutes / 60 + seconds / 3600
+    if (ref or "").upper() in {"S", "W"}:
+        decimal *= -1
+    return decimal
+
+
+def _extract_gps_from_image_bytes(data: bytes) -> tuple[float | None, float | None]:
+    if not data or Image is None or ExifTags is None:
+        return None, None
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            exif = img._getexif()  # type: ignore[attr-defined]
+    except Exception:
+        return None, None
+    if not exif:
+        return None, None
+    try:
+        tag_map = {ExifTags.TAGS.get(tag, tag): value for tag, value in exif.items()}
+    except Exception:
+        tag_map = {}
+    gps_info = tag_map.get("GPSInfo")
+    if not isinstance(gps_info, dict):
+        return None, None
+    try:
+        gps_map = {ExifTags.GPSTAGS.get(tag, tag): value for tag, value in gps_info.items()}
+    except Exception:
+        gps_map = {}
+    lat = _gps_to_decimal(gps_map.get("GPSLatitude"), gps_map.get("GPSLatitudeRef"))
+    lon = _gps_to_decimal(gps_map.get("GPSLongitude"), gps_map.get("GPSLongitudeRef"))
+    return lat, lon
+
+
+def _fetch_image_bytes(url: str, *, timeout: float = 10.0, max_bytes: int = 4_194_304) -> bytes:
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": DEFAULT_USER_AGENT})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read(max_bytes)
+    except Exception:
+        return b""
+
+
+def extract_gps_from_url(url: str) -> tuple[float | None, float | None]:
+    if not _is_image_url(url):
+        return None, None
+    data = _fetch_image_bytes(url)
+    if not data:
+        return None, None
+    return _extract_gps_from_image_bytes(data)
 
 
 @dataclass(slots=True)
@@ -367,6 +457,7 @@ def store_profile_media(
     *,
     source: str = "profile-scan",
     added_by: str = "",
+    gps_fetcher: Callable[[str], tuple[float | None, float | None]] | None = extract_gps_from_url,
 ) -> ScanResult:
     """Persist collected media URLs into the bot database."""
 
@@ -382,6 +473,33 @@ def store_profile_media(
     try:
         added_items = 0
         for url in prepared:
+            existing = conn.execute(
+                """
+                SELECT latitude, longitude FROM items
+                WHERE chat_id=? AND username=? AND image_url=? AND profile_url=?
+                """,
+                (chat_id, username, url, profile_url),
+            ).fetchone()
+            existing_lat = existing_lon = None
+            if existing:
+                existing_lat, existing_lon = existing
+
+            lat, lon = existing_lat, existing_lon
+            should_fetch = (
+                gps_fetcher is not None
+                and _is_image_url(url)
+                and (lat is None or lon is None)
+            )
+            if should_fetch:
+                try:
+                    fetched_lat, fetched_lon = gps_fetcher(url)
+                except Exception:
+                    fetched_lat = fetched_lon = None
+                if fetched_lat is not None:
+                    lat = fetched_lat
+                if fetched_lon is not None:
+                    lon = fetched_lon
+
             cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO items(
@@ -392,8 +510,8 @@ def store_profile_media(
                 (
                     chat_id,
                     username,
-                    None,
-                    None,
+                    lat,
+                    lon,
                     profile_url,
                     url,
                     source,
@@ -404,6 +522,18 @@ def store_profile_media(
             )
             if cur.rowcount > 0:
                 added_items += 1
+            elif (lat is not None or lon is not None) and (
+                lat != existing_lat or lon != existing_lon
+            ):
+                conn.execute(
+                    """
+                    UPDATE items
+                    SET latitude = COALESCE(latitude, ?),
+                        longitude = COALESCE(longitude, ?)
+                    WHERE chat_id=? AND username=? AND image_url=? AND profile_url=?
+                    """,
+                    (lat, lon, chat_id, username, url, profile_url),
+                )
         conn.execute(
             "INSERT OR IGNORE INTO links(chat_id,username,url,created_at) VALUES(?,?,?,?)",
             (chat_id, username, profile_url, utc_now_iso()),
