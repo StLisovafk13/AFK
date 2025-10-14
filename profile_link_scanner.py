@@ -23,11 +23,12 @@ import aiohttp
 
 from vsco_utils import (
     dedupe_keep_order,
+    extract_media_urls_from_html,
     is_media_url,
     is_vsco_logo_url,
     normalize_media_url,
     normalize_vsco_profile_url,
-    playwright_scan_profile,
+    scan_profile_media,
     upscale_w_param,
 )
 
@@ -150,6 +151,149 @@ def resolve_profile_inputs(username: str | None, profile_url: str | None) -> tup
     return clean_username, f"https://vsco.co/{clean_username}/gallery"
 
 
+async def _collect_with_playwright(
+    profile_url: str,
+    *,
+    headers: dict[str, str],
+    max_width: int,
+    delay: float,
+    target_count: int,
+) -> list[str]:
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as exc:  # pragma: no cover - optional dependency
+        LOGGER.info("Playwright недоступен, откатываемся на HTTP: %s", exc)
+        return []
+
+    gallery_url = profile_url.rstrip("/")
+    if not gallery_url.endswith("/gallery"):
+        gallery_url = f"{gallery_url}/gallery"
+
+    async def _extract(page) -> list[str]:
+        html = await page.content()
+        root = getattr(page, "url", None) or gallery_url
+        urls = extract_media_urls_from_html(html, max_width=max_width, root=root)
+        return [u for u in urls if not is_vsco_logo_url(u)]
+
+    async def _scroll(page) -> list[str]:
+        urls = dedupe_keep_order(await _extract(page))
+        if urls:
+            LOGGER.info("Нашли %d ссылок на первом экране", len(urls))
+        else:
+            LOGGER.warning("На первом экране ссылки не найдены, пробуем прокрутку")
+
+        max_scrolls = (
+            999999
+            if target_count == 0
+            else max(30, min(999999, target_count // 2 + 20))
+        )
+        max_clicks = 500
+        stagnation_limit = 5
+        no_growth_click_limit = 3
+
+        last_height = await page.evaluate("() => document.body.scrollHeight")
+        stagnation = 0
+        load_clicks = 0
+        clicks_without_growth = 0
+        prev_count = len(urls)
+
+        for _ in range(max_scrolls):
+            btn = page.locator("#loadMore-Button").first
+            try:
+                btn_exists = (await btn.count()) > 0
+                btn_visible = btn_exists and (await btn.is_visible())
+                disabled_attr = await btn.get_attribute("disabled") if btn_exists else None
+                aria_disabled = (
+                    await btn.get_attribute("aria-disabled") if btn_exists else None
+                )
+                btn_disabled = (
+                    disabled_attr is not None
+                    or (aria_disabled or "").lower() in {"true", "1"}
+                )
+            except Exception:
+                btn_exists = btn_visible = False
+                btn_disabled = True
+
+            clicked = False
+            if btn_exists and btn_visible and not btn_disabled and load_clicks < max_clicks:
+                try:
+                    await btn.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                try:
+                    await btn.click()
+                    load_clicks += 1
+                    clicked = True
+                    LOGGER.debug("Клик по Load More #%d", load_clicks)
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=2000)
+                    except Exception:
+                        await page.wait_for_timeout(int(max(0.1, delay) * 1000))
+                except Exception as exc:
+                    LOGGER.debug("Не удалось кликнуть Load More: %s", exc)
+
+            await page.evaluate(
+                "() => { window.scrollBy(0, Math.floor(window.innerHeight * 0.9)); }"
+            )
+            await page.wait_for_timeout(int(max(0.1, delay) * 1000))
+
+            extracted = dedupe_keep_order(await _extract(page))
+            combined = dedupe_keep_order(urls + extracted)
+            if len(combined) > prev_count:
+                LOGGER.info("Прогресс: %d ссылок", len(combined))
+            urls = combined
+
+            new_height = await page.evaluate("() => document.body.scrollHeight")
+            grew = (new_height > last_height) or (len(urls) > prev_count)
+
+            if grew:
+                stagnation = 0
+                if len(urls) > prev_count:
+                    clicks_without_growth = 0
+                last_height = max(last_height, new_height)
+                prev_count = len(urls)
+            else:
+                stagnation += 1
+                if clicked:
+                    clicks_without_growth += 1
+
+            if target_count and len(urls) >= target_count:
+                LOGGER.debug("Достигли целевого количества ссылок")
+                break
+            if (
+                (not btn_exists or not btn_visible or btn_disabled)
+                and stagnation >= stagnation_limit
+            ):
+                LOGGER.debug("Похоже, достигнут конец ленты")
+                break
+            if clicked and clicks_without_growth >= no_growth_click_limit:
+                LOGGER.debug("Клики Load More не дают новых ссылок, останавливаемся")
+                break
+
+        return urls
+
+    browser = context = page = None
+    try:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            context = await browser.new_context(extra_http_headers=headers)
+            page = await context.new_page()
+            await page.goto(gallery_url, wait_until="networkidle")
+            return await _scroll(page)
+    except Exception as exc:
+        LOGGER.warning("Playwright не справился: %s", exc)
+    finally:
+        for handle in (page, context, browser):
+            if handle is None:
+                continue
+            try:
+                await handle.close()  # type: ignore[func-returns-value]
+            except Exception:
+                pass
+
+    return []
+
+
 async def collect_profile_media(
     profile_url: str,
     *,
@@ -164,15 +308,25 @@ async def collect_profile_media(
     if headers:
         session_headers.update(headers)
 
+    urls = await _collect_with_playwright(
+        profile_url,
+        headers=session_headers,
+        max_width=max_width,
+        delay=delay,
+        target_count=target_count,
+    )
+
+    if urls:
+        return urls
+
     async with aiohttp.ClientSession(headers=session_headers) as session:
-        urls = await playwright_scan_profile(
+        urls = await scan_profile_media(
+            session,
             profile_url,
             max_width=max_width,
-            session=session,
             logger=LOGGER,
-            delay=delay,
-            target_count=target_count,
         )
+
     if not urls:
         LOGGER.warning("Не удалось получить ссылки медиа для %s", profile_url)
     return urls
