@@ -1307,8 +1307,6 @@ async def _maybe_schedule_profile_scans(
         username = (data or {}).get("username") or username_from_vsco_co(normalized_link) or ""
         if not username:
             continue
-        if data and data.get("has_media"):
-            continue
         job = ProfileScanJob(
             chat_id=chat_id,
             username=username,
