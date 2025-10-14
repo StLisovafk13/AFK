@@ -1292,13 +1292,10 @@ async def _maybe_schedule_profile_scans(
             username = username_from_vsco_co(normalized_url) or ""
         if not username:
             continue
-        entry = profile_map.setdefault(
+        profile_map.setdefault(
             normalized_url,
-            {"username": username, "has_media": False},
+            {"username": username},
         )
-        image_url = (record.get("image_url") or "").strip()
-        if image_url:
-            entry["has_media"] = True
 
     scheduled = 0
     for link in dict.fromkeys(new_links):
@@ -1306,8 +1303,6 @@ async def _maybe_schedule_profile_scans(
         data = profile_map.get(normalized_link)
         username = (data or {}).get("username") or username_from_vsco_co(normalized_link) or ""
         if not username:
-            continue
-        if data and data.get("has_media"):
             continue
         job = ProfileScanJob(
             chat_id=chat_id,
