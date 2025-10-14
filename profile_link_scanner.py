@@ -161,6 +161,7 @@ async def _collect_with_playwright(
 ) -> list[str]:
     try:
         from playwright.async_api import async_playwright
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
     except Exception as exc:  # pragma: no cover - optional dependency
         LOGGER.info("Playwright недоступен, откатываемся на HTTP: %s", exc)
         return []
@@ -278,7 +279,19 @@ async def _collect_with_playwright(
             browser = await playwright.chromium.launch(headless=True)
             context = await browser.new_context(extra_http_headers=headers)
             page = await context.new_page()
-            await page.goto(gallery_url, wait_until="networkidle")
+            try:
+                await page.goto(
+                    gallery_url,
+                    wait_until="domcontentloaded",
+                    timeout=60000,
+                )
+            except PlaywrightTimeoutError as exc:
+                LOGGER.warning(
+                    "Playwright не дождался полной загрузки страницы: %s", exc
+                )
+            except Exception:
+                # На этом этапе дальнейшая прокрутка бессмысленна.
+                raise
             return await _scroll(page)
     except Exception as exc:
         LOGGER.warning("Playwright не справился: %s", exc)
