@@ -73,8 +73,58 @@ sqlite3 vsco_links.db "DELETE FROM links WHERE username='vsco_user';"
 
 ## 5. Автоматизация и интеграция
 
-- Скрипт возвращает JSON-подобный результат `ScanResult`, поэтому его можно импортировать из другого Python-кода и использовать функции `collect_profile_media` и `store_profile_media` напрямую.
-- При интеграции в бота используйте ту же БД или передавайте отдельный путь через `--db`.
-- Чтобы не блокировать основной поток бота, вызывайте `collect_profile_media` из асинхронного контекста и работайте с результатом через `await`.
+Ниже приведён практический пример того, как использовать функции сканера прямо из кода бота.
 
-Эти шаги позволят собирать ссылки, проверять их и подключать к существующей инфраструктуре без скачивания файлов.
+### 5.1 Импорт и повторное использование базы
+
+- Подключите модуль в коде бота:
+  ```python
+  from pathlib import Path
+
+  from profile_link_scanner import collect_profile_media, store_profile_media
+  ```
+- Передайте путь к той же БД, с которой работает бот. Если бот уже знает путь (например, `settings.DB_PATH`), передайте его в `Path(settings.DB_PATH)`. При необходимости можно создать отдельную базу: `Path("/path/to/links.db")`.
+
+### 5.2 Асинхронное получение ссылок
+
+Функция `collect_profile_media` является корутиной и выполняет сетевые запросы, поэтому её нужно вызывать с `await` внутри существующего event loop бота (например, обработчика aiogram):
+
+```python
+async def handle_vsco_scan(message: Message, profile_url: str) -> None:
+    media_urls = await collect_profile_media(
+        profile_url,
+        max_width=2048,
+        delay=0.4,
+        target_count=0,
+    )
+    result = store_profile_media(
+        Path("vsco_links.db"),
+        chat_id=message.chat.id,
+        username=message.from_user.username or "",
+        profile_url=profile_url,
+        media_urls=media_urls,
+        source="bot",
+        added_by=str(message.from_user.id),
+    )
+    await message.answer(
+        f"Добавлено ссылок: {result.added_items}, всего найдено: {len(result.media_urls)}"
+    )
+```
+
+Если обработчик должен запускать сканирование «в фоне», можно использовать `asyncio.create_task`:
+
+```python
+async def start_background_scan(profile_url: str, chat_id: int, username: str) -> None:
+    async def _scan() -> None:
+        media_urls = await collect_profile_media(profile_url)
+        store_profile_media(Path("vsco_links.db"), chat_id, username, profile_url, media_urls)
+
+    asyncio.create_task(_scan())
+```
+
+### 5.3 Работа с результатом
+
+- `store_profile_media` возвращает объект `ScanResult`. Он содержит поля `media_urls`, `added_items` и `link_added`, поэтому результат можно сохранить или отправить в лог.
+- `collect_profile_media` можно переиспользовать, чтобы получить ссылки без немедленной записи в базу (например, для предпросмотра или фильтрации перед сохранением).
+
+Эти шаги позволяют переиспользовать готовую логику сканера внутри бота, не блокируя основной поток и не создавая дублирующих таблиц в базе данных.
