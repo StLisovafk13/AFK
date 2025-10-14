@@ -1,7 +1,12 @@
-# Version: 18.4.3 — 2025-10-02
+# Version: 19.0.0 — 2025-10-02
 # Python: 3.11
-# Telegram VSCO Toolkit Bot — v18.4.3
-# Изменения (18.4.3):
+# Telegram VSCO Toolkit Bot — v19.0.0
+# Изменения (19.0.0):
+# - NEW: Фоновый worker profile_link_scanner обрабатывает очередь профилей из общей БД и уведомляет чаты о новых медиа.
+# - NEW: Автоматическое помещение ссылок профилей в очередь сканирования при импорте текста, CSV и HTML.
+# - FIX: Совместный запуск/остановка фоновых задач загрузчика и сканера теперь синхронизированы.
+#
+# Ранее в 18.4.3:
 # - NEW: Добавлены раздельные каналы архива и сводки (BOT_ARCHIVE_ADMIN_CHANNEL_ID, BOT_ARCHIVE_SUMMARY_CHANNEL_ID) с авторассылкой архивов и итогов.
 # - NEW: Для сводочного канала формируется единый ZIP при отправке нескольких частей.
 # - UI: Возвращена клавиатура экспорта /export с выбором области и форматов.
@@ -26,7 +31,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple, Sequence
+from typing import Iterable, List, Optional, Dict, Any, Tuple, Sequence
 from datetime import datetime, timedelta, timezone
 from urllib.parse import (
     urljoin,
@@ -93,6 +98,11 @@ from vsco_utils import (
     normalize_media_url,
     playwright_scan_profile,
     upscale_w_param,
+)
+from profile_link_scanner import (
+    collect_profile_media,
+    store_profile_media,
+    ScanResult,
 )
 
 # ---------------------- setup & logging ----------------------
@@ -1257,6 +1267,74 @@ def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source:
         return (added_items, added_comments, new_links)
     finally:
         conn.close()
+
+async def _maybe_schedule_profile_scans(
+    chat_id: int,
+    records: Iterable[Dict[str, Any]],
+    new_links: Sequence[str],
+    *,
+    added_by: str,
+    source: str,
+) -> None:
+    if not new_links:
+        return
+
+    profile_map: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        raw_url = (record.get("url") or record.get("profile_url") or "").strip()
+        if not raw_url:
+            continue
+        normalized_url = normalize_vsco_profile_url(raw_url) or raw_url
+        username = (record.get("username") or "").strip().lstrip("@")
+        if not username:
+            username = username_from_vsco_co(normalized_url) or ""
+        if not username:
+            continue
+        entry = profile_map.setdefault(
+            normalized_url,
+            {"username": username, "has_media": False},
+        )
+        image_url = (record.get("image_url") or "").strip()
+        if image_url:
+            entry["has_media"] = True
+
+    scheduled = 0
+    for link in dict.fromkeys(new_links):
+        normalized_link = normalize_vsco_profile_url(link) or link
+        data = profile_map.get(normalized_link)
+        username = (data or {}).get("username") or username_from_vsco_co(normalized_link) or ""
+        if not username:
+            continue
+        if data and data.get("has_media"):
+            continue
+        job = ProfileScanJob(
+            chat_id=chat_id,
+            username=username,
+            profile_url=normalized_link,
+            source=source,
+            added_by=added_by,
+        )
+        try:
+            scheduled_now = await _enqueue_profile_scan(job)
+        except Exception:
+            log.exception(
+                "Failed to enqueue profile scan: chat_id=%s profile_url=%s",
+                chat_id,
+                normalized_link,
+            )
+            continue
+        if scheduled_now:
+            scheduled += 1
+
+    if scheduled:
+        log.info(
+            "Queued %s background profile scan job(s) for chat_id=%s",
+            scheduled,
+            chat_id,
+        )
+
 
 def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_file: str, added_by: str) -> Tuple[int, List[str]]:
     if not rows:
@@ -3576,6 +3654,13 @@ async def on_document(msg: Message):
             added_by=added_by,
         )
         added_items += ai; added_comments += ac; new_links.extend(links)
+        await _maybe_schedule_profile_scans(
+            msg.chat.id,
+            pairs,
+            links,
+            added_by=added_by,
+            source="text",
+        )
 
     p = ses.dir / (doc.file_name or "file.bin")
     await msg.bot.download(doc, destination=p)
@@ -3622,6 +3707,13 @@ async def on_document(msg: Message):
             added_items += ai
             added_comments += ac
             new_links.extend(links)
+            await _maybe_schedule_profile_scans(
+                msg.chat.id,
+                pairs,
+                links,
+                added_by=added_by,
+                source="csv",
+            )
             links_block = format_new_links_block(new_links)
             notice_block = format_profile_urls_notice(caption_profile_files, ses.dir)
             await msg.answer(
@@ -3645,6 +3737,13 @@ async def on_document(msg: Message):
                 rows,
                 source_file=p.name,
                 added_by=added_by,
+            )
+            await _maybe_schedule_profile_scans(
+                msg.chat.id,
+                rows,
+                html_links,
+                added_by=added_by,
+                source="html",
             )
             all_links: List[str] = []
             if msg.caption:
@@ -3758,6 +3857,13 @@ async def on_text(msg: Message):
         source="text",
         source_file="message",
         added_by=added_by,
+    )
+    await _maybe_schedule_profile_scans(
+        msg.chat.id,
+        pairs,
+        links,
+        added_by=added_by,
+        source="text",
     )
     links_block = format_new_links_block(links)
     notice_block = format_profile_urls_notice(profile_files, ses.dir)
@@ -3980,6 +4086,10 @@ _DL_WORKER_TASK: asyncio.Task | None = None
 _DL_COUNTER = 0  # монотонный ID джоб
 _CURRENT_JOB: Dict[str, Any] | None = None
 
+_PROFILE_SCAN_QUEUE: asyncio.Queue | None = None
+_PROFILE_SCAN_TASK: asyncio.Task | None = None
+_PROFILE_SCAN_PENDING: set[tuple[int, str]] = set()
+
 
 async def _enqueue_download_request(
     msg: Message,
@@ -4063,6 +4173,114 @@ class DLJob:
     out_base: Path        # базовая папка для выдачи
     cancelled: bool = False
     requested_by: str = ""
+
+
+@dataclass
+class ProfileScanJob:
+    chat_id: int
+    username: str
+    profile_url: str
+    source: str = "bot"
+    added_by: str = ""
+
+
+async def _enqueue_profile_scan(job: ProfileScanJob) -> bool:
+    normalized_url = normalize_vsco_profile_url(job.profile_url) or job.profile_url
+    username = (job.username or "").lstrip("@")
+    if not normalized_url or not username:
+        return False
+
+    job.profile_url = normalized_url
+    job.username = username
+
+    key = (job.chat_id, normalized_url.lower())
+    if key in _PROFILE_SCAN_PENDING:
+        log.debug(
+            "Profile scan already scheduled: chat_id=%s profile_url=%s",
+            job.chat_id,
+            normalized_url,
+        )
+        return False
+
+    global _PROFILE_SCAN_QUEUE
+    if _PROFILE_SCAN_QUEUE is None:
+        _PROFILE_SCAN_QUEUE = asyncio.Queue()
+
+    await _PROFILE_SCAN_QUEUE.put(job)
+    _PROFILE_SCAN_PENDING.add(key)
+    log.info(
+        "Profile scan scheduled: chat_id=%s profile_url=%s added_by=%s",
+        job.chat_id,
+        normalized_url,
+        job.added_by,
+    )
+    return True
+
+
+async def _profile_scan_worker() -> None:
+    global _PROFILE_SCAN_QUEUE
+    if _PROFILE_SCAN_QUEUE is None:
+        _PROFILE_SCAN_QUEUE = asyncio.Queue()
+
+    log.info("Profile scan worker started")
+    while True:
+        job: ProfileScanJob = await _PROFILE_SCAN_QUEUE.get()
+        key = (job.chat_id, job.profile_url.lower())
+        try:
+            log.info(
+                "Profile scan worker: start chat_id=%s profile_url=%s",
+                job.chat_id,
+                job.profile_url,
+            )
+            media_urls = await collect_profile_media(
+                job.profile_url,
+                max_width=MEDIA_PAGE_MAX_WIDTH,
+            )
+            result: ScanResult = store_profile_media(
+                Path(DB_PATH),
+                job.chat_id,
+                job.username,
+                job.profile_url,
+                media_urls,
+                source=job.source,
+                added_by=job.added_by,
+            )
+            if result.added_items > 0 or not result.media_urls:
+                total = len(result.media_urls)
+                text = (
+                    f"🔍 Профиль <code>@{escape(job.username)}</code> — найдено ссылок: <b>{total}</b>. "
+                    f"Новых: <b>{result.added_items}</b>."
+                )
+                if not result.media_urls:
+                    text += "\n⚠️ Не удалось обнаружить медиа у этого профиля."
+                with contextlib.suppress(Exception):
+                    await bot.send_message(
+                        job.chat_id,
+                        text,
+                        parse_mode="HTML",
+                    )
+        except asyncio.CancelledError:
+            log.info("Profile scan worker cancelled")
+            raise
+        except Exception:
+            log.exception(
+                "Profile scan worker failed for chat_id=%s profile_url=%s",
+                job.chat_id,
+                job.profile_url,
+            )
+            with contextlib.suppress(Exception):
+                await bot.send_message(
+                    job.chat_id,
+                    (
+                        "❌ Не удалось сканировать профиль "
+                        f"<code>{escape(job.profile_url)}</code>."
+                    ),
+                    parse_mode="HTML",
+                )
+        finally:
+            _PROFILE_SCAN_PENDING.discard(key)
+            if _PROFILE_SCAN_QUEUE is not None:
+                _PROFILE_SCAN_QUEUE.task_done()
 
 def _dl_script_path() -> Path:
     # vsco_downloader.py должен лежать рядом с текущим файлом
@@ -5147,10 +5365,19 @@ async def main():
     if _DL_WORKER_TASK is None or _DL_WORKER_TASK.done():
         _DL_WORKER_TASK = asyncio.create_task(_dl_worker())
     # -----------------------------
+    global _PROFILE_SCAN_TASK, _PROFILE_SCAN_QUEUE
+    if _PROFILE_SCAN_QUEUE is None:
+        _PROFILE_SCAN_QUEUE = asyncio.Queue()
+    if _PROFILE_SCAN_TASK is None or _PROFILE_SCAN_TASK.done():
+        _PROFILE_SCAN_TASK = asyncio.create_task(_profile_scan_worker())
     log.info("Bot is starting polling…")
     try:
         await _start_polling_with_retries()
     finally:
+        if _PROFILE_SCAN_TASK:
+            _PROFILE_SCAN_TASK.cancel()
+            with contextlib.suppress(Exception):
+                await _PROFILE_SCAN_TASK
         if _DL_WORKER_TASK:
             _DL_WORKER_TASK.cancel()
             with contextlib.suppress(Exception):
