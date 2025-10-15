@@ -385,7 +385,8 @@ def test_has_daily_data_access_admin_override(vsco_module):
     allowed, message = vsco_module.has_daily_data_access(chat_id=100, user_id=42)
     assert allowed is True
     assert "Администратор" in message
-    assert "с координатами" in message
+    assert "новых профилей" in message
+    assert str(vsco_module.DAILY_PROFILE_LIMIT) in message
 
 
 def test_admin_command_displays_menu(vsco_module):

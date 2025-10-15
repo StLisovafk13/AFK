@@ -715,19 +715,17 @@ def fetch_profile_archive_info(username: Optional[str], *, max_items: int = 120)
     finally:
         conn.close()
 
-DAILY_COORDS_LIMIT = 0
-DAILY_NO_COORDS_LIMIT = 0
+DAILY_PROFILE_LIMIT = 20
 
 
-def _daily_item_counts(chat_id: int) -> Tuple[int, int]:
+def _daily_profile_count(chat_id: int) -> int:
     since = _since_utc_iso(1)
     conn = db_connect()
+    username_key_sql = "LOWER(TRIM(COALESCE(username,'')))"
     try:
-        with_coords, without_coords = conn.execute(
-            """
-            SELECT
-                SUM(CASE WHEN latitude IS NOT NULL AND longitude IS NOT NULL THEN 1 ELSE 0 END) AS with_coords,
-                SUM(CASE WHEN latitude IS NULL OR longitude IS NULL THEN 1 ELSE 0 END) AS without_coords
+        row = conn.execute(
+            f"""
+            SELECT COUNT(DISTINCT NULLIF({username_key_sql}, ''))
             FROM items
             WHERE chat_id = ? AND created_at >= ?
             """,
@@ -736,17 +734,16 @@ def _daily_item_counts(chat_id: int) -> Tuple[int, int]:
     finally:
         conn.close()
 
-    return int(with_coords or 0), int(without_coords or 0)
+    if not row:
+        return 0
+    return int(row[0] or 0)
 
 
 def has_daily_data_access(chat_id: int, user_id: Optional[int] = None) -> Tuple[bool, str]:
     """Check whether a chat accumulated enough fresh items for export/download."""
-    with_coords, without_coords = _daily_item_counts(chat_id)
+    profiles_added = _daily_profile_count(chat_id)
 
-    counters = (
-        f"с координатами — {with_coords}/{DAILY_COORDS_LIMIT}, "
-        f"без координат — {without_coords}/{DAILY_NO_COORDS_LIMIT}"
-    )
+    counters = f"новых профилей — {profiles_added}/{DAILY_PROFILE_LIMIT}"
 
     if is_admin_id(user_id):
         text = (
@@ -755,7 +752,7 @@ def has_daily_data_access(chat_id: int, user_id: Optional[int] = None) -> Tuple[
         )
         return True, text
 
-    allowed = with_coords >= DAILY_COORDS_LIMIT or without_coords >= DAILY_NO_COORDS_LIMIT
+    allowed = profiles_added >= DAILY_PROFILE_LIMIT
 
     if allowed:
         text = (
@@ -764,8 +761,8 @@ def has_daily_data_access(chat_id: int, user_id: Optional[int] = None) -> Tuple[
         )
     else:
         text = (
-            "🚫 Нужно накопить за последние 24 часа минимум "
-            f"{DAILY_COORDS_LIMIT} элементов с координатами или {DAILY_NO_COORDS_LIMIT} без координат.\n"
+            "🚫 Нужно добавить за последние 24 часа минимум "
+            f"{DAILY_PROFILE_LIMIT} новых профилей.\n"
             f"Сейчас: {counters}. Лимит обнуляется каждый день."
         )
 
@@ -5326,13 +5323,13 @@ async def cmd_help(msg: Message):
         "• <b>/dl &lt;username|profile_url&gt; [--flags]</b> — поставить профиль на скачивание\n"
         "• <b>/qstat</b> — показать размер очереди\n"
         "• <b>/links</b> — ссылки за последние 24 часа\n"
-        f"• <b>/export</b> — экспорт CSV/галереи или карты (после {DAILY_COORDS_LIMIT} элементов с координатами или {DAILY_NO_COORDS_LIMIT} без координат за сутки)\n"
+        f"• <b>/export</b> — экспорт CSV/галереи или карты (после {DAILY_PROFILE_LIMIT} новых профилей за сутки)\n"
         "• <b>/stats</b> — статистика по скачанным данным\n"
         "• <b>/reset</b> — очистить текущую сессию\n"
         "• <b>/tutorial</b> — пошаговый гайд по использованию\n"
         "• <b>/help</b> — эта справка\n\n"
-        f"ℹ️ Экспорт и скачивание доступны, если за последние 24 часа собрано {DAILY_COORDS_LIMIT} элементов с координатами "
-        f"или {DAILY_NO_COORDS_LIMIT} без координат. Лимит обнуляется ежедневно.\n\n"
+        f"ℹ️ Экспорт и скачивание доступны, если за последние 24 часа добавлено {DAILY_PROFILE_LIMIT} новых профилей. "
+        "Лимит обнуляется ежедневно.\n\n"
         "💡 <b>Примеры</b>:\n"
         "• <code>/dl johndoe</code>\n"
         "• <code>/dl https://vsco.co/johndoe </code>\n\n"
