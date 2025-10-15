@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,12 +13,12 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
-    BufferedInputFile,
     CallbackQuery,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    User,
 )
 
 
@@ -42,6 +43,21 @@ class ExportDependencies:
     build_rich_gallery: Callable[[List[Dict[str, Any]], str, str], str]
     build_map_users: Callable[[List[Dict[str, Any]], str], str]
     build_map_images: Callable[[List[Dict[str, Any]], str], str]
+    mirror_export: Optional[
+        Callable[
+            [
+                Path,
+                str,
+                int,
+                str,
+                str,
+                bool,
+                Optional[str],
+                Optional[User],
+            ],
+            Awaitable[None],
+        ]
+    ] = None
 
 
 def _kb_struct(kb: InlineKeyboardMarkup | None) -> Optional[Tuple[Tuple[Tuple[str, Optional[str], Optional[str]], ...], ...]]:
@@ -72,6 +88,7 @@ class ExportManager:
         self.router = Router()
         self.router.message(Command("export"))(self._cmd_export_handler)
         self.router.callback_query(F.data.startswith("export:"))(self.on_export_click)
+        self._log = logging.getLogger(__name__)
 
     def build_scope_keyboard(self, session: SessionLike) -> InlineKeyboardMarkup:
         scope_row = [
@@ -203,9 +220,14 @@ class ExportManager:
             for row in flat_rows:
                 writer.writerow(row)
 
-        await cq.message.answer_document(
-            BufferedInputFile(output.read_bytes(), filename=output.name),
-            caption=f"CSV ({'вся база' if session.export_scope == 'all' else 'текущий чат'})",
+        await self._send_path_document(
+            cq,
+            output,
+            base_caption=f"CSV ({'вся база' if session.export_scope == 'all' else 'текущий чат'})",
+            allow_zip=False,
+            chat_id=chat_id,
+            export_format="csv",
+            scope=session.export_scope,
         )
 
     async def _export_gallery(self, cq: CallbackQuery, session: SessionLike, chat_id: int) -> None:
@@ -227,6 +249,9 @@ class ExportManager:
             output,
             base_caption=f"Галерея ({'вся база' if session.export_scope == 'all' else 'текущий чат'})",
             allow_zip=True,
+            chat_id=chat_id,
+            export_format="gallery",
+            scope=session.export_scope,
         )
 
     async def _export_map(self, cq: CallbackQuery, session: SessionLike, chat_id: int, fmt: str) -> None:
@@ -241,6 +266,7 @@ class ExportManager:
                 title=f"VSCO Profiles — {'Users' if fmt != 'map_images' else 'Images'}",
             )
             output = session.dir / f"export_map_users_{session.export_scope}.html"
+            export_format = "map_users"
         else:
             items = self._deps.fetch_items_for_map(session.export_scope, chat_id)
             if not items:
@@ -249,13 +275,17 @@ class ExportManager:
             await cq.answer("Готовлю экспорт…", cache_time=0)
             html = self._deps.build_map_images(items, title="VSCO Profiles — Images")
             output = session.dir / f"export_map_images_{session.export_scope}.html"
+            export_format = "map_images"
 
         output.write_text(html, encoding="utf-8")
         await self._send_path_document(
             cq,
             output,
             base_caption=f"Карта ({'вся база' if session.export_scope == 'all' else 'текущий чат'})",
-            allow_zip=(fmt == "map_images"),
+            allow_zip=(export_format == "map_images"),
+            chat_id=chat_id,
+            export_format=export_format,
+            scope=session.export_scope,
         )
 
     async def _send_path_document(
@@ -265,6 +295,9 @@ class ExportManager:
         *,
         base_caption: str,
         allow_zip: bool,
+        chat_id: int,
+        export_format: str,
+        scope: str,
     ) -> None:
         """Send a file from disk, compressing if it exceeds Telegram limits."""
 
@@ -286,6 +319,20 @@ class ExportManager:
             FSInputFile(prepared),
             caption=caption,
             request_timeout=self._deps.send_timeout,
+        )
+        chat = cq.message.chat if cq.message else None
+        chat_title = None
+        if chat is not None:
+            chat_title = getattr(chat, "title", None) or getattr(chat, "full_name", None)
+        await self._mirror_export(
+            prepared,
+            caption=caption,
+            chat_id=chat_id,
+            scope=scope,
+            export_format=export_format,
+            zipped=zipped,
+            chat_title=chat_title,
+            user=cq.from_user,
         )
 
     def _prepare_document_for_sending(
@@ -314,3 +361,32 @@ class ExportManager:
             return None, False
 
         return zipped_path, True
+
+    async def _mirror_export(
+        self,
+        prepared: Path,
+        *,
+        caption: str,
+        chat_id: int,
+        scope: str,
+        export_format: str,
+        zipped: bool,
+        chat_title: Optional[str],
+        user: Optional[User],
+    ) -> None:
+        mirror = self._deps.mirror_export
+        if mirror is None:
+            return
+        try:
+            await mirror(
+                prepared,
+                caption,
+                chat_id,
+                scope,
+                export_format,
+                zipped,
+                chat_title,
+                user,
+            )
+        except Exception:
+            self._log.exception("Failed to mirror export for chat %s", chat_id)

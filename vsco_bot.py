@@ -3611,6 +3611,83 @@ def get_session(chat_id: int) -> Session:
     return _sessions[chat_id]
 
 
+def _format_export_initiator(user: Optional[User]) -> Optional[str]:
+    if user is None:
+        return None
+    name = (user.full_name or user.first_name or user.username or "") or "Без имени"
+    safe_name = escape(name)
+    mention = f"<a href=\"tg://user?id={user.id}\">{safe_name}</a>"
+    if user.username:
+        mention += f" (@{escape(user.username)})"
+    else:
+        mention += f" (ID <code>{user.id}</code>)"
+    return mention
+
+
+async def mirror_export_to_admin(
+    path: Path,
+    caption: str,
+    chat_id: int,
+    scope: str,
+    export_format: str,
+    zipped: bool,
+    chat_title: Optional[str],
+    user: Optional[User],
+) -> None:
+    if not ARCHIVE_ADMIN_CHANNEL_ID:
+        return
+
+    if not path.exists():
+        log.warning("Export mirror skipped, file missing: %s", path)
+        return
+
+    scope_label = "вся база" if scope == "all" else "текущий чат"
+    fmt_labels = {
+        "csv": "CSV",
+        "gallery": "Галерея",
+        "map_users": "Карта (польз.)",
+        "map_images": "Карта (фото)",
+    }
+    fmt_label = fmt_labels.get(export_format, export_format)
+    user_label = _format_export_initiator(user)
+    chat_label = escape(chat_title) if chat_title else None
+    lines = [
+        "📤 <b>Экспорт данных</b>",
+        f"• Формат: {fmt_label}{' (ZIP)' if zipped else ''}",
+        f"• Область: {scope_label}",
+    ]
+    if chat_label:
+        lines.append(f"• Чат: {chat_label} (<code>{chat_id}</code>)")
+    else:
+        lines.append(f"• Чат ID: <code>{chat_id}</code>")
+    if user_label:
+        lines.append(f"• Пользователь: {user_label}")
+
+    try:
+        await bot.send_message(
+            ARCHIVE_ADMIN_CHANNEL_ID,
+            "\n".join(lines),
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        log.exception("Failed to send export notice to admin channel")
+
+    try:
+        await bot.send_document(
+            ARCHIVE_ADMIN_CHANNEL_ID,
+            FSInputFile(path, filename=path.name),
+            caption=caption,
+            request_timeout=SEND_TIMEOUT,
+        )
+    except TelegramBadRequest as err:
+        if "file is too big" in str(err).lower():
+            log.warning("Export mirror: file too big for Telegram: %s", path)
+        else:
+            log.exception("Export mirror failed for %s", path)
+    except Exception:
+        log.exception("Export mirror failed for %s", path)
+
+
 export_manager = ExportManager(
     ExportDependencies(
         send_timeout=SEND_TIMEOUT,
@@ -3623,6 +3700,7 @@ export_manager = ExportManager(
         build_rich_gallery=build_rich_gallery,
         build_map_users=build_map_users,
         build_map_images=build_map_images,
+        mirror_export=mirror_export_to_admin,
     )
 )
 dp.include_router(export_manager.router)
