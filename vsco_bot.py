@@ -2203,7 +2203,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
 
       if (!lines.length) return '';
       return lines.map(line => '<div>' + escapeHtml(line) + '</div>').join('');
-    }
+    }}
 
     function parseDatasetList(rawList) {{
       const result = [];
