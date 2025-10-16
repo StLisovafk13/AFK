@@ -3982,10 +3982,10 @@ async def on_stats_click(cq: CallbackQuery):
             return
     s = get_stats(chat_id, ses.export_scope)
     txt = format_stats_text(s, ses.export_scope)
-    try:
-        await cq.message.edit_text(txt, reply_markup=stats_scope_keyboard(ses))
-    except Exception:
-        await cq.message.answer(txt, reply_markup=stats_scope_keyboard(ses))
+    await cq.message.answer(txt, reply_markup=stats_scope_keyboard(ses))
+    if cq.message:
+        with contextlib.suppress(TelegramBadRequest):
+            await cq.message.edit_reply_markup(reply_markup=None)
     await cq.answer("Готово")
 
 # ---------- links (за день) ----------
@@ -4134,10 +4134,10 @@ async def on_links_click(cq: CallbackQuery):
         return
 
     txt, total = _render_links_text(chat_id, ses.export_scope, page)
-    try:
-        await cq.message.edit_text(txt, reply_markup=_links_scope_keyboard(ses, page, total))
-    except Exception:
-        await cq.message.answer(txt, reply_markup=_links_scope_keyboard(ses, page, total))
+    await cq.message.answer(txt, reply_markup=_links_scope_keyboard(ses, page, total))
+    if cq.message:
+        with contextlib.suppress(TelegramBadRequest):
+            await cq.message.edit_reply_markup(reply_markup=None)
     await cq.answer("Готово")
 
 # ---------- reset ----------
