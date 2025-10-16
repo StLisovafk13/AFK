@@ -13,6 +13,7 @@ from profile_link_scanner import (
     DEFAULT_DB,
     ScanResult,
     collect_profile_media,
+    collect_media_exif,
     connect_db,
     store_profile_media,
     utc_now_iso,
@@ -175,6 +176,8 @@ async def _rescan_single(
         LOGGER.warning("Нет медиа по ссылке %s", entry.profile_url)
         return None
 
+    media_exif = await collect_media_exif(media_urls)
+
     return store_profile_media(
         db_path,
         entry.chat_id,
@@ -182,6 +185,7 @@ async def _rescan_single(
         entry.profile_url,
         media_urls,
         source="rescan",
+        media_exif=media_exif,
     )
 
 

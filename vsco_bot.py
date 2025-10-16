@@ -101,6 +101,7 @@ from vsco_utils import (
 )
 from profile_link_scanner import (
     collect_profile_media,
+    collect_media_exif,
     store_profile_media,
     ScanResult,
 )
@@ -1731,30 +1732,37 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     conn = db_connect(); conn.execute("PRAGMA read_uncommitted=1;")
     if scope == "chat":
         rows = conn.execute(
-            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,created_at"
+            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,created_at,exif_json"
             " FROM items WHERE chat_id=?",
             (chat_id,),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,created_at FROM items"
+            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,created_at,exif_json FROM items"
         ).fetchall()
     if not rows:
         conn.close(); return []
 
     groups: Dict[str, Dict[str, Any]] = {}
     ids_by_user: Dict[str,List[int]] = {}
-    for iid, uname, purl, lat, lon, img, added_by, source, source_file, created_at in rows:
+    for iid, uname, purl, lat, lon, img, added_by, source, source_file, created_at, exif_json in rows:
         uname = uname or ""
         g = groups.setdefault(uname, {
             "username": uname, "profile_url": purl or (f"https://vsco.co/{uname}" if uname else ""),
             "lat_sum":0.0, "lon_sum":0.0, "lat_n":0, "lon_n":0,
-            "images": set(), "added_by": "",
+            "images": set(), "image_meta": {}, "added_by": "",
             "sources": {}, "cities": set(), "first_at": None, "last_at": None,
         })
         if purl and not g["profile_url"]:
             g["profile_url"] = purl
         if img: g["images"].add(img)
+        if img and exif_json:
+            try:
+                parsed_meta = json.loads(exif_json)
+                if isinstance(parsed_meta, dict) and parsed_meta:
+                    g.setdefault("image_meta", {})[img] = parsed_meta
+            except Exception:
+                pass
         if lat is not None and lon is not None:
             try:
                 lat_f = float(lat); lon_f = float(lon)
@@ -1815,11 +1823,24 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
         ]
         city_list = sorted(str(city) for city in g.get("cities", []))  # type: ignore
         added_key = (display or "").strip().lower()
+        image_meta_dict = g.get("image_meta", {})  # type: ignore
+        image_list = list(g["images"])
+        image_details = []
+        if image_meta_dict:
+            for img_url in image_list:
+                meta = image_meta_dict.get(img_url)
+                if isinstance(meta, dict) and meta:
+                    image_details.append({"url": img_url, "exif": meta})
+                else:
+                    image_details.append({"url": img_url})
+        else:
+            image_details = [{"url": img_url} for img_url in image_list]
         out.append({
             "username": uname,
             "profile_url": g["profile_url"],
             "lat": lat, "lon": lon,
-            "images": list(g["images"]),
+            "images": image_list,
+            "image_details": image_details,
             "comments": u_comments,
             "images_count": len(g["images"]),
             "comments_count": len(u_comments),
@@ -1978,6 +1999,8 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     .profile-grid {{ display:grid; grid-template-columns: repeat(auto-fill,minmax(220px,1fr)); gap:16px; }}
     .profile-grid .cell {{ position:relative; width:100%; padding-bottom:100%; border-radius:18px; overflow:hidden; background:#f3f4f6; }}
     .profile-grid .cell img {{ position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; }}
+    .profile-grid .exif {{ position:absolute; left:0; right:0; bottom:0; padding:10px 12px 12px; background:linear-gradient(180deg, rgba(17,24,39,0) 0%, rgba(17,24,39,0.72) 40%, rgba(17,24,39,0.92) 100%); color:#f9fafb; font-size:11px; line-height:1.45; display:flex; flex-direction:column; gap:4px; pointer-events:none; }}
+    .profile-grid .exif div {{ display:block; }}
     .profile-empty {{ text-align:center; font-size:15px; color:#6b7280; padding:40px 0; }}
     @media (max-width: 900px) {{
       .profile-wrap {{ padding:24px; }}
@@ -2123,6 +2146,64 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         timer = setTimeout(function() {{ fn.apply(ctx, args); }}, delay);
       }};
     }}
+
+    function formatExif(meta) {{
+      if (!meta || typeof meta !== 'object') return '';
+      const cameraParts = [];
+      const make = (meta.camera_make || '').toString().trim();
+      const model = (meta.camera_model || '').toString().trim();
+      if (model) {{
+        if (make && !model.toLowerCase().includes(make.toLowerCase())) {{
+          cameraParts.push((make + ' ' + model).trim());
+        }} else {{
+          cameraParts.push(model);
+        }}
+      }} else if (make) {{
+        cameraParts.push(make);
+      }}
+      const lens = (meta.lens_model || '').toString().trim();
+      if (lens) cameraParts.push(lens);
+
+      const lines = [];
+      if (cameraParts.length) lines.push(cameraParts.join(' · '));
+
+      const techParts = [];
+      const focal = typeof meta.focal_length_mm === 'number' ? meta.focal_length_mm : null;
+      if (focal && Number.isFinite(focal) && focal > 0) {{
+        const focalStr = (Math.round(focal * 10) / 10).toFixed(1).replace(/\.0$/, '');
+        techParts.push(focalStr + 'mm');
+      }}
+      const focal35 = typeof meta.focal_length_35mm === 'number' ? meta.focal_length_35mm : null;
+      if (focal35 && Number.isFinite(focal35) && focal35 > 0) {{
+        const focal35Str = Math.round(focal35).toString();
+        techParts.push(focal35Str + 'mm (35mm)');
+      }}
+      const aperture = typeof meta.aperture === 'number' ? meta.aperture : null;
+      if (aperture && Number.isFinite(aperture) && aperture > 0) {{
+        const apStr = (Math.round(aperture * 10) / 10).toFixed(1).replace(/\.0$/, '');
+        techParts.push('f/' + apStr);
+      }}
+      if (meta.exposure) {{
+        techParts.push(meta.exposure.toString());
+      }}
+      const iso = typeof meta.iso === 'number' ? meta.iso : null;
+      if (iso && iso > 0) {{
+        techParts.push('ISO ' + iso);
+      }}
+      if (techParts.length) lines.push(techParts.join(' · '));
+
+      const extraParts = [];
+      if (meta.taken_at) extraParts.push(meta.taken_at.toString());
+      if (typeof meta.lat === 'number' && typeof meta.lon === 'number') {{
+        const latStr = meta.lat.toFixed(5);
+        const lonStr = meta.lon.toFixed(5);
+        extraParts.push(latStr + ', ' + lonStr);
+      }}
+      if (extraParts.length) lines.push(extraParts.join(' · '));
+
+      if (!lines.length) return '';
+      return lines.map(line => '<div>' + escapeHtml(line) + '</div>').join('');
+    }
 
     function parseDatasetList(rawList) {{
       const result = [];
@@ -2383,7 +2464,18 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         profileFollow.classList.add('disabled');
       }}
 
-      const images = Array.isArray(user.images) ? user.images.filter(Boolean) : [];
+      let images = Array.isArray(user.images) ? user.images.filter(Boolean) : [];
+      const imageDetailsRaw = Array.isArray(user.image_details) ? user.image_details.filter(Boolean) : [];
+      const detailMap = new Map();
+      imageDetailsRaw.forEach(entry => {{
+        if (!entry || !entry.url) return;
+        const url = entry.url;
+        const meta = (entry.exif && typeof entry.exif === 'object') ? entry.exif : null;
+        detailMap.set(url, {{ url, exif: meta }});
+      }});
+      if (images.length === 0 && detailMap.size > 0) {{
+        images = Array.from(detailMap.keys());
+      }}
       if (images.length) {{
         profileAvatar.classList.add('has-image');
         profileAvatar.style.backgroundImage = 'url(' + JSON.stringify(images[0]) + ')';
@@ -2432,7 +2524,14 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       ].join('');
 
       if (images.length) {{
-        profileGrid.innerHTML = images.map(src => '<div class=\"cell\"><img src=\"' + escapeHtml(src) + '\" loading=\"lazy\" alt=\"\"></div>').join('');
+        const orderedDetails = images.map(src => detailMap.get(src) || {{ url: src, exif: null }});
+        const cellsHtml = orderedDetails.map(detail => {{
+          const src = detail.url || '';
+          const exifHtml = formatExif(detail.exif);
+          const exifBlock = exifHtml ? '<div class=\"exif\">' + exifHtml + '</div>' : '';
+          return '<div class=\"cell\"><img src=\"' + escapeHtml(src) + '\" loading=\"lazy\" alt=\"\">' + exifBlock + '</div>';
+        }}).join('');
+        profileGrid.innerHTML = cellsHtml;
         profileEmpty.classList.add('hidden');
       }} else {{
         profileGrid.innerHTML = '';
@@ -4311,6 +4410,7 @@ async def _profile_scan_worker() -> None:
                 job.profile_url,
                 max_width=MEDIA_PAGE_MAX_WIDTH,
             )
+            media_exif = await collect_media_exif(media_urls)
             result: ScanResult = store_profile_media(
                 Path(DB_PATH),
                 job.chat_id,
@@ -4319,6 +4419,7 @@ async def _profile_scan_worker() -> None:
                 media_urls,
                 source=job.source,
                 added_by=job.added_by,
+                media_exif=media_exif,
             )
             if result.added_items > 0 or not result.media_urls:
                 total = len(result.media_urls)

@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 
@@ -53,3 +54,43 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
         assert count_links == 1
     finally:
         conn.close()
+
+
+def test_store_profile_media_persists_exif(tmp_path: Path):
+    db_path = tmp_path / "vsco_exif.db"
+    profile_url = "https://vsco.co/exif/gallery"
+    url = "https://images.example.com/photo.jpg"
+    exif_payload = {
+        "camera_make": "Canon",
+        "camera_model": "EOS",
+        "aperture": 2.8,
+        "iso": 200,
+        "lat": 10.123456,
+        "lon": 20.654321,
+    }
+
+    store_profile_media(
+        db_path,
+        321,
+        "exif_user",
+        profile_url,
+        [url],
+        media_exif={url: exif_payload},
+    )
+
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT latitude, longitude, exif_json FROM items WHERE image_url=?",
+            (url,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row is not None
+    lat, lon, exif_json = row
+    assert lat == pytest.approx(exif_payload["lat"])
+    assert lon == pytest.approx(exif_payload["lon"])
+    data = json.loads(exif_json)
+    assert data["camera_make"] == "Canon"
+    assert data["iso"] == 200
