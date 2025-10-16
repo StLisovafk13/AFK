@@ -2170,7 +2170,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       const techParts = [];
       const focal = typeof meta.focal_length_mm === 'number' ? meta.focal_length_mm : null;
       if (focal && Number.isFinite(focal) && focal > 0) {{
-        const focalStr = (Math.round(focal * 10) / 10).toFixed(1).replace(/\.0$/, '');
+        const focalStr = (Math.round(focal * 10) / 10).toFixed(1).replace(/\\.0$/, '');
         techParts.push(focalStr + 'mm');
       }}
       const focal35 = typeof meta.focal_length_35mm === 'number' ? meta.focal_length_35mm : null;
@@ -2180,7 +2180,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       }}
       const aperture = typeof meta.aperture === 'number' ? meta.aperture : null;
       if (aperture && Number.isFinite(aperture) && aperture > 0) {{
-        const apStr = (Math.round(aperture * 10) / 10).toFixed(1).replace(/\.0$/, '');
+        const apStr = (Math.round(aperture * 10) / 10).toFixed(1).replace(/\\.0$/, '');
         techParts.push('f/' + apStr);
       }}
       if (meta.exposure) {{
