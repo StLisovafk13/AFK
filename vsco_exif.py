@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import io
 import logging
-from typing import Any
+import argparse
+import json
+import sys
+from typing import Any, Sequence
 from urllib.request import Request, urlopen
 
 from PIL import Image, ExifTags
@@ -67,3 +70,46 @@ def get_exif_from_url(url: str, *, timeout: float = 10.0) -> dict[str, Any]:
     exif = extract_exif_from_bytes(data)
     LOG.debug("Extracted %d EXIF tags from %s", len(exif), url)
     return exif
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Download an image by direct URL and print its EXIF metadata as JSON",
+    )
+    parser.add_argument("url", help="Direct link to an image (e.g. VSCO CDN URL)")
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="Timeout for the download request in seconds (default: 10)",
+    )
+    parser.add_argument(
+        "--pretty",
+        action="store_true",
+        help="Format JSON output with indentation for readability",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Command-line entry point for fetching EXIF metadata from a direct URL."""
+
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+
+    try:
+        exif = get_exif_from_url(args.url, timeout=args.timeout)
+    except Exception as exc:  # pragma: no cover - defensive, logged and reported
+        LOG.error("Failed to retrieve EXIF data: %s", exc, exc_info=True)
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    json_kwargs = {"ensure_ascii": False}
+    if args.pretty:
+        json_kwargs.update(indent=2, sort_keys=True)
+    print(json.dumps(exif, **json_kwargs))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - manual invocation
+    sys.exit(main())

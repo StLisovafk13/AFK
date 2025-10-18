@@ -5,9 +5,11 @@ from PIL import Image
 
 from vsco_exif import (
     DEFAULT_USER_AGENT,
+    _build_parser,
     extract_exif_from_bytes,
     fetch_image_bytes,
     get_exif_from_url,
+    main,
 )
 
 
@@ -77,3 +79,29 @@ def test_get_exif_from_url_chains_download_and_parsing(monkeypatch):
     result = get_exif_from_url("https://images.example.com/photo.jpg", timeout=7.5)
 
     assert result["Make"] == "ExampleCam"
+
+
+def test_cli_parser_accepts_arguments():
+    parser = _build_parser()
+    args = parser.parse_args(["https://cdn.example.com/photo.jpg", "--timeout", "2", "--pretty"])
+    assert args.url == "https://cdn.example.com/photo.jpg"
+    assert args.timeout == pytest.approx(2.0)
+    assert args.pretty is True
+
+
+def test_cli_main_prints_json(monkeypatch, capsys):
+    fake_exif = {"Make": "ExampleCam", "Model": "ExampleCam X"}
+
+    def fake_get(url, timeout):
+        assert url == "https://cdn.example.com/photo.jpg"
+        assert timeout == pytest.approx(3.0)
+        return fake_exif
+
+    monkeypatch.setattr("vsco_exif.get_exif_from_url", fake_get)
+
+    exit_code = main(["https://cdn.example.com/photo.jpg", "--timeout", "3", "--pretty"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "ExampleCam" in captured.out
+    assert captured.err == ""
