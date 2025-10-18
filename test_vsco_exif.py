@@ -8,6 +8,7 @@ from urllib.error import HTTPError
 from vsco_exif import (
     DEFAULT_HEADERS,
     _build_parser,
+    _normalise_cookie,
     configure_logging,
     extract_exif_from_bytes,
     fetch_image_bytes,
@@ -145,6 +146,16 @@ def test_cli_parser_accepts_arguments():
     assert args.cookie == "session=abc"
 
 
+def test_normalise_cookie_strips_prefix_and_whitespace():
+    raw = "  Cookie:  session=abc; other=def  "
+    assert _normalise_cookie(raw) == "session=abc; other=def"
+
+
+def test_normalise_cookie_collapses_newlines():
+    raw = "cookie\nvs_app=1;\n other=2"
+    assert _normalise_cookie(raw) == "vs_app=1; other=2"
+
+
 def test_cli_main_prints_json(monkeypatch, capsys):
     fake_exif = {"Make": "ExampleCam", "Model": "ExampleCam X"}
 
@@ -169,6 +180,23 @@ def test_cli_main_prints_json(monkeypatch, capsys):
     assert exit_code == 0
     assert "ExampleCam" in captured.out
     assert "Starting EXIF extraction" in captured.err
+
+
+def test_cli_main_rejects_invalid_cookie(monkeypatch, capsys):
+    def fake_get(url, timeout, headers=None):
+        raise AssertionError("Should not be called when cookie invalid")
+
+    monkeypatch.setattr("vsco_exif.get_exif_from_url", fake_get)
+
+    exit_code = main([
+        "https://cdn.example.com/photo.jpg",
+        "--cookie",
+        "   \n  ",
+    ])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "Error parsing cookie value" in captured.err
 
 
 def test_cli_main_writes_output_file(monkeypatch, tmp_path):

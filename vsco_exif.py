@@ -209,6 +209,32 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _normalise_cookie(cookie_value: str) -> str:
+    """Return a cookie string cleaned for HTTP header usage."""
+
+    if cookie_value is None:
+        raise ValueError("Cookie value cannot be None")
+
+    cleaned = cookie_value.strip()
+    lower_cleaned = cleaned.lower()
+
+    if lower_cleaned.startswith("cookie"):
+        remainder = cleaned[6:]
+        if remainder[:1] in {":", " ", "\t", "\r", "\n"}:
+            if remainder.startswith(":"):
+                cleaned = remainder[1:].lstrip()
+            else:
+                cleaned = remainder.lstrip()
+
+    cleaned = cleaned.replace("\r", " ")
+    cleaned = " ".join(cleaned.replace("\n", " ").split())
+
+    if not cleaned:
+        raise ValueError("Cookie header cannot be empty")
+
+    return cleaned
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Command-line entry point for fetching EXIF metadata from a direct URL."""
 
@@ -227,7 +253,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.header:
         request_headers.update(dict(args.header))
     if args.cookie:
-        request_headers["Cookie"] = args.cookie
+        try:
+            request_headers["Cookie"] = _normalise_cookie(args.cookie)
+        except Exception as exc:
+            LOG.error("Invalid cookie string supplied: %s", exc, exc_info=True)
+            print(f"Error parsing cookie value: {exc}", file=sys.stderr)
+            return 1
 
     try:
         exif = get_exif_from_url(
