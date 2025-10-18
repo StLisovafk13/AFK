@@ -1,4 +1,5 @@
 import io
+import json
 
 import pytest
 from PIL import Image
@@ -6,6 +7,7 @@ from PIL import Image
 from vsco_exif import (
     DEFAULT_USER_AGENT,
     _build_parser,
+    configure_logging,
     extract_exif_from_bytes,
     fetch_image_bytes,
     get_exif_from_url,
@@ -83,10 +85,24 @@ def test_get_exif_from_url_chains_download_and_parsing(monkeypatch):
 
 def test_cli_parser_accepts_arguments():
     parser = _build_parser()
-    args = parser.parse_args(["https://cdn.example.com/photo.jpg", "--timeout", "2", "--pretty"])
+    args = parser.parse_args([
+        "https://cdn.example.com/photo.jpg",
+        "--timeout",
+        "2",
+        "--pretty",
+        "--output",
+        "result.json",
+        "--log-level",
+        "DEBUG",
+        "--log-file",
+        "exif.log",
+    ])
     assert args.url == "https://cdn.example.com/photo.jpg"
     assert args.timeout == pytest.approx(2.0)
     assert args.pretty is True
+    assert args.output == "result.json"
+    assert args.log_level == "DEBUG"
+    assert args.log_file == "exif.log"
 
 
 def test_cli_main_prints_json(monkeypatch, capsys):
@@ -104,4 +120,41 @@ def test_cli_main_prints_json(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert exit_code == 0
     assert "ExampleCam" in captured.out
-    assert captured.err == ""
+    assert "Starting EXIF extraction" in captured.err
+
+
+def test_cli_main_writes_output_file(monkeypatch, tmp_path):
+    fake_exif = {"Make": "ExampleCam", "Model": "ExampleCam X"}
+    output_path = tmp_path / "result.json"
+    log_path = tmp_path / "exif.log"
+
+    def fake_get(url, timeout):
+        assert url == "https://cdn.example.com/photo.jpg"
+        assert timeout == pytest.approx(4.0)
+        return fake_exif
+
+    monkeypatch.setattr("vsco_exif.get_exif_from_url", fake_get)
+
+    exit_code = main(
+        [
+            "https://cdn.example.com/photo.jpg",
+            "--timeout",
+            "4",
+            "--output",
+            str(output_path),
+            "--log-file",
+            str(log_path),
+            "--log-level",
+            "DEBUG",
+        ]
+    )
+
+    assert exit_code == 0
+    assert json.loads(output_path.read_text(encoding="utf-8")) == fake_exif
+    log_contents = log_path.read_text(encoding="utf-8")
+    assert "EXIF metadata saved" in log_contents
+
+
+def test_configure_logging_rejects_invalid_level():
+    with pytest.raises(ValueError):
+        configure_logging("NOTALEVEL")
