@@ -3,9 +3,10 @@ import json
 
 import pytest
 from PIL import Image
+from urllib.error import HTTPError
 
 from vsco_exif import (
-    DEFAULT_USER_AGENT,
+    DEFAULT_HEADERS,
     _build_parser,
     configure_logging,
     extract_exif_from_bytes,
@@ -30,7 +31,9 @@ def test_fetch_image_bytes_downloads_with_custom_user_agent(monkeypatch):
 
     def fake_urlopen(request, timeout):
         assert request.full_url == url
-        assert request.get_header("User-agent") == DEFAULT_USER_AGENT
+        headers = {key.lower(): value for key, value in request.header_items()}
+        for header, value in DEFAULT_HEADERS.items():
+            assert headers.get(header.lower()) == value
         assert timeout == pytest.approx(5.0)
         return _BytesResponse(payload)
 
@@ -43,6 +46,18 @@ def test_fetch_image_bytes_downloads_with_custom_user_agent(monkeypatch):
 def test_fetch_image_bytes_rejects_empty_url():
     with pytest.raises(ValueError):
         fetch_image_bytes("")
+
+
+def test_fetch_image_bytes_translates_403_to_permission_error(monkeypatch):
+    url = "https://example.com/forbidden.jpg"
+
+    def fake_urlopen(request, timeout):
+        raise HTTPError(url, 403, "Forbidden", hdrs=None, fp=None)
+
+    monkeypatch.setattr("vsco_exif.urlopen", fake_urlopen)
+
+    with pytest.raises(PermissionError):
+        fetch_image_bytes(url)
 
 
 def _jpeg_with_exif() -> bytes:

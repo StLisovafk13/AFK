@@ -8,6 +8,7 @@ import io
 import logging
 from pathlib import Path
 from typing import Any, Sequence
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from PIL import Image, ExifTags
@@ -21,6 +22,13 @@ DEFAULT_USER_AGENT = (
     "Chrome/120.0 Safari/537.36"
 )
 
+DEFAULT_HEADERS = {
+    "User-Agent": DEFAULT_USER_AGENT,
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://vsco.co/",
+}
+
 
 def fetch_image_bytes(url: str, *, timeout: float = 10.0) -> bytes:
     """Return the raw bytes from an image URL.
@@ -30,10 +38,18 @@ def fetch_image_bytes(url: str, *, timeout: float = 10.0) -> bytes:
 
     if not url:
         raise ValueError("URL is required to download image bytes")
-    request = Request(url, headers={"User-Agent": DEFAULT_USER_AGENT})
+    request = Request(url, headers=DEFAULT_HEADERS)
     LOG.debug("Fetching image bytes from %s", url)
-    with urlopen(request, timeout=timeout) as response:  # nosec: B310 - validated URL
-        data = response.read()
+    try:
+        with urlopen(request, timeout=timeout) as response:  # nosec: B310 - validated URL
+            data = response.read()
+    except HTTPError as exc:  # pragma: no cover - network edge cases mocked in tests
+        if exc.code == 403:
+            raise PermissionError(
+                "Access to the image was forbidden (HTTP 403). VSCO may require "
+                "authenticated access for this link."
+            ) from exc
+        raise
     if not data:
         raise ValueError(f"No data returned when fetching image bytes from {url}")
     return data

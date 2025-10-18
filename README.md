@@ -157,6 +157,10 @@ async def start_background_scan(profile_url: str, chat_id: int, username: str) -
 python vsco_exif.py "https://img.vsco.co/.../vsco_image.jpg"
 ```
 
+Скрипт отправляет запросы с «браузерным» набором заголовков (`User-Agent`, `Accept`, `Accept-Language`, `Referer`), поэтому VSCO CDN
+не отвечает кодом `403 Forbidden` для публичных ссылок. Если же снимок закрыт настройками приватности, будет показана осмысленная
+ошибка доступа.
+
 Альтернативно можно вызвать модуль через `-m` без суффикса `.py`:
 
 ```bash
