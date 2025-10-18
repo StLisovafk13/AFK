@@ -1,0 +1,69 @@
+"""Helpers for retrieving EXIF metadata from direct media links."""
+from __future__ import annotations
+
+import io
+import logging
+from typing import Any
+from urllib.request import Request, urlopen
+
+from PIL import Image, ExifTags
+
+
+LOG = logging.getLogger(__name__)
+
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0 Safari/537.36"
+)
+
+
+def fetch_image_bytes(url: str, *, timeout: float = 10.0) -> bytes:
+    """Return the raw bytes from an image URL.
+
+    A VSCO-style user agent is supplied to avoid CDN blocks.
+    """
+
+    if not url:
+        raise ValueError("URL is required to download image bytes")
+    request = Request(url, headers={"User-Agent": DEFAULT_USER_AGENT})
+    LOG.debug("Fetching image bytes from %s", url)
+    with urlopen(request, timeout=timeout) as response:  # nosec: B310 - validated URL
+        data = response.read()
+    if not data:
+        raise ValueError(f"No data returned when fetching image bytes from {url}")
+    return data
+
+
+def extract_exif_from_bytes(data: bytes) -> dict[str, Any]:
+    """Return a dictionary of EXIF tags decoded from raw image bytes."""
+
+    if not data:
+        return {}
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            exif_data = image.getexif()
+            if not exif_data:
+                return {}
+            result: dict[str, Any] = {}
+            for tag_id, value in exif_data.items():
+                tag_name = ExifTags.TAGS.get(tag_id, f"Tag_{tag_id}")
+                if isinstance(value, bytes):
+                    try:
+                        value = value.decode("utf-8", "replace").rstrip("\x00")
+                    except Exception:  # pragma: no cover - defensive
+                        value = value.hex()
+                result[tag_name] = value
+            return result
+    except Exception as exc:  # pragma: no cover - Pillow raises specific errors
+        LOG.warning("Failed to extract EXIF metadata: %s", exc, exc_info=True)
+        return {}
+
+
+def get_exif_from_url(url: str, *, timeout: float = 10.0) -> dict[str, Any]:
+    """Download an image and return its EXIF metadata."""
+
+    data = fetch_image_bytes(url, timeout=timeout)
+    exif = extract_exif_from_bytes(data)
+    LOG.debug("Extracted %d EXIF tags from %s", len(exif), url)
+    return exif
