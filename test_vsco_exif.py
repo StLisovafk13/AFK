@@ -7,6 +7,7 @@ from urllib.error import HTTPError
 
 from vsco_exif import (
     DEFAULT_HEADERS,
+    PLAYWRIGHT_DEFAULT_HEADERS,
     _build_parser,
     _normalise_cookie,
     _parse_header,
@@ -80,6 +81,53 @@ def test_fetch_image_bytes_merges_extra_headers(monkeypatch):
     assert result == b"data"
 
 
+def test_fetch_image_bytes_uses_playwright_fallback(monkeypatch):
+    url = "https://example.com/protected.jpg"
+
+    def fake_urlopen(request, timeout):
+        raise HTTPError(url, 403, "Forbidden", hdrs=None, fp=None)
+
+    def fake_playwright_fetch(url_arg, *, timeout, headers):
+        assert url_arg == url
+        assert timeout == pytest.approx(7.0)
+        merged = {key.lower(): value for key, value in headers.items()}
+        for key in DEFAULT_HEADERS:
+            assert key.lower() in merged
+        for key in PLAYWRIGHT_DEFAULT_HEADERS:
+            assert key.lower() in merged
+        assert merged["x-extra"] == "value"
+        return b"fallback"
+
+    monkeypatch.setattr("vsco_exif.urlopen", fake_urlopen)
+    monkeypatch.setattr("vsco_exif._playwright_fetch", fake_playwright_fetch)
+
+    result = fetch_image_bytes(
+        url,
+        timeout=5.0,
+        headers={"X-Extra": "value"},
+        use_playwright=True,
+        playwright_timeout=7.0,
+    )
+    assert result == b"fallback"
+
+
+def test_fetch_image_bytes_playwright_failure_reports(monkeypatch):
+    url = "https://example.com/protected.jpg"
+
+    def fake_urlopen(request, timeout):
+        raise HTTPError(url, 403, "Forbidden", hdrs=None, fp=None)
+
+    def fake_playwright_fetch(url_arg, *, timeout, headers):
+        raise RuntimeError("Playwright missing")
+
+    monkeypatch.setattr("vsco_exif.urlopen", fake_urlopen)
+    monkeypatch.setattr("vsco_exif._playwright_fetch", fake_playwright_fetch)
+
+    with pytest.raises(PermissionError) as exc:
+        fetch_image_bytes(url, use_playwright=True)
+    assert "Playwright fallback failed" in str(exc.value)
+
+
 def _jpeg_with_exif() -> bytes:
     img = Image.new("RGB", (5, 5), color="red")
     exif = Image.Exif()
@@ -106,15 +154,22 @@ def test_extract_exif_from_bytes_returns_empty_dict_for_missing_data():
 def test_get_exif_from_url_chains_download_and_parsing(monkeypatch):
     payload = _jpeg_with_exif()
 
-    def fake_fetch(url, timeout, headers=None):
+    def fake_fetch(url, timeout, headers=None, use_playwright=False, playwright_timeout=None):
         assert url == "https://images.example.com/photo.jpg"
         assert timeout == pytest.approx(7.5)
         assert headers is None
+        assert use_playwright is True
+        assert playwright_timeout == pytest.approx(12.0)
         return payload
 
     monkeypatch.setattr("vsco_exif.fetch_image_bytes", fake_fetch)
 
-    result = get_exif_from_url("https://images.example.com/photo.jpg", timeout=7.5)
+    result = get_exif_from_url(
+        "https://images.example.com/photo.jpg",
+        timeout=7.5,
+        use_playwright=True,
+        playwright_timeout=12.0,
+    )
 
     assert result["Make"] == "ExampleCam"
 
@@ -136,6 +191,9 @@ def test_cli_parser_accepts_arguments():
         "Authorization: Bearer token",
         "--cookie",
         "session=abc",
+        "--playwright",
+        "--playwright-timeout",
+        "15",
     ])
     assert args.url == "https://cdn.example.com/photo.jpg"
     assert args.timeout == pytest.approx(2.0)
@@ -145,6 +203,8 @@ def test_cli_parser_accepts_arguments():
     assert args.log_file == "exif.log"
     assert ("Authorization", "Bearer token") in args.header
     assert args.cookie == "session=abc"
+    assert args.playwright is True
+    assert args.playwright_timeout == pytest.approx(15.0)
 
 
 def test_normalise_cookie_strips_prefix_and_whitespace():
@@ -171,10 +231,12 @@ def test_parse_header_normalises_confusable_name():
 def test_cli_main_prints_json(monkeypatch, capsys):
     fake_exif = {"Make": "ExampleCam", "Model": "ExampleCam X"}
 
-    def fake_get(url, timeout, headers=None):
+    def fake_get(url, timeout, headers=None, use_playwright=False, playwright_timeout=None):
         assert url == "https://cdn.example.com/photo.jpg"
         assert timeout == pytest.approx(3.0)
         assert headers == {"X-Test": "value"}
+        assert use_playwright is False
+        assert playwright_timeout is None
         return fake_exif
 
     monkeypatch.setattr("vsco_exif.get_exif_from_url", fake_get)
@@ -195,7 +257,7 @@ def test_cli_main_prints_json(monkeypatch, capsys):
 
 
 def test_cli_main_rejects_invalid_cookie(monkeypatch, capsys):
-    def fake_get(url, timeout, headers=None):
+    def fake_get(url, timeout, headers=None, use_playwright=False, playwright_timeout=None):
         raise AssertionError("Should not be called when cookie invalid")
 
     monkeypatch.setattr("vsco_exif.get_exif_from_url", fake_get)
@@ -216,10 +278,12 @@ def test_cli_main_writes_output_file(monkeypatch, tmp_path):
     output_path = tmp_path / "result.json"
     log_path = tmp_path / "exif.log"
 
-    def fake_get(url, timeout, headers=None):
+    def fake_get(url, timeout, headers=None, use_playwright=False, playwright_timeout=None):
         assert url == "https://cdn.example.com/photo.jpg"
         assert timeout == pytest.approx(4.0)
         assert headers == {"Cookie": "session=abc"}
+        assert use_playwright is True
+        assert playwright_timeout == pytest.approx(9.0)
         return fake_exif
 
     monkeypatch.setattr("vsco_exif.get_exif_from_url", fake_get)
@@ -237,6 +301,9 @@ def test_cli_main_writes_output_file(monkeypatch, tmp_path):
             "DEBUG",
             "--cookie",
             "session=abc",
+            "--playwright",
+            "--playwright-timeout",
+            "9",
         ]
     )
 

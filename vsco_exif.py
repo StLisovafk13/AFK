@@ -8,9 +8,12 @@ import io
 import logging
 import unicodedata
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Sequence, Callable, Awaitable
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+import asyncio
+import threading
 
 from PIL import Image, ExifTags
 
@@ -28,6 +31,11 @@ DEFAULT_HEADERS = {
     "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://vsco.co/",
+}
+
+PLAYWRIGHT_DEFAULT_HEADERS = {
+    "Accept": "video/*;q=0.9,image/avif,image/webp,image/*,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
 }
 
 _ASCII_CONFUSABLES = str.maketrans(
@@ -84,11 +92,101 @@ def _merge_headers(extra: dict[str, str] | None) -> dict[str, str]:
     return headers
 
 
+def _merge_playwright_headers(extra: dict[str, str] | None) -> dict[str, str]:
+    """Merge headers for Playwright requests with sensible defaults."""
+
+    merged = dict(DEFAULT_HEADERS)
+    merged.update(PLAYWRIGHT_DEFAULT_HEADERS)
+    if extra:
+        for key, value in extra.items():
+            merged[_ascii_header_name(key)] = value
+    return merged
+
+
+def _run_coroutine(factory: Callable[[], Awaitable[bytes]]) -> bytes:
+    """Run a coroutine factory even when an event loop is already running."""
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(factory())
+
+    result: dict[str, Any] = {}
+    error: dict[str, BaseException] = {}
+
+    def runner() -> None:
+        new_loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(new_loop)
+            result["value"] = new_loop.run_until_complete(factory())
+        except BaseException as exc:  # pragma: no cover - exceptional path
+            error["exc"] = exc
+        finally:
+            asyncio.set_event_loop(None)
+            new_loop.close()
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join()
+
+    if error:
+        raise error["exc"]
+    return result["value"]
+
+
+async def _async_playwright_fetch(
+    url: str,
+    *,
+    timeout: float,
+    headers: dict[str, str] | None,
+) -> bytes:
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as exc:  # pragma: no cover - optional dependency missing
+        raise RuntimeError("Playwright is not installed. Run 'pip install playwright' and 'playwright install'.") from exc
+
+    merged_headers = _merge_playwright_headers(headers)
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        context = await browser.new_context()
+        try:
+            response = await context.request.get(
+                url,
+                headers=merged_headers,
+                timeout=int(max(timeout, 0) * 1000),
+            )
+            status = getattr(response, "status", None)
+            status_text = getattr(response, "status_text", "")
+            if not getattr(response, "ok", False) or (status is not None and status >= 400):
+                raise HTTPError(url, status or 0, status_text or "Forbidden", hdrs=None, fp=None)
+            body = await response.body()
+            if not body:
+                raise ValueError(f"No data returned when fetching image bytes from {url}")
+            return body
+        finally:
+            await context.close()
+            await browser.close()
+
+
+def _playwright_fetch(
+    url: str,
+    *,
+    timeout: float,
+    headers: dict[str, str] | None,
+) -> bytes:
+    """Synchronously fetch bytes using Playwright."""
+
+    return _run_coroutine(lambda: _async_playwright_fetch(url, timeout=timeout, headers=headers))
+
+
 def fetch_image_bytes(
     url: str,
     *,
     timeout: float = 10.0,
     headers: dict[str, str] | None = None,
+    use_playwright: bool = False,
+    playwright_timeout: float | None = None,
 ) -> bytes:
     """Return the raw bytes from an image URL.
 
@@ -97,13 +195,28 @@ def fetch_image_bytes(
 
     if not url:
         raise ValueError("URL is required to download image bytes")
-    request = Request(url, headers=_merge_headers(headers))
+    request_headers = _merge_headers(headers)
+    request = Request(url, headers=request_headers)
     LOG.debug("Fetching image bytes from %s", url)
     try:
         with urlopen(request, timeout=timeout) as response:  # nosec: B310 - validated URL
             data = response.read()
     except HTTPError as exc:  # pragma: no cover - network edge cases mocked in tests
         if exc.code == 403:
+            if use_playwright:
+                LOG.info("Primary request forbidden, attempting Playwright fallback")
+                try:
+                    return _playwright_fetch(
+                        url,
+                        timeout=playwright_timeout or timeout,
+                        headers=request_headers,
+                    )
+                except Exception as play_exc:
+                    LOG.error("Playwright fallback failed: %s", play_exc, exc_info=True)
+                    raise PermissionError(
+                        "Access to the image was forbidden (HTTP 403). Playwright fallback failed: "
+                        f"{play_exc}"
+                    ) from play_exc
             raise PermissionError(
                 "Access to the image was forbidden (HTTP 403). VSCO may require "
                 "authenticated access for this link."
@@ -144,10 +257,18 @@ def get_exif_from_url(
     *,
     timeout: float = 10.0,
     headers: dict[str, str] | None = None,
+    use_playwright: bool = False,
+    playwright_timeout: float | None = None,
 ) -> dict[str, Any]:
     """Download an image and return its EXIF metadata."""
 
-    data = fetch_image_bytes(url, timeout=timeout, headers=headers)
+    data = fetch_image_bytes(
+        url,
+        timeout=timeout,
+        headers=headers,
+        use_playwright=use_playwright,
+        playwright_timeout=playwright_timeout,
+    )
     exif = extract_exif_from_bytes(data)
     LOG.debug("Extracted %d EXIF tags from %s", len(exif), url)
     return exif
@@ -252,6 +373,22 @@ def _build_parser() -> argparse.ArgumentParser:
             "Equivalent to --header 'Cookie: <value>'."
         ),
     )
+    parser.add_argument(
+        "--playwright",
+        action="store_true",
+        help=(
+            "Attempt a Playwright-powered fallback when the CDN returns 403 Forbidden. "
+            "Requires 'playwright' to be installed."
+        ),
+    )
+    parser.add_argument(
+        "--playwright-timeout",
+        type=float,
+        help=(
+            "Custom timeout (seconds) for Playwright fallback requests. "
+            "Defaults to the --timeout value."
+        ),
+    )
     return parser
 
 
@@ -266,23 +403,32 @@ def _normalise_cookie(cookie_value: str) -> str:
         raise ValueError("Cookie header cannot be empty")
 
     normalised = unicodedata.normalize("NFKC", cleaned)
-    colon_index = normalised.find(":")
+    flattened = normalised.replace("\r", " ").replace("\n", " ")
+    flattened = " ".join(flattened.split())
+
+    colon_index = flattened.find(":")
     if colon_index != -1:
-        prefix = normalised[:colon_index]
+        prefix = flattened[:colon_index]
         try:
             ascii_prefix = _ascii_header_name(prefix.strip())
         except ValueError:
             ascii_prefix = ""
         if ascii_prefix.lower() == "cookie":
-            cleaned = cleaned[colon_index + 1 :].lstrip()
+            flattened = flattened[colon_index + 1 :].lstrip()
+    else:
+        first, _, rest = flattened.partition(" ")
+        if rest:
+            try:
+                ascii_prefix = _ascii_header_name(first.strip())
+            except ValueError:
+                ascii_prefix = ""
+            if ascii_prefix.lower() == "cookie":
+                flattened = rest.lstrip()
 
-    cleaned = cleaned.replace("\r", " ")
-    cleaned = " ".join(cleaned.replace("\n", " ").split())
-
-    if not cleaned:
+    if not flattened:
         raise ValueError("Cookie header cannot be empty")
 
-    return cleaned
+    return flattened
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -315,6 +461,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.url,
             timeout=args.timeout,
             headers=request_headers or None,
+            use_playwright=args.playwright,
+            playwright_timeout=args.playwright_timeout,
         )
     except Exception as exc:  # pragma: no cover - defensive, logged and reported
         LOG.error("Failed to retrieve EXIF data: %s", exc, exc_info=True)
