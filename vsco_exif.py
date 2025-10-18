@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Sequence, Callable, Awaitable
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import asyncio
 import threading
@@ -101,6 +102,34 @@ def _merge_playwright_headers(extra: dict[str, str] | None) -> dict[str, str]:
         for key, value in extra.items():
             merged[_ascii_header_name(key)] = value
     return merged
+
+
+def _normalise_vsco_cdn_url(url: str) -> str:
+    """Normalise alternate VSCO CDN hostnames to direct ``img.vsco.co`` links."""
+
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    netloc = parts.netloc.lower()
+    if netloc != "im.vsco.co":
+        return url
+
+    segments = [segment for segment in parts.path.split("/") if segment]
+    if segments and segments[0].startswith("aws-"):
+        segments = segments[1:]
+    if not segments:
+        return url
+    path = "/" + "/".join(segments)
+
+    query_items = parse_qsl(parts.query, keep_blank_values=True)
+    filtered_query = [(key, value) for key, value in query_items if key.lower() != "w"]
+    query = urlencode(filtered_query, doseq=True) if filtered_query else ""
+
+    normalised = urlunsplit((parts.scheme or "https", "img.vsco.co", path, query, parts.fragment))
+    return normalised
 
 
 def _run_coroutine(factory: Callable[[], Awaitable[bytes]]) -> bytes:
@@ -195,8 +224,11 @@ def fetch_image_bytes(
 
     if not url:
         raise ValueError("URL is required to download image bytes")
+    normalised_url = _normalise_vsco_cdn_url(url)
+    if normalised_url != url:
+        LOG.debug("Normalised VSCO CDN URL %s -> %s", url, normalised_url)
     request_headers = _merge_headers(headers)
-    request = Request(url, headers=request_headers)
+    request = Request(normalised_url, headers=request_headers)
     LOG.debug("Fetching image bytes from %s", url)
     try:
         with urlopen(request, timeout=timeout) as response:  # nosec: B310 - validated URL
@@ -207,7 +239,7 @@ def fetch_image_bytes(
                 LOG.info("Primary request forbidden, attempting Playwright fallback")
                 try:
                     return _playwright_fetch(
-                        url,
+                        normalised_url,
                         timeout=playwright_timeout or timeout,
                         headers=request_headers,
                     )

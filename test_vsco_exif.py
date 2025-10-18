@@ -9,6 +9,7 @@ from vsco_exif import (
     DEFAULT_HEADERS,
     PLAYWRIGHT_DEFAULT_HEADERS,
     _build_parser,
+    _normalise_vsco_cdn_url,
     _normalise_cookie,
     _parse_header,
     configure_logging,
@@ -79,6 +80,34 @@ def test_fetch_image_bytes_merges_extra_headers(monkeypatch):
         headers={"Cookie": "session=abc", "User-Agent": "Override-Agent"},
     )
     assert result == b"data"
+
+
+def test_fetch_image_bytes_normalises_im_vsco_links(monkeypatch):
+    original = "https://im.vsco.co/aws-us-west-2/d8ef0f/123/abc/vsco123.jpg?w=480&token=xyz"
+    expected = "https://img.vsco.co/d8ef0f/123/abc/vsco123.jpg?token=xyz"
+
+    def fake_urlopen(request, timeout):
+        assert request.full_url == expected
+        return _BytesResponse(b"bytes")
+
+    monkeypatch.setattr("vsco_exif.urlopen", fake_urlopen)
+
+    result = fetch_image_bytes(original)
+    assert result == b"bytes"
+
+
+def test_normalise_vsco_cdn_url_handles_edge_cases():
+    unchanged = "https://img.vsco.co/path/photo.jpg"
+    assert _normalise_vsco_cdn_url(unchanged) == unchanged
+
+    malformed = "https://im.vsco.co/"
+    assert _normalise_vsco_cdn_url(malformed) == malformed
+
+    other_query = "https://im.vsco.co/aws-us-west-2/a/b/c.jpg?foo=1&w=2&bar=3"
+    assert (
+        _normalise_vsco_cdn_url(other_query)
+        == "https://img.vsco.co/a/b/c.jpg?foo=1&bar=3"
+    )
 
 
 def test_fetch_image_bytes_uses_playwright_fallback(monkeypatch):
