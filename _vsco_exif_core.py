@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Any, Sequence, Callable, Awaitable
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+from urllib.parse import (
+    urlsplit,
+    urlunsplit,
+    parse_qsl,
+    urlencode,
+    quote,
+)
 
 import asyncio
 import threading
@@ -46,6 +52,7 @@ __all__ = [
     "_merge_headers",
     "_merge_playwright_headers",
     "_normalise_vsco_cdn_url",
+    "_normalise_request_url",
     "_run_coroutine",
     "_async_playwright_fetch",
     "_playwright_fetch",
@@ -153,6 +160,45 @@ def _normalise_vsco_cdn_url(url: str) -> str:
     return normalised
 
 
+def _normalise_request_url(url: str) -> str:
+    """Percent-encode non-ASCII characters in URL components for requests."""
+
+    if not url:
+        return url
+
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+
+    path = parts.path
+    if path and any(ord(ch) >= 128 for ch in path):
+        encoded_path = quote(path, safe="/%:@!$&'()*+,;=")
+        if encoded_path != path:
+            LOG.debug("Percent-encoded non-ASCII characters in path: %s -> %s", path, encoded_path)
+        path = encoded_path
+
+    query = parts.query
+    if query and any(ord(ch) >= 128 for ch in query):
+        encoded_query = urlencode(parse_qsl(query, keep_blank_values=True), doseq=True)
+        if encoded_query != query:
+            LOG.debug("Percent-encoded non-ASCII characters in query: %s -> %s", query, encoded_query)
+        query = encoded_query
+
+    fragment = parts.fragment
+    if fragment and any(ord(ch) >= 128 for ch in fragment):
+        encoded_fragment = quote(fragment, safe="/%:@!$&'()*+,;=")
+        if encoded_fragment != fragment:
+            LOG.debug(
+                "Percent-encoded non-ASCII characters in fragment: %s -> %s",
+                fragment,
+                encoded_fragment,
+            )
+        fragment = encoded_fragment
+
+    return urlunsplit((parts.scheme, parts.netloc, path, query, fragment))
+
+
 def _run_coroutine(factory: Callable[[], Awaitable[bytes]]) -> bytes:
     """Run a coroutine factory even when an event loop is already running."""
 
@@ -245,9 +291,9 @@ def fetch_image_bytes(
 
     if not url:
         raise ValueError("URL is required to download image bytes")
-    normalised_url = _normalise_vsco_cdn_url(url)
+    normalised_url = _normalise_request_url(_normalise_vsco_cdn_url(url))
     if normalised_url != url:
-        LOG.debug("Normalised VSCO CDN URL %s -> %s", url, normalised_url)
+        LOG.debug("Normalised request URL %s -> %s", url, normalised_url)
     request_headers = _merge_headers(headers)
     request = Request(normalised_url, headers=request_headers)
     LOG.debug("Fetching image bytes from %s", url)

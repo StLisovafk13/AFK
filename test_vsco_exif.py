@@ -96,6 +96,20 @@ def test_fetch_image_bytes_normalises_im_vsco_links(monkeypatch):
     assert result == b"bytes"
 
 
+def test_fetch_image_bytes_percent_encodes_non_ascii(monkeypatch):
+    original = "https://img.vsco.co/path/with…ellipsis/vsco.jpg"
+    expected = "https://img.vsco.co/path/with%E2%80%A6ellipsis/vsco.jpg"
+
+    def fake_urlopen(request, timeout):
+        assert request.full_url == expected
+        return _BytesResponse(b"encoded")
+
+    monkeypatch.setattr("vsco_exif.urlopen", fake_urlopen)
+
+    result = fetch_image_bytes(original)
+    assert result == b"encoded"
+
+
 def test_normalise_vsco_cdn_url_handles_edge_cases():
     unchanged = "https://img.vsco.co/path/photo.jpg"
     assert _normalise_vsco_cdn_url(unchanged) == unchanged
