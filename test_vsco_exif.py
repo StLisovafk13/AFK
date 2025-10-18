@@ -60,6 +60,24 @@ def test_fetch_image_bytes_translates_403_to_permission_error(monkeypatch):
         fetch_image_bytes(url)
 
 
+def test_fetch_image_bytes_merges_extra_headers(monkeypatch):
+    url = "https://example.com/with-cookie.jpg"
+
+    def fake_urlopen(request, timeout):
+        headers = {key.lower(): value for key, value in request.header_items()}
+        assert headers["cookie"] == "session=abc"
+        assert headers["user-agent"] == "Override-Agent"
+        return _BytesResponse(b"data")
+
+    monkeypatch.setattr("vsco_exif.urlopen", fake_urlopen)
+
+    result = fetch_image_bytes(
+        url,
+        headers={"Cookie": "session=abc", "User-Agent": "Override-Agent"},
+    )
+    assert result == b"data"
+
+
 def _jpeg_with_exif() -> bytes:
     img = Image.new("RGB", (5, 5), color="red")
     exif = Image.Exif()
@@ -86,9 +104,10 @@ def test_extract_exif_from_bytes_returns_empty_dict_for_missing_data():
 def test_get_exif_from_url_chains_download_and_parsing(monkeypatch):
     payload = _jpeg_with_exif()
 
-    def fake_fetch(url, timeout):
+    def fake_fetch(url, timeout, headers=None):
         assert url == "https://images.example.com/photo.jpg"
         assert timeout == pytest.approx(7.5)
+        assert headers is None
         return payload
 
     monkeypatch.setattr("vsco_exif.fetch_image_bytes", fake_fetch)
@@ -111,6 +130,10 @@ def test_cli_parser_accepts_arguments():
         "DEBUG",
         "--log-file",
         "exif.log",
+        "--header",
+        "Authorization: Bearer token",
+        "--cookie",
+        "session=abc",
     ])
     assert args.url == "https://cdn.example.com/photo.jpg"
     assert args.timeout == pytest.approx(2.0)
@@ -118,19 +141,29 @@ def test_cli_parser_accepts_arguments():
     assert args.output == "result.json"
     assert args.log_level == "DEBUG"
     assert args.log_file == "exif.log"
+    assert ("Authorization", "Bearer token") in args.header
+    assert args.cookie == "session=abc"
 
 
 def test_cli_main_prints_json(monkeypatch, capsys):
     fake_exif = {"Make": "ExampleCam", "Model": "ExampleCam X"}
 
-    def fake_get(url, timeout):
+    def fake_get(url, timeout, headers=None):
         assert url == "https://cdn.example.com/photo.jpg"
         assert timeout == pytest.approx(3.0)
+        assert headers == {"X-Test": "value"}
         return fake_exif
 
     monkeypatch.setattr("vsco_exif.get_exif_from_url", fake_get)
 
-    exit_code = main(["https://cdn.example.com/photo.jpg", "--timeout", "3", "--pretty"])
+    exit_code = main([
+        "https://cdn.example.com/photo.jpg",
+        "--timeout",
+        "3",
+        "--pretty",
+        "--header",
+        "X-Test: value",
+    ])
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -143,9 +176,10 @@ def test_cli_main_writes_output_file(monkeypatch, tmp_path):
     output_path = tmp_path / "result.json"
     log_path = tmp_path / "exif.log"
 
-    def fake_get(url, timeout):
+    def fake_get(url, timeout, headers=None):
         assert url == "https://cdn.example.com/photo.jpg"
         assert timeout == pytest.approx(4.0)
+        assert headers == {"Cookie": "session=abc"}
         return fake_exif
 
     monkeypatch.setattr("vsco_exif.get_exif_from_url", fake_get)
@@ -161,6 +195,8 @@ def test_cli_main_writes_output_file(monkeypatch, tmp_path):
             str(log_path),
             "--log-level",
             "DEBUG",
+            "--cookie",
+            "session=abc",
         ]
     )
 
@@ -168,6 +204,12 @@ def test_cli_main_writes_output_file(monkeypatch, tmp_path):
     assert json.loads(output_path.read_text(encoding="utf-8")) == fake_exif
     log_contents = log_path.read_text(encoding="utf-8")
     assert "EXIF metadata saved" in log_contents
+
+
+def test_cli_rejects_invalid_header():
+    parser = _build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["https://example.com", "--header", "MissingColon"])
 
 
 def test_configure_logging_rejects_invalid_level():

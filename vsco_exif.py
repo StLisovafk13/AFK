@@ -30,7 +30,24 @@ DEFAULT_HEADERS = {
 }
 
 
-def fetch_image_bytes(url: str, *, timeout: float = 10.0) -> bytes:
+def _merge_headers(extra: dict[str, str] | None) -> dict[str, str]:
+    """Return headers combined with defaults, allowing overrides."""
+
+    headers = dict(DEFAULT_HEADERS)
+    if extra:
+        for key, value in extra.items():
+            if not key:
+                raise ValueError("Header names must be non-empty")
+            headers[key] = value
+    return headers
+
+
+def fetch_image_bytes(
+    url: str,
+    *,
+    timeout: float = 10.0,
+    headers: dict[str, str] | None = None,
+) -> bytes:
     """Return the raw bytes from an image URL.
 
     A VSCO-style user agent is supplied to avoid CDN blocks.
@@ -38,7 +55,7 @@ def fetch_image_bytes(url: str, *, timeout: float = 10.0) -> bytes:
 
     if not url:
         raise ValueError("URL is required to download image bytes")
-    request = Request(url, headers=DEFAULT_HEADERS)
+    request = Request(url, headers=_merge_headers(headers))
     LOG.debug("Fetching image bytes from %s", url)
     try:
         with urlopen(request, timeout=timeout) as response:  # nosec: B310 - validated URL
@@ -80,10 +97,15 @@ def extract_exif_from_bytes(data: bytes) -> dict[str, Any]:
         return {}
 
 
-def get_exif_from_url(url: str, *, timeout: float = 10.0) -> dict[str, Any]:
+def get_exif_from_url(
+    url: str,
+    *,
+    timeout: float = 10.0,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """Download an image and return its EXIF metadata."""
 
-    data = fetch_image_bytes(url, timeout=timeout)
+    data = fetch_image_bytes(url, timeout=timeout, headers=headers)
     exif = extract_exif_from_bytes(data)
     LOG.debug("Extracted %d EXIF tags from %s", len(exif), url)
     return exif
@@ -123,6 +145,21 @@ def configure_logging(level: str = "INFO", log_file: str | None = None) -> None:
         root_logger.addHandler(file_handler)
 
 
+def _parse_header(argument: str) -> tuple[str, str]:
+    """Parse a ``KEY:VALUE`` header CLI argument."""
+
+    if ":" not in argument:
+        raise argparse.ArgumentTypeError(
+            "Headers must use the format 'Name: Value'"
+        )
+    name, value = argument.split(":", 1)
+    name = name.strip()
+    value = value.strip()
+    if not name:
+        raise argparse.ArgumentTypeError("Header name cannot be empty")
+    return name, value
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Download an image by direct URL and print its EXIF metadata as JSON",
@@ -152,6 +189,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "--log-file",
         help="Write logs to the specified file in addition to the console",
     )
+    parser.add_argument(
+        "--header",
+        action="append",
+        type=_parse_header,
+        metavar="NAME:VALUE",
+        help=(
+            "Additional request headers to send when downloading the image. "
+            "May be provided multiple times."
+        ),
+    )
+    parser.add_argument(
+        "--cookie",
+        help=(
+            "Convenience shortcut for supplying a Cookie header. "
+            "Equivalent to --header 'Cookie: <value>'."
+        ),
+    )
     return parser
 
 
@@ -169,8 +223,18 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     LOG.info("Starting EXIF extraction from %s", args.url)
 
+    request_headers: dict[str, str] = {}
+    if args.header:
+        request_headers.update(dict(args.header))
+    if args.cookie:
+        request_headers["Cookie"] = args.cookie
+
     try:
-        exif = get_exif_from_url(args.url, timeout=args.timeout)
+        exif = get_exif_from_url(
+            args.url,
+            timeout=args.timeout,
+            headers=request_headers or None,
+        )
     except Exception as exc:  # pragma: no cover - defensive, logged and reported
         LOG.error("Failed to retrieve EXIF data: %s", exc, exc_info=True)
         print(f"Error: {exc}", file=sys.stderr)
