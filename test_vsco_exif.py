@@ -9,6 +9,7 @@ from vsco_exif import (
     DEFAULT_HEADERS,
     _build_parser,
     _normalise_cookie,
+    _parse_header,
     configure_logging,
     extract_exif_from_bytes,
     fetch_image_bytes,
@@ -154,6 +155,17 @@ def test_normalise_cookie_strips_prefix_and_whitespace():
 def test_normalise_cookie_collapses_newlines():
     raw = "cookie\nvs_app=1;\n other=2"
     assert _normalise_cookie(raw) == "vs_app=1; other=2"
+
+
+def test_normalise_cookie_handles_cyrillic_prefix():
+    raw = "\u0421ookie: session=abc"  # first letter is Cyrillic capital Es
+    assert _normalise_cookie(raw) == "session=abc"
+
+
+def test_parse_header_normalises_confusable_name():
+    name, value = _parse_header("\u0421ookie: value")
+    assert name == "Cookie"
+    assert value == "value"
 
 
 def test_cli_main_prints_json(monkeypatch, capsys):

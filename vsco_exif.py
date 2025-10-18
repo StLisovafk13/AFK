@@ -6,6 +6,7 @@ import json
 import sys
 import io
 import logging
+import unicodedata
 from pathlib import Path
 from typing import Any, Sequence
 from urllib.error import HTTPError
@@ -29,6 +30,47 @@ DEFAULT_HEADERS = {
     "Referer": "https://vsco.co/",
 }
 
+_ASCII_CONFUSABLES = str.maketrans(
+    {
+        "Α": "A",
+        "А": "A",
+        "В": "B",
+        "Е": "E",
+        "Н": "H",
+        "Κ": "K",
+        "М": "M",
+        "Ο": "O",
+        "Р": "P",
+        "С": "C",
+        "Т": "T",
+        "Χ": "X",
+        "а": "a",
+        "е": "e",
+        "н": "h",
+        "к": "k",
+        "м": "m",
+        "о": "o",
+        "р": "p",
+        "с": "c",
+        "т": "t",
+        "х": "x",
+    }
+)
+
+
+def _ascii_header_name(name: str) -> str:
+    """Return a header name guaranteed to be ASCII."""
+
+    normalised = unicodedata.normalize("NFKC", name)
+    translated = normalised.translate(_ASCII_CONFUSABLES)
+    try:
+        encoded = translated.encode("ascii")
+    except UnicodeEncodeError as exc:  # pragma: no cover - defensive
+        raise ValueError("Header names must contain only ASCII characters") from exc
+    # Preserve the original casing for readability while ensuring ASCII
+    # by mapping characters individually.
+    return encoded.decode("ascii")
+
 
 def _merge_headers(extra: dict[str, str] | None) -> dict[str, str]:
     """Return headers combined with defaults, allowing overrides."""
@@ -38,7 +80,7 @@ def _merge_headers(extra: dict[str, str] | None) -> dict[str, str]:
         for key, value in extra.items():
             if not key:
                 raise ValueError("Header names must be non-empty")
-            headers[key] = value
+            headers[_ascii_header_name(key)] = value
     return headers
 
 
@@ -154,9 +196,13 @@ def _parse_header(argument: str) -> tuple[str, str]:
         )
     name, value = argument.split(":", 1)
     name = name.strip()
-    value = value.strip()
     if not name:
         raise argparse.ArgumentTypeError("Header name cannot be empty")
+    try:
+        name = _ascii_header_name(name)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    value = value.strip()
     return name, value
 
 
@@ -216,15 +262,19 @@ def _normalise_cookie(cookie_value: str) -> str:
         raise ValueError("Cookie value cannot be None")
 
     cleaned = cookie_value.strip()
-    lower_cleaned = cleaned.lower()
+    if not cleaned:
+        raise ValueError("Cookie header cannot be empty")
 
-    if lower_cleaned.startswith("cookie"):
-        remainder = cleaned[6:]
-        if remainder[:1] in {":", " ", "\t", "\r", "\n"}:
-            if remainder.startswith(":"):
-                cleaned = remainder[1:].lstrip()
-            else:
-                cleaned = remainder.lstrip()
+    normalised = unicodedata.normalize("NFKC", cleaned)
+    colon_index = normalised.find(":")
+    if colon_index != -1:
+        prefix = normalised[:colon_index]
+        try:
+            ascii_prefix = _ascii_header_name(prefix.strip())
+        except ValueError:
+            ascii_prefix = ""
+        if ascii_prefix.lower() == "cookie":
+            cleaned = cleaned[colon_index + 1 :].lstrip()
 
     cleaned = cleaned.replace("\r", " ")
     cleaned = " ".join(cleaned.replace("\n", " ").split())
