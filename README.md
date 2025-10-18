@@ -154,13 +154,21 @@ async def start_background_scan(profile_url: str, chat_id: int, username: str) -
 Модуль `vsco_exif.py` можно запускать из командной строки, чтобы быстро проверить EXIF-данные по ссылке на оригинал снимка.
 
 ```bash
+python vsco_exif.py "https://img.vsco.co/.../vsco_image.jpg"
+```
+
+Альтернативно можно вызвать модуль через `-m` без суффикса `.py`:
+
+```bash
 python -m vsco_exif "https://img.vsco.co/.../vsco_image.jpg"
 ```
+
+> 💡 Если при запуске появляется сообщение `ModuleNotFoundError: __path__ attribute not found on 'vsco_exif' while trying to find 'vsco_exif.py'`, значит команда была выполнена как `python -m vsco_exif.py`. Нужно убрать `.py` из имени модуля или запускать файл напрямую, как показано выше.
 
 По умолчанию результат выводится в формате JSON в одну строку. Чтобы получить отформатированный вывод и задать тайм-аут загрузки, используйте дополнительные параметры:
 
 ```bash
-python -m vsco_exif "https://img.vsco.co/.../vsco_image.jpg" --timeout 5 --pretty
+python vsco_exif.py "https://img.vsco.co/.../vsco_image.jpg" --timeout 5 --pretty
 ```
 
 В ответе будут ключи EXIF (например, `Make`, `Model`, `DateTimeOriginal`). Если у изображения нет метаданных, скрипт вернёт пустой JSON `{}`. Ошибки загрузки выводятся в стандартный поток ошибок и сопровождаются логами в консоли.
