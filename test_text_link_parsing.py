@@ -21,6 +21,12 @@ def vsco_module(tmp_path, monkeypatch):
 
     sys.modules.pop("vsco_bot", None)
     sys.modules.pop("zip_profile", None)
+    sys.modules.pop("profile_link_scanner", None)
+
+    import profile_link_scanner as pls
+
+    monkeypatch.setattr(pls, "extract_exif_from_url", lambda url: {"size_bytes": 1}, raising=False)
+
     vsco_bot = importlib.import_module("vsco_bot")
     vsco_bot.init_db()
     async def _empty_playwright(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0):  # type: ignore[override]

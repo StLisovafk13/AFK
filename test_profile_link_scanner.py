@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from pathlib import Path
 
@@ -30,7 +31,16 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
         "https://images.example.com/media2.jpg",
     ]
 
-    result = store_profile_media(db_path, 123, "example", profile_url, urls)
+    stub_meta = lambda url: {"size_bytes": 123, "exiftool": {"Model": "TestCam"}}
+
+    result = store_profile_media(
+        db_path,
+        123,
+        "example",
+        profile_url,
+        urls,
+        meta_fetcher=stub_meta,
+    )
     assert result.added_items == 2
     assert result.link_added is True
 
@@ -40,6 +50,7 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
         "example",
         profile_url,
         [urls[0], "https://images.example.com/media3.jpg"],
+        meta_fetcher=stub_meta,
     )
     assert second.added_items == 1
     assert second.link_added is True
@@ -51,5 +62,14 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
 
         count_links = conn.execute("SELECT COUNT(*) FROM links").fetchone()[0]
         assert count_links == 1
+
+        meta_row = conn.execute(
+            "SELECT meta_json FROM items WHERE image_url=?",
+            ("https://images.example.com/media1.jpg",),
+        ).fetchone()
+        assert meta_row is not None and meta_row[0]
+        payload = json.loads(meta_row[0])
+        assert payload.get("size_bytes") == 123
+        assert payload.get("exiftool", {}).get("Model") == "TestCam"
     finally:
         conn.close()

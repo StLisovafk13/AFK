@@ -11,15 +11,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Dict, Iterable, Optional, Sequence
 
 import aiohttp
+
+from exif_fetcher import extract_exif_from_url
 
 from vsco_utils import (
     dedupe_keep_order,
@@ -87,6 +90,7 @@ def ensure_db_schema(conn: sqlite3.Connection) -> None:
           source TEXT DEFAULT '',
           source_file TEXT DEFAULT '',
           added_by TEXT DEFAULT '',
+          meta_json TEXT DEFAULT '',
           created_at TEXT NOT NULL,
           UNIQUE(chat_id, username, image_url, profile_url)
         )
@@ -108,6 +112,8 @@ def ensure_db_schema(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
     if "added_by" not in cols:
         conn.execute("ALTER TABLE items ADD COLUMN added_by TEXT DEFAULT ''")
+    if "meta_json" not in cols:
+        conn.execute("ALTER TABLE items ADD COLUMN meta_json TEXT DEFAULT ''")
 
 
 def connect_db(path: Path) -> sqlite3.Connection:
@@ -367,6 +373,7 @@ def store_profile_media(
     *,
     source: str = "profile-scan",
     added_by: str = "",
+    meta_fetcher: Optional[Callable[[str], Dict[str, Any]]] = None,
 ) -> ScanResult:
     """Persist collected media URLs into the bot database."""
 
@@ -378,16 +385,20 @@ def store_profile_media(
     if not prepared:
         return result
 
+    if meta_fetcher is None:
+        meta_fetcher = extract_exif_from_url
+
     conn = connect_db(db_path)
     try:
         added_items = 0
         for url in prepared:
+            created_at = utc_now_iso()
             cur = conn.execute(
                 """
                 INSERT OR IGNORE INTO items(
                     chat_id, username, latitude, longitude, profile_url, image_url,
-                    source, source_file, added_by, created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    source, source_file, added_by, meta_json, created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     chat_id,
@@ -399,11 +410,29 @@ def store_profile_media(
                     source,
                     "",
                     added_by,
-                    utc_now_iso(),
+                    "",
+                    created_at,
                 ),
             )
             if cur.rowcount > 0:
                 added_items += 1
+                if meta_fetcher is not None:
+                    try:
+                        metadata = meta_fetcher(url)
+                    except Exception as exc:  # pragma: no cover - best effort metadata
+                        LOGGER.debug("Не удалось получить EXIF для %s: %s", url, exc)
+                        metadata = None
+                    if metadata:
+                        try:
+                            payload = json.dumps(metadata, ensure_ascii=False)
+                        except (TypeError, ValueError):
+                            payload = json.dumps({"raw": str(metadata)}, ensure_ascii=False)
+                        item_id = cur.lastrowid
+                        if item_id:
+                            conn.execute(
+                                "UPDATE items SET meta_json=? WHERE id=?",
+                                (payload, item_id),
+                            )
         conn.execute(
             "INSERT OR IGNORE INTO links(chat_id,username,url,created_at) VALUES(?,?,?,?)",
             (chat_id, username, profile_url, utc_now_iso()),
