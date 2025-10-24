@@ -2428,7 +2428,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       const power = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
       const value = bytes / Math.pow(1024, power);
       const fixed = value >= 100 || power === 0 ? value.toFixed(0) : value.toFixed(1);
-      return fixed.replace(/\.0$/, '') + ' ' + units[power];
+      return fixed.replace(/\\.0$/, '') + ' ' + units[power];
     }}
 
     function normalizeExifEntry(entry) {{
@@ -2457,7 +2457,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         mapping.forEach(([key, label]) => {{
           if (exif[key] !== undefined && exif[key] !== null && exif[key] !== '') {{
             let value = '' + exif[key];
-            if (key === 'FNumber' && !/^f\//i.test(value)) {{
+            if (key === 'FNumber' && !/^f\\//i.test(value)) {{
               value = 'f/' + value;
             }} else if (key === 'ISO' && !/^ISO/i.test(value)) {{
               value = 'ISO ' + value;
