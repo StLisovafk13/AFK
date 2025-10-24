@@ -589,6 +589,7 @@ def init_db():
       source TEXT DEFAULT '',
       source_file TEXT DEFAULT '',
       added_by TEXT DEFAULT '',
+      meta_json TEXT DEFAULT '',
       created_at TEXT NOT NULL,
       UNIQUE(chat_id, username, image_url, profile_url)
     )""")
@@ -605,6 +606,8 @@ def init_db():
     cols = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
     if "added_by" not in cols:
         conn.execute("ALTER TABLE items ADD COLUMN added_by TEXT DEFAULT ''")
+    if "meta_json" not in cols:
+        conn.execute("ALTER TABLE items ADD COLUMN meta_json TEXT DEFAULT ''")
     conn.commit(); conn.close()
     log.info("DB initialized at %s", DB_PATH)
 
@@ -1176,8 +1179,8 @@ def _insert_item(conn: sqlite3.Connection, chat_id: int, username: str, profile_
                  source: str, source_file: Optional[str], added_by: str) -> int:
     cur = conn.cursor()
     cur.execute(
-        """INSERT INTO items(chat_id,username,latitude,longitude,profile_url,image_url,source,source_file,added_by,created_at)
-           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        """INSERT INTO items(chat_id,username,latitude,longitude,profile_url,image_url,source,source_file,added_by,meta_json,created_at)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
         (
             chat_id,
             username,
@@ -1188,6 +1191,7 @@ def _insert_item(conn: sqlite3.Connection, chat_id: int, username: str, profile_
             source or "",
             source_file or "",
             added_by or "",
+            "",
             utc_now_iso(),
         )
     )
@@ -1731,30 +1735,41 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     conn = db_connect(); conn.execute("PRAGMA read_uncommitted=1;")
     if scope == "chat":
         rows = conn.execute(
-            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,created_at"
+            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,meta_json,created_at"
             " FROM items WHERE chat_id=?",
             (chat_id,),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,created_at FROM items"
+            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,meta_json,created_at FROM items"
         ).fetchall()
     if not rows:
         conn.close(); return []
 
     groups: Dict[str, Dict[str, Any]] = {}
     ids_by_user: Dict[str,List[int]] = {}
-    for iid, uname, purl, lat, lon, img, added_by, source, source_file, created_at in rows:
+    for iid, uname, purl, lat, lon, img, added_by, source, source_file, meta_json, created_at in rows:
         uname = uname or ""
         g = groups.setdefault(uname, {
             "username": uname, "profile_url": purl or (f"https://vsco.co/{uname}" if uname else ""),
             "lat_sum":0.0, "lon_sum":0.0, "lat_n":0, "lon_n":0,
-            "images": set(), "added_by": "",
+            "images": [], "image_set": set(), "image_meta": {}, "added_by": "",
             "sources": {}, "cities": set(), "first_at": None, "last_at": None,
         })
         if purl and not g["profile_url"]:
             g["profile_url"] = purl
-        if img: g["images"].add(img)
+        if img and img not in g["image_set"]:
+            g["images"].append(img)
+            g["image_set"].add(img)
+        if img and meta_json:
+            try:
+                parsed_meta = json.loads(meta_json)
+            except Exception:
+                parsed_meta = {"raw": meta_json}
+            if isinstance(parsed_meta, dict):
+                g["image_meta"][img] = parsed_meta
+            else:
+                g["image_meta"][img] = {"raw": parsed_meta}
         if lat is not None and lon is not None:
             try:
                 lat_f = float(lat); lon_f = float(lon)
@@ -1815,13 +1830,38 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
         ]
         city_list = sorted(str(city) for city in g.get("cities", []))  # type: ignore
         added_key = (display or "").strip().lower()
+        image_meta_map: Dict[str, Any] = g.get("image_meta", {})  # type: ignore
+        images_ordered: List[str] = g.get("images", [])  # type: ignore
+        meta_entries: List[Dict[str, Any]] = []
+        for img_url in images_ordered:
+            payload = image_meta_map.get(img_url)
+            entry: Dict[str, Any] = {"url": img_url}
+            if isinstance(payload, dict):
+                size_value = payload.get("size_bytes")
+                if isinstance(size_value, (int, float)):
+                    entry["size_bytes"] = int(size_value)
+                exif_value = payload.get("exiftool")
+                if isinstance(exif_value, dict):
+                    entry["exiftool"] = exif_value
+                extra_keys = {
+                    key: value
+                    for key, value in payload.items()
+                    if key not in {"size_bytes", "exiftool"}
+                }
+                if extra_keys:
+                    entry["extra"] = extra_keys
+            elif payload not in (None, ""):
+                entry["extra"] = {"raw": payload}
+            meta_entries.append(entry)
+
         out.append({
             "username": uname,
             "profile_url": g["profile_url"],
             "lat": lat, "lon": lon,
-            "images": list(g["images"]),
+            "images": images_ordered,
+            "images_meta": meta_entries,
             "comments": u_comments,
-            "images_count": len(g["images"]),
+            "images_count": len(images_ordered),
             "comments_count": len(u_comments),
             "added_by": display,
             "added_by_link": link or "",
@@ -1978,6 +2018,21 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     .profile-grid {{ display:grid; grid-template-columns: repeat(auto-fill,minmax(220px,1fr)); gap:16px; }}
     .profile-grid .cell {{ position:relative; width:100%; padding-bottom:100%; border-radius:18px; overflow:hidden; background:#f3f4f6; }}
     .profile-grid .cell img {{ position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; }}
+    .profile-exif {{ margin-top:28px; background:#fff; border-radius:20px; padding:24px; box-shadow:0 12px 30px rgba(15,23,42,0.08); }}
+    .profile-exif h3 {{ margin:0 0 16px 0; font-size:20px; font-weight:600; color:#111827; }}
+    .profile-exif-list {{ display:flex; flex-direction:column; gap:16px; }}
+    .profile-exif-item {{ display:flex; gap:18px; align-items:flex-start; }}
+    .profile-exif-thumb {{ width:120px; min-width:120px; height:120px; border-radius:16px; overflow:hidden; background:#f3f4f6; border:1px solid #e5e7eb; display:flex; align-items:center; justify-content:center; }}
+    .profile-exif-thumb img {{ width:100%; height:100%; object-fit:cover; }}
+    .profile-exif-body {{ flex:1 1 auto; display:flex; flex-direction:column; gap:10px; }}
+    .profile-exif-title {{ font-size:15px; font-weight:600; color:#111827; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
+    .profile-exif-title a {{ color:#2563eb; text-decoration:none; }}
+    .profile-exif-title a:hover {{ text-decoration:underline; }}
+    .profile-exif-tags {{ display:flex; flex-wrap:wrap; gap:6px; font-size:12px; color:#4b5563; }}
+    .profile-exif-tags .chip {{ display:inline-flex; align-items:center; gap:4px; background:#f3f4f6; border-radius:999px; padding:4px 10px; }}
+    .profile-exif details {{ background:#f9fafb; border-radius:14px; padding:8px 12px; color:#374151; }}
+    .profile-exif summary {{ cursor:pointer; font-weight:600; }}
+    .profile-exif-raw {{ white-space:pre-wrap; word-break:break-word; font-family:ui-monospace, SFMono-Regular, SFMono, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size:12px; margin:8px 0 0 0; color:#111827; }}
     .profile-empty {{ text-align:center; font-size:15px; color:#6b7280; padding:40px 0; }}
     @media (max-width: 900px) {{
       .profile-wrap {{ padding:24px; }}
@@ -2076,6 +2131,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       <div class=\"profile-stats\" id=\"profileStats\"></div>
       <div class=\"profile-grid\" id=\"profileGrid\"></div>
       <div class=\"profile-empty hidden\" id=\"profileEmpty\">Нет сохранённых фотографий для этого профиля.</div>
+      <div class=\"profile-exif hidden\" id=\"profileExif\"></div>
     </div>
   </div>
 
@@ -2099,6 +2155,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     const profileStats = document.getElementById('profileStats');
     const profileGrid = document.getElementById('profileGrid');
     const profileEmpty = document.getElementById('profileEmpty');
+    const profileExif = document.getElementById('profileExif');
 
     const searchInput = document.getElementById('q');
     const datasetSelect = document.getElementById('datasetSelect');
@@ -2364,6 +2421,69 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       return (''+s).replace(/[&<>"']/g, function(m) {{ return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[m]; }});
     }}
 
+    function formatBytes(bytes) {{
+      if (typeof bytes !== 'number' || !isFinite(bytes) || bytes < 0) return '';
+      if (bytes === 0) return '0 B';
+      const units = ['B','KB','MB','GB','TB'];
+      const power = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+      const value = bytes / Math.pow(1024, power);
+      const fixed = value >= 100 || power === 0 ? value.toFixed(0) : value.toFixed(1);
+      return fixed.replace(/\.0$/, '') + ' ' + units[power];
+    }}
+
+    function normalizeExifEntry(entry) {{
+      if (!entry || typeof entry !== 'object') return {{}};
+      return entry;
+    }}
+
+    function collectExifChips(entry) {{
+      const data = normalizeExifEntry(entry);
+      const chips = [];
+      if (typeof data.size_bytes === 'number') {{
+        const sizeLabel = formatBytes(data.size_bytes);
+        if (sizeLabel) chips.push('Размер: ' + sizeLabel);
+      }}
+      const exif = data.exiftool && typeof data.exiftool === 'object' ? data.exiftool : null;
+      if (exif) {{
+        const mapping = [
+          ['Model', 'Камера'],
+          ['LensModel', 'Объектив'],
+          ['CreateDate', 'Дата'],
+          ['ExposureTime', 'Выдержка'],
+          ['FNumber', 'Диафрагма'],
+          ['ISO', 'ISO'],
+          ['FocalLength', 'Фокус'],
+        ];
+        mapping.forEach(([key, label]) => {{
+          if (exif[key] !== undefined && exif[key] !== null && exif[key] !== '') {{
+            let value = '' + exif[key];
+            if (key === 'FNumber' && !/^f\//i.test(value)) {{
+              value = 'f/' + value;
+            }} else if (key === 'ISO' && !/^ISO/i.test(value)) {{
+              value = 'ISO ' + value;
+            }}
+            chips.push(label + ': ' + value);
+          }}
+        }});
+      }}
+      return chips;
+    }}
+
+    function buildExifRaw(entry) {{
+      const data = normalizeExifEntry(entry);
+      if (data.exiftool && typeof data.exiftool === 'object') {{
+        return JSON.stringify(data.exiftool, null, 2);
+      }}
+      if (data.extra && typeof data.extra === 'object') {{
+        return JSON.stringify(data.extra, null, 2);
+      }}
+      const keys = Object.keys(data).filter(key => key !== 'url');
+      if (keys.length) {{
+        return JSON.stringify(data, null, 2);
+      }}
+      return '';
+    }}
+
     function renderProfile(user, updateHash=true) {{
       if (!user) {{
         return;
@@ -2437,6 +2557,38 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       }} else {{
         profileGrid.innerHTML = '';
         profileEmpty.classList.remove('hidden');
+      }}
+
+      if (profileExif) {{
+        const metaList = Array.isArray(user.images_meta) ? user.images_meta : [];
+        if (metaList.length) {{
+          const sections = metaList.map((entry, idx) => {{
+            const data = normalizeExifEntry(entry);
+            const rawUrl = (data.url || entry.url || '').toString();
+            const safeUrl = rawUrl ? escapeHtml(rawUrl) : '';
+            const thumb = rawUrl ? '<img src=\"' + safeUrl + '\" loading=\"lazy\" alt=\"\" />' : '';
+            const chips = collectExifChips(data);
+            const chipsHtml = chips.length ? '<div class=\"profile-exif-tags\">' + chips.map(chip => '<span class=\"chip\">' + escapeHtml(chip) + '</span>').join('') + '</div>' : '';
+            const raw = buildExifRaw(data);
+            const rawHtml = raw ? '<details><summary>Полные данные</summary><pre class=\"profile-exif-raw\">' + escapeHtml(raw) + '</pre></details>' : '';
+            const linkHtml = rawUrl ? ' • <a href=\"' + safeUrl + '\" target=\"_blank\" rel=\"noopener\">Открыть оригинал</a>' : '';
+            return [
+              '<div class=\"profile-exif-item\">',
+              '  <div class=\"profile-exif-thumb\">' + thumb + '</div>',
+              '  <div class=\"profile-exif-body\">',
+              '    <div class=\"profile-exif-title\">' + escapeHtml('#' + (idx + 1)) + linkHtml + '</div>',
+              chipsHtml,
+              rawHtml,
+              '  </div>',
+              '</div>',
+            ].join('');
+          }}).join('');
+          profileExif.innerHTML = '<h3>EXIF / Метаданные</h3><div class=\"profile-exif-list\">' + sections + '</div>';
+          profileExif.classList.remove('hidden');
+        }} else {{
+          profileExif.innerHTML = '';
+          profileExif.classList.add('hidden');
+        }}
       }}
 
       galleryView.classList.add('hidden');
