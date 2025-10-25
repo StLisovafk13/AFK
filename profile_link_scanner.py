@@ -26,6 +26,7 @@ from exif_fetcher import extract_exif_from_url
 
 from vsco_utils import (
     dedupe_keep_order,
+    extract_gps_from_exif,
     extract_media_urls_from_html,
     is_media_url,
     is_vsco_logo_url,
@@ -423,16 +424,25 @@ def store_profile_media(
                         LOGGER.debug("Не удалось получить EXIF для %s: %s", url, exc)
                         metadata = None
                     if metadata:
+                        lat_from_meta = None
+                        lon_from_meta = None
+                        if isinstance(metadata, dict):
+                            exif_payload = metadata.get("exiftool")
+                            if isinstance(exif_payload, dict):
+                                lat_from_meta, lon_from_meta = extract_gps_from_exif(exif_payload)
                         try:
                             payload = json.dumps(metadata, ensure_ascii=False)
                         except (TypeError, ValueError):
                             payload = json.dumps({"raw": str(metadata)}, ensure_ascii=False)
                         item_id = cur.lastrowid
                         if item_id:
-                            conn.execute(
-                                "UPDATE items SET meta_json=? WHERE id=?",
-                                (payload, item_id),
-                            )
+                            sql = "UPDATE items SET meta_json=?"
+                            params: list[object] = [payload]
+                            if lat_from_meta is not None and lon_from_meta is not None:
+                                sql += ", latitude=?, longitude=?"
+                                params.extend([lat_from_meta, lon_from_meta])
+                            params.append(item_id)
+                            conn.execute(sql + " WHERE id=?", params)
         conn.execute(
             "INSERT OR IGNORE INTO links(chat_id,username,url,created_at) VALUES(?,?,?,?)",
             (chat_id, username, profile_url, utc_now_iso()),

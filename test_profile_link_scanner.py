@@ -31,7 +31,11 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
         "https://images.example.com/media2.jpg",
     ]
 
-    stub_meta = lambda url: {"size_bytes": 123, "exiftool": {"Model": "TestCam"}}
+    def stub_meta(url):
+        return {
+            "size_bytes": 123,
+            "exiftool": {"Model": "TestCam", "GPSLatitude": 51.5, "GPSLongitude": -0.12},
+        }
 
     result = store_profile_media(
         db_path,
@@ -71,5 +75,12 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
         payload = json.loads(meta_row[0])
         assert payload.get("size_bytes") == 123
         assert payload.get("exiftool", {}).get("Model") == "TestCam"
+        coords = conn.execute(
+            "SELECT latitude, longitude FROM items WHERE image_url=?",
+            ("https://images.example.com/media1.jpg",),
+        ).fetchone()
+        assert coords is not None
+        assert coords[0] == pytest.approx(51.5)
+        assert coords[1] == pytest.approx(-0.12)
     finally:
         conn.close()

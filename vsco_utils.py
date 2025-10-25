@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
 from urllib.parse import (
     parse_qsl,
     urlencode,
@@ -153,6 +153,92 @@ def generate_media_filename(url: str, idx: int, *, default_ext: str = "jpg") -> 
     if path.endswith(".mov"):
         return f"vsco_{idx:05d}.mov"
     return f"vsco_{idx:05d}.{default_ext.strip('.')}"
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    """Convert arbitrary EXIF numeric values into ``float`` instances."""
+
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, str):
+        candidate = value.strip()
+        if not candidate:
+            return None
+        try:
+            return float(candidate)
+        except ValueError:
+            return None
+    return None
+
+
+def extract_gps_from_exif(exif: Mapping[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    """Pull latitude and longitude values from an EXIF dictionary."""
+
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+
+    lat_keys = (
+        "Composite:GPSLatitude",
+        "GPSLatitude",
+        "XMP:GPSLatitude",
+        "EXIF:GPSLatitude",
+    )
+    lon_keys = (
+        "Composite:GPSLongitude",
+        "GPSLongitude",
+        "XMP:GPSLongitude",
+        "EXIF:GPSLongitude",
+    )
+
+    for key in lat_keys:
+        lat = _coerce_float(exif.get(key))
+        if lat is not None:
+            break
+    for key in lon_keys:
+        lon = _coerce_float(exif.get(key))
+        if lon is not None:
+            break
+
+    if lat is None or lon is None:
+        return None, None
+
+    lat_ref = str(exif.get("GPSLatitudeRef") or "").strip().upper()
+    lon_ref = str(exif.get("GPSLongitudeRef") or "").strip().upper()
+    if lat_ref == "S":
+        lat = -abs(lat)
+    if lon_ref == "W":
+        lon = -abs(lon)
+
+    return lat, lon
+
+
+def extract_camera_model(exif: Mapping[str, Any]) -> Optional[str]:
+    """Derive a readable camera/phone model label from EXIF payload."""
+
+    model_candidates = (
+        str(exif.get("Model") or ""),
+        str(exif.get("CameraModelName") or ""),
+        str(exif.get("DeviceModelName") or ""),
+    )
+    model = next((value.strip() for value in model_candidates if value.strip()), "")
+    make = str(exif.get("Make") or "").strip()
+
+    if not model and not make:
+        return None
+
+    if make:
+        if model and make.lower() in model.lower():
+            return model
+        if model:
+            return f"{make} {model}".strip()
+        return make
+
+    return model or None
 # --- URL helpers ---------------------------------------------------------
 def build_perception_gallery_url(slug: str) -> str:
     return f"https://perception.vsco.co/{slug}/gallery"
