@@ -2844,45 +2844,45 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       profileDatasets.classList.toggle('hidden', datasetParts.length === 0);
 
       let phoneList = Array.isArray(user._phoneList) ? user._phoneList : [];
-      if ((!phoneList || phoneList.length === 0) && Array.isArray(user.phone_models)) {
+      if ((!phoneList || phoneList.length === 0) && Array.isArray(user.phone_models)) {{
         const fallback = [];
         const seen = new Set();
-        user.phone_models.forEach(entry => {
+        user.phone_models.forEach(entry => {{
           if (!entry) return;
           let model = '';
           let count = 0;
           let rawCount = null;
-          if (typeof entry === 'object') {
+          if (typeof entry === 'object') {{
             model = (entry.model || entry.value || '').toString();
             rawCount = entry.count;
             if (rawCount === undefined || rawCount === null) rawCount = entry.cnt;
             if (rawCount === undefined || rawCount === null) rawCount = entry.total;
-          } else {
+          }} else {{
             model = entry.toString();
-          }
+          }}
           model = model.trim();
           if (!model) return;
           const lower = model.toLowerCase();
           if (seen.has(lower)) return;
           seen.add(lower);
-          if (rawCount !== null && rawCount !== undefined) {
+          if (rawCount !== null && rawCount !== undefined) {{
             const num = Number(rawCount);
-            if (Number.isFinite(num) && num > 0) {
+            if (Number.isFinite(num) && num > 0) {{
               count = Math.round(num);
-            }
-          }
-          fallback.push({ label: model, display: count > 1 ? model + ' ×' + count : model });
-        });
+            }}
+          }}
+          fallback.push({{ label: model, display: count > 1 ? model + ' ×' + count : model }});
+        }});
         phoneList = fallback;
-      }
-      const phoneParts = (Array.isArray(phoneList) ? phoneList : []).map(phone => {
+      }}
+      const phoneParts = (Array.isArray(phoneList) ? phoneList : []).map(phone => {{
         const label = (phone && (phone.display || phone.label)) ? (phone.display || phone.label) : '';
         return label ? '<span class=\"tag\">' + escapeHtml(label) + '</span>' : '';
-      }).filter(Boolean);
-      if (profilePhones) {
+      }}).filter(Boolean);
+      if (profilePhones) {{
         profilePhones.innerHTML = phoneParts.join('');
         profilePhones.classList.toggle('hidden', phoneParts.length === 0);
-      }
+      }}
 
       const cityParts = (user.cities || []).map(city => '<span class=\"chip\">' + escapeHtml(city) + '</span>');
       profileCities.innerHTML = cityParts.join('');
