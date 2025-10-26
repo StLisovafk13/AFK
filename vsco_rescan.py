@@ -11,6 +11,7 @@ from typing import Iterable
 
 from profile_link_scanner import (
     DEFAULT_DB,
+    ProfileMediaCollection,
     ScanResult,
     collect_profile_media,
     connect_db,
@@ -161,15 +162,23 @@ async def _rescan_single(
     target_count: int,
 ) -> ScanResult | None:
     try:
-        media_urls = await collect_profile_media(
+        collected = await collect_profile_media(
             entry.profile_url,
             max_width=max_width,
             delay=delay,
             target_count=target_count,
+            include_details=True,
         )
     except Exception as exc:  # pragma: no cover - network failures
         LOGGER.error("Не удалось собрать медиа для %s: %s", entry.profile_url, exc)
         return None
+
+    if isinstance(collected, ProfileMediaCollection):
+        media_urls = collected.media_urls
+        profile_tabs = collected.profile_tabs
+    else:
+        media_urls = collected
+        profile_tabs = []
 
     if not media_urls:
         LOGGER.warning("Нет медиа по ссылке %s", entry.profile_url)
@@ -182,6 +191,7 @@ async def _rescan_single(
         entry.profile_url,
         media_urls,
         source="rescan",
+        profile_tabs=profile_tabs,
     )
 
 

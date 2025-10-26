@@ -102,9 +102,10 @@ from vsco_utils import (
     upscale_w_param,
 )
 from profile_link_scanner import (
+    ProfileMediaCollection,
+    ScanResult,
     collect_profile_media,
     store_profile_media,
-    ScanResult,
 )
 
 # ---------------------- setup & logging ----------------------
@@ -747,6 +748,7 @@ def init_db():
       chat_id INTEGER NOT NULL,
       username TEXT NOT NULL,
       url TEXT NOT NULL,
+      extra_json TEXT DEFAULT '',
       created_at TEXT NOT NULL,
       UNIQUE(chat_id, username)
     )""")
@@ -781,6 +783,9 @@ def init_db():
         conn.execute("ALTER TABLE items ADD COLUMN added_by TEXT DEFAULT ''")
     if "meta_json" not in cols:
         conn.execute("ALTER TABLE items ADD COLUMN meta_json TEXT DEFAULT ''")
+    link_cols = {row[1] for row in conn.execute("PRAGMA table_info(links)")}
+    if "extra_json" not in link_cols:
+        conn.execute("ALTER TABLE links ADD COLUMN extra_json TEXT DEFAULT ''")
     conn.commit(); conn.close()
     log.info("DB initialized at %s", DB_PATH)
 
@@ -818,6 +823,49 @@ def added_by_html(value: str) -> str:
     if link:
         return f"<a href=\"{escape(link)}\">{escape(display)}</a>"
     return escape(display)
+
+
+def parse_profile_tabs_payload(raw: str) -> List[Dict[str, str]]:
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return []
+
+    candidates: List[Dict[str, Any]] = []
+    if isinstance(payload, dict):
+        maybe_tabs = payload.get("profile_tabs") or payload.get("tabs")
+        if isinstance(maybe_tabs, list):
+            candidates = [entry for entry in maybe_tabs if isinstance(entry, dict)]
+    elif isinstance(payload, list):
+        candidates = [entry for entry in payload if isinstance(entry, dict)]
+
+    sanitized: List[Dict[str, str]] = []
+    seen: set[Tuple[str, str]] = set()
+    for tab in candidates:
+        href_raw = tab.get("href")
+        href = str(href_raw).strip() if href_raw is not None else ""
+        if not href:
+            continue
+        tab_id_raw = tab.get("id")
+        tab_id = str(tab_id_raw).strip() if tab_id_raw is not None else ""
+        key = (tab_id.lower(), href)
+        if key in seen:
+            continue
+        seen.add(key)
+        entry: Dict[str, str] = {"href": href}
+        if tab_id:
+            entry["id"] = tab_id
+        for field_name in ("label", "slug", "active"):
+            value = tab.get(field_name)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                entry[field_name] = text
+        sanitized.append(entry)
+    return sanitized
 
 
 @dataclass
@@ -2022,6 +2070,27 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             ):
                 comments_map.setdefault(iid, []).append(c)
 
+    tab_info_by_user: Dict[str, Dict[str, Any]] = {}
+    link_query = "SELECT username, url, extra_json FROM links"
+    link_params: List[Any] = []
+    if scope == "chat":
+        link_query += " WHERE chat_id = ?"
+        link_params.append(chat_id)
+    for uname, link_url, extra_json in conn.execute(link_query, tuple(link_params)).fetchall():
+        key = uname or ""
+        info = tab_info_by_user.setdefault(key, {"url": "", "tabs": []})
+        if link_url and not info.get("url"):
+            info["url"] = link_url
+        tabs = parse_profile_tabs_payload(extra_json or "")
+        if tabs:
+            existing: List[Dict[str, str]] = info.setdefault("tabs", [])  # type: ignore[assignment]
+            seen_hrefs = {tab.get("href") for tab in existing}
+            for tab in tabs:
+                href = tab.get("href")
+                if href and href not in seen_hrefs:
+                    existing.append(tab)
+                    seen_hrefs.add(href)
+
     out = []
     for uname, g in groups.items():
         geo_buckets_raw = g.get("geo_buckets", {})  # type: ignore
@@ -2096,9 +2165,29 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             if label and int(count or 0) > 0
         ]
 
+        link_info = tab_info_by_user.get(uname, {})
+        link_profile_url = link_info.get("url") if isinstance(link_info, dict) else None
+        profile_tabs: List[Dict[str, str]] = []
+        raw_tabs = link_info.get("tabs") if isinstance(link_info, dict) else None
+        if isinstance(raw_tabs, list):
+            for tab in raw_tabs:
+                if not isinstance(tab, dict):
+                    continue
+                cleaned: Dict[str, str] = {}
+                for key, value in tab.items():
+                    if not isinstance(key, str):
+                        continue
+                    if value is None:
+                        continue
+                    text = str(value).strip()
+                    if text:
+                        cleaned[key] = text
+                if cleaned.get("href"):
+                    profile_tabs.append(cleaned)
+
         out.append({
             "username": uname,
-            "profile_url": g["profile_url"],
+            "profile_url": link_profile_url or g["profile_url"],
             "lat": lat, "lon": lon,
             "images": images_ordered,
             "images_meta": meta_entries,
@@ -2115,6 +2204,7 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "location_photo_count": location_count,
             "first_created": g.get("first_at"),
             "last_created": g.get("last_at"),
+            "profile_tabs": profile_tabs,
         })
     conn.close()
     return out
@@ -2269,6 +2359,10 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     .profile-actions .follow.disabled {{ pointer-events:none; opacity:0.5; }}
     .profile-actions .open {{ font-size:13px; color:#2563eb; text-decoration:none; font-weight:600; }}
     .profile-actions .open:hover {{ text-decoration:underline; }}
+    .profile-tabs {{ display:flex; flex-wrap:wrap; gap:10px; margin:12px 0 18px; }}
+    .profile-tabs.hidden {{ display:none !important; }}
+    .profile-tab {{ display:inline-flex; align-items:center; padding:6px 14px; border-radius:999px; background:#f3f4f6; color:#1f2937; text-decoration:none; font-weight:600; font-size:12px; letter-spacing:0.02em; transition:background .15s ease,color .15s ease; }}
+    .profile-tab:hover {{ background:#e5e7eb; color:#111827; }}
     .profile-meta {{ display:flex; gap:16px; flex-wrap:wrap; font-size:13px; color:#4b5563; margin-bottom:10px; }}
     .profile-meta span {{ display:inline-flex; align-items:center; gap:6px; }}
     .profile-tags {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }}
@@ -2374,10 +2468,11 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
             <a class=\"follow\" id=\"profileFollow\" href=\"#\" target=\"_blank\" rel=\"noopener\">FOLLOW</a>
             <a class=\"open\" id=\"profileOpen\" href=\"#\" target=\"_blank\" rel=\"noopener\">Открыть оригинал</a>
           </div>
+          <div class=\"profile-tabs hidden\" id=\"profileTabs\"></div>
           <div class=\"profile-meta\" id=\"profileMeta\"></div>
-      <div class=\"profile-tags\" id=\"profileDatasets\"></div>
-      <div class=\"profile-phones\" id=\"profilePhones\"></div>
-      <div class=\"profile-cities\" id=\"profileCities\"></div>
+          <div class=\"profile-tags\" id=\"profileDatasets\"></div>
+          <div class=\"profile-phones\" id=\"profilePhones\"></div>
+          <div class=\"profile-cities\" id=\"profileCities\"></div>
           <div class=\"profile-meta\" id=\"profileInfoExtra\"></div>
         </div>
       </div>
@@ -2400,6 +2495,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     const profileUsername = document.getElementById('profileUsername');
     const profileFollow = document.getElementById('profileFollow');
     const profileOpen = document.getElementById('profileOpen');
+    const profileTabs = document.getElementById('profileTabs');
     const profileMeta = document.getElementById('profileMeta');
     const profileDatasets = document.getElementById('profileDatasets');
     const profilePhones = document.getElementById('profilePhones');
@@ -2765,6 +2861,20 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         profileFollow.href = '#';
         profileOpen.href = '#';
         profileFollow.classList.add('disabled');
+      }}
+
+      if (profileTabs) {{
+        const tabs = Array.isArray(user.profile_tabs) ? user.profile_tabs : [];
+        const tabHtml = tabs.map(tab => {{
+          if (!tab || typeof tab !== 'object') return '';
+          const rawHref = tab.href != null ? String(tab.href) : '';
+          const href = rawHref.trim();
+          if (!href) return '';
+          const label = (tab.label || tab.slug || tab.id || href || '').toString();
+          return '<a class=\"profile-tab\" href=\"' + escapeHtml(href) + '\" target=\"_blank\" rel=\"noopener\">' + escapeHtml(label) + '</a>';
+        }}).filter(Boolean).join('');
+        profileTabs.innerHTML = tabHtml;
+        profileTabs.classList.toggle('hidden', tabHtml.length === 0);
       }}
 
       const images = Array.isArray(user.images) ? user.images.filter(Boolean) : [];
@@ -4811,10 +4921,17 @@ async def _profile_scan_worker() -> None:
                 job.chat_id,
                 job.profile_url,
             )
-            media_urls = await collect_profile_media(
+            collected = await collect_profile_media(
                 job.profile_url,
                 max_width=MEDIA_PAGE_MAX_WIDTH,
+                include_details=True,
             )
+            if isinstance(collected, ProfileMediaCollection):
+                media_urls = collected.media_urls
+                profile_tabs = collected.profile_tabs
+            else:
+                media_urls = collected
+                profile_tabs = []
             result: ScanResult = store_profile_media(
                 Path(DB_PATH),
                 job.chat_id,
@@ -4823,6 +4940,7 @@ async def _profile_scan_worker() -> None:
                 media_urls,
                 source=job.source,
                 added_by=job.added_by,
+                profile_tabs=profile_tabs,
             )
             if result.added_items > 0 or not result.media_urls:
                 total = len(result.media_urls)

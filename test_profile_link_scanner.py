@@ -33,16 +33,23 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
 
     stub_meta = lambda url: {"size_bytes": 123, "exiftool": {"Model": "TestCam"}}
 
+    tabs = [
+        {"href": "https://vsco.co/example/collection/1", "label": "REPOSTS"},
+        {"href": "https://vsco.co/example/gallery", "label": "RECENT"},
+    ]
+
     result = store_profile_media(
         db_path,
         123,
         "example",
         profile_url,
         urls,
+        profile_tabs=tabs,
         meta_fetcher=stub_meta,
     )
     assert result.added_items == 2
     assert result.link_added is True
+    assert result.profile_tabs and result.profile_tabs[0]["href"].endswith("/collection/1")
 
     second = store_profile_media(
         db_path,
@@ -71,5 +78,14 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
         payload = json.loads(meta_row[0])
         assert payload.get("size_bytes") == 123
         assert payload.get("exiftool", {}).get("Model") == "TestCam"
+
+        extra_row = conn.execute(
+            "SELECT extra_json FROM links WHERE username=?",
+            ("example",),
+        ).fetchone()
+        assert extra_row is not None and extra_row[0]
+        tabs_payload = json.loads(extra_row[0])
+        stored_tabs = tabs_payload.get("profile_tabs") or []
+        assert stored_tabs and stored_tabs[0]["href"].endswith("/collection/1")
     finally:
         conn.close()

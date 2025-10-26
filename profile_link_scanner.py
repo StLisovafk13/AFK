@@ -15,10 +15,10 @@ import json
 import logging
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Dict, Iterable, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, Optional, Sequence
 
 import aiohttp
 
@@ -27,6 +27,7 @@ from exif_fetcher import extract_exif_from_url
 from vsco_utils import (
     dedupe_keep_order,
     extract_media_urls_from_html,
+    extract_profile_tab_links,
     is_media_url,
     is_vsco_logo_url,
     normalize_media_url,
@@ -54,6 +55,15 @@ class ScanResult:
     media_urls: list[str]
     added_items: int = 0
     link_added: bool = False
+    profile_tabs: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class ProfileMediaCollection:
+    """Container with extracted media URLs and profile metadata."""
+
+    media_urls: list[str]
+    profile_tabs: list[dict[str, str]] = field(default_factory=list)
 
 
 def utc_now_iso() -> str:
@@ -72,6 +82,7 @@ def ensure_db_schema(conn: sqlite3.Connection) -> None:
           chat_id INTEGER NOT NULL,
           username TEXT NOT NULL,
           url TEXT NOT NULL,
+          extra_json TEXT DEFAULT '',
           created_at TEXT NOT NULL,
           UNIQUE(chat_id, username)
         )
@@ -114,6 +125,9 @@ def ensure_db_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE items ADD COLUMN added_by TEXT DEFAULT ''")
     if "meta_json" not in cols:
         conn.execute("ALTER TABLE items ADD COLUMN meta_json TEXT DEFAULT ''")
+    link_cols = {row[1] for row in conn.execute("PRAGMA table_info(links)")}
+    if "extra_json" not in link_cols:
+        conn.execute("ALTER TABLE links ADD COLUMN extra_json TEXT DEFAULT ''")
 
 
 def connect_db(path: Path) -> sqlite3.Connection:
@@ -164,26 +178,27 @@ async def _collect_with_playwright(
     max_width: int,
     delay: float,
     target_count: int,
-) -> list[str]:
+) -> tuple[list[str], str]:
     try:
         from playwright.async_api import async_playwright
         from playwright.async_api import TimeoutError as PlaywrightTimeoutError
     except Exception as exc:  # pragma: no cover - optional dependency
         LOGGER.info("Playwright недоступен, откатываемся на HTTP: %s", exc)
-        return []
+        return [], ""
 
     gallery_url = profile_url.rstrip("/")
     if not gallery_url.endswith("/gallery"):
         gallery_url = f"{gallery_url}/gallery"
 
-    async def _extract(page) -> list[str]:
+    async def _extract(page) -> tuple[list[str], str]:
         html = await page.content()
         root = getattr(page, "url", None) or gallery_url
         urls = extract_media_urls_from_html(html, max_width=max_width, root=root)
-        return [u for u in urls if not is_vsco_logo_url(u)]
+        return [u for u in urls if not is_vsco_logo_url(u)], html
 
-    async def _scroll(page) -> list[str]:
-        urls = dedupe_keep_order(await _extract(page))
+    async def _scroll(page) -> tuple[list[str], str]:
+        urls, last_html = await _extract(page)
+        urls = dedupe_keep_order(urls)
         if urls:
             LOGGER.info("Нашли %d ссылок на первом экране", len(urls))
         else:
@@ -244,7 +259,9 @@ async def _collect_with_playwright(
             )
             await page.wait_for_timeout(int(max(0.1, delay) * 1000))
 
-            extracted = dedupe_keep_order(await _extract(page))
+            extracted, html_snapshot = await _extract(page)
+            last_html = html_snapshot
+            extracted = dedupe_keep_order(extracted)
             combined = dedupe_keep_order(urls + extracted)
             if len(combined) > prev_count:
                 LOGGER.info("Прогресс: %d ссылок", len(combined))
@@ -277,7 +294,12 @@ async def _collect_with_playwright(
                 LOGGER.debug("Клики Load More не дают новых ссылок, останавливаемся")
                 break
 
-        return urls
+        if not last_html:
+            # Гарантируем, что у нас есть HTML последнего состояния
+            fallback_urls, last_html = await _extract(page)
+            urls = dedupe_keep_order(urls + fallback_urls)
+
+        return dedupe_keep_order(urls), last_html
 
     browser = context = page = None
     try:
@@ -310,7 +332,7 @@ async def _collect_with_playwright(
             except Exception:
                 pass
 
-    return []
+    return [], ""
 
 
 async def collect_profile_media(
@@ -320,14 +342,15 @@ async def collect_profile_media(
     delay: float = 0.4,
     target_count: int = 0,
     headers: dict[str, str] | None = None,
-) -> list[str]:
+    include_details: bool = False,
+) -> list[str] | ProfileMediaCollection:
     """Return the list of direct media URLs for a VSCO profile."""
 
     session_headers = {"User-Agent": DEFAULT_USER_AGENT}
     if headers:
         session_headers.update(headers)
 
-    urls = await _collect_with_playwright(
+    urls, html = await _collect_with_playwright(
         profile_url,
         headers=session_headers,
         max_width=max_width,
@@ -336,10 +359,13 @@ async def collect_profile_media(
     )
 
     if urls:
+        if include_details:
+            tabs = extract_profile_tab_links(html, root=profile_url)
+            return ProfileMediaCollection(media_urls=urls, profile_tabs=tabs)
         return urls
 
     async with aiohttp.ClientSession(headers=session_headers) as session:
-        urls = await scan_profile_media(
+        urls, html = await scan_profile_media(
             session,
             profile_url,
             max_width=max_width,
@@ -348,6 +374,14 @@ async def collect_profile_media(
 
     if not urls:
         LOGGER.warning("Не удалось получить ссылки медиа для %s", profile_url)
+        if include_details:
+            return ProfileMediaCollection(media_urls=[], profile_tabs=[])
+        return []
+
+    if include_details:
+        tabs = extract_profile_tab_links(html, root=profile_url)
+        return ProfileMediaCollection(media_urls=urls, profile_tabs=tabs)
+
     return urls
 
 
@@ -364,6 +398,31 @@ def _prepare_urls(urls: Iterable[str], *, max_width: int) -> list[str]:
     return dedupe_keep_order(prepared)
 
 
+def _sanitize_profile_tabs(
+    tabs: Optional[Sequence[Dict[str, Any]]],
+) -> list[dict[str, str]]:
+    sanitized: list[dict[str, str]] = []
+    if not tabs:
+        return sanitized
+    for tab in tabs:
+        if not isinstance(tab, dict):
+            continue
+        href_raw = tab.get("href")
+        href = str(href_raw).strip() if href_raw is not None else ""
+        if not href:
+            continue
+        entry: dict[str, str] = {"href": href}
+        for key in ("id", "label", "slug", "active"):
+            value = tab.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                entry[key] = text
+        sanitized.append(entry)
+    return sanitized
+
+
 def store_profile_media(
     db_path: Path,
     chat_id: int,
@@ -373,11 +432,18 @@ def store_profile_media(
     *,
     source: str = "profile-scan",
     added_by: str = "",
+    profile_tabs: Optional[Sequence[Dict[str, Any]]] = None,
     meta_fetcher: Optional[Callable[[str], Dict[str, Any]]] = None,
 ) -> ScanResult:
     """Persist collected media URLs into the bot database."""
 
-    result = ScanResult(username=username, profile_url=profile_url, media_urls=list(media_urls))
+    sanitized_tabs = _sanitize_profile_tabs(profile_tabs)
+    result = ScanResult(
+        username=username,
+        profile_url=profile_url,
+        media_urls=list(media_urls),
+        profile_tabs=sanitized_tabs,
+    )
     if not media_urls:
         return result
 
@@ -437,6 +503,17 @@ def store_profile_media(
             "INSERT OR IGNORE INTO links(chat_id,username,url,created_at) VALUES(?,?,?,?)",
             (chat_id, username, profile_url, utc_now_iso()),
         )
+        if sanitized_tabs:
+            payload = json.dumps({"profile_tabs": sanitized_tabs}, ensure_ascii=False)
+            conn.execute(
+                "UPDATE links SET extra_json=?, url=? WHERE chat_id=? AND username=?",
+                (payload, profile_url, chat_id, username),
+            )
+        elif profile_url:
+            conn.execute(
+                "UPDATE links SET url=? WHERE chat_id=? AND username=?",
+                (profile_url, chat_id, username),
+            )
         conn.commit()
     finally:
         result.added_items = added_items
@@ -469,12 +546,19 @@ async def _async_main(args: argparse.Namespace) -> ScanResult:
     username, profile_url = resolve_profile_inputs(args.username, args.profile_url)
     LOGGER.info("Сканируем профиль %s (%s)", username, profile_url)
 
-    media_urls = await collect_profile_media(
+    collected = await collect_profile_media(
         profile_url,
         max_width=args.max_width,
         delay=args.delay,
         target_count=args.target_count,
+        include_details=True,
     )
+    if isinstance(collected, ProfileMediaCollection):
+        media_urls = collected.media_urls
+        profile_tabs = collected.profile_tabs
+    else:
+        media_urls = collected
+        profile_tabs = []
 
     result = store_profile_media(
         args.db,
@@ -483,6 +567,7 @@ async def _async_main(args: argparse.Namespace) -> ScanResult:
         profile_url,
         media_urls,
         source="profile-scan",
+        profile_tabs=profile_tabs,
     )
     LOGGER.info(
         "Сканирование завершено: %d новых элементов, ссылка сохранена=%s",
