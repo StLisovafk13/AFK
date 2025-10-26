@@ -2281,23 +2281,10 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     .profile-stats .stat {{ display:flex; flex-direction:column; font-size:14px; color:#6b7280; }}
     .profile-stats .stat .value {{ font-size:20px; font-weight:600; color:#111827; }}
     .profile-grid {{ display:grid; grid-template-columns: repeat(auto-fill,minmax(220px,1fr)); gap:16px; }}
-    .profile-grid .cell {{ position:relative; width:100%; padding-bottom:100%; border-radius:18px; overflow:hidden; background:#f3f4f6; }}
-    .profile-grid .cell img {{ position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; }}
-    .profile-exif {{ margin-top:28px; background:#fff; border-radius:20px; padding:24px; box-shadow:0 12px 30px rgba(15,23,42,0.08); }}
-    .profile-exif h3 {{ margin:0 0 16px 0; font-size:20px; font-weight:600; color:#111827; }}
-    .profile-exif-list {{ display:flex; flex-direction:column; gap:16px; }}
-    .profile-exif-item {{ display:flex; gap:18px; align-items:flex-start; }}
-    .profile-exif-thumb {{ width:120px; min-width:120px; height:120px; border-radius:16px; overflow:hidden; background:#f3f4f6; border:1px solid #e5e7eb; display:flex; align-items:center; justify-content:center; }}
-    .profile-exif-thumb img {{ width:100%; height:100%; object-fit:cover; }}
-    .profile-exif-body {{ flex:1 1 auto; display:flex; flex-direction:column; gap:10px; }}
-    .profile-exif-title {{ font-size:15px; font-weight:600; color:#111827; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
-    .profile-exif-title a {{ color:#2563eb; text-decoration:none; }}
-    .profile-exif-title a:hover {{ text-decoration:underline; }}
-    .profile-exif-tags {{ display:flex; flex-wrap:wrap; gap:6px; font-size:12px; color:#4b5563; }}
-    .profile-exif-tags .chip {{ display:inline-flex; align-items:center; gap:4px; background:#f3f4f6; border-radius:999px; padding:4px 10px; }}
-    .profile-exif details {{ background:#f9fafb; border-radius:14px; padding:8px 12px; color:#374151; }}
-    .profile-exif summary {{ cursor:pointer; font-weight:600; }}
-    .profile-exif-raw {{ white-space:pre-wrap; word-break:break-word; font-family:ui-monospace, SFMono-Regular, SFMono, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size:12px; margin:8px 0 0 0; color:#111827; }}
+    .profile-grid .cell {{ display:flex; flex-direction:column; border-radius:18px; overflow:hidden; background:#f3f4f6; border:1px solid #e5e7eb; }}
+    .profile-grid .cell-thumb {{ position:relative; width:100%; padding-bottom:100%; background:#e5e7eb; }}
+    .profile-grid .cell-thumb img {{ position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; }}
+    .profile-grid .cell-city {{ font-size:12px; color:#4b5563; padding:6px 8px 10px; background:#fff; text-align:center; line-height:1.4; border-top:1px solid #e5e7eb; }}
     .profile-empty {{ text-align:center; font-size:15px; color:#6b7280; padding:40px 0; }}
     @media (max-width: 900px) {{
       .profile-wrap {{ padding:24px; }}
@@ -2397,7 +2384,6 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       <div class=\"profile-stats\" id=\"profileStats\"></div>
       <div class=\"profile-grid\" id=\"profileGrid\"></div>
       <div class=\"profile-empty hidden\" id=\"profileEmpty\">Нет сохранённых фотографий для этого профиля.</div>
-      <div class=\"profile-exif hidden\" id=\"profileExif\"></div>
     </div>
   </div>
 
@@ -2422,7 +2408,6 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     const profileStats = document.getElementById('profileStats');
     const profileGrid = document.getElementById('profileGrid');
     const profileEmpty = document.getElementById('profileEmpty');
-    const profileExif = document.getElementById('profileExif');
 
     const searchInput = document.getElementById('q');
     const datasetSelect = document.getElementById('datasetSelect');
@@ -2736,57 +2721,29 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       return entry;
     }}
 
-    function collectExifChips(entry) {{
+    function getEntryCityLabel(entry) {{
       const data = normalizeExifEntry(entry);
-      const chips = [];
-      if (typeof data.size_bytes === 'number') {{
-        const sizeLabel = formatBytes(data.size_bytes);
-        if (sizeLabel) chips.push('Размер: ' + sizeLabel);
-      }}
-      if (typeof data.lat === 'number' && isFinite(data.lat) && typeof data.lon === 'number' && isFinite(data.lon)) {{
-        chips.push('GPS: ' + data.lat.toFixed(5) + ', ' + data.lon.toFixed(5));
-      }}
-      if (data.city) {{
-        const cityLabel = ('' + data.city).trim();
-        if (cityLabel) chips.push('Город: ' + cityLabel);
+      const hasLat = typeof data.lat === 'number' && isFinite(data.lat);
+      const hasLon = typeof data.lon === 'number' && isFinite(data.lon);
+      if (!hasLat || !hasLon) return '';
+      const candidates = [];
+      if (data.city !== undefined && data.city !== null) candidates.push(data.city);
+      const extra = data.extra && typeof data.extra === 'object' ? data.extra : null;
+      if (extra) {{
+        ['city', 'City', 'town', 'Town', 'location', 'Location'].forEach(key => {{
+          if (extra[key] !== undefined && extra[key] !== null) candidates.push(extra[key]);
+        }});
       }}
       const exif = data.exiftool && typeof data.exiftool === 'object' ? data.exiftool : null;
       if (exif) {{
-        const mapping = [
-          ['Model', 'Камера'],
-          ['LensModel', 'Объектив'],
-          ['CreateDate', 'Дата'],
-          ['ExposureTime', 'Выдержка'],
-          ['FNumber', 'Диафрагма'],
-          ['ISO', 'ISO'],
-          ['FocalLength', 'Фокус'],
-        ];
-        mapping.forEach(([key, label]) => {{
-          if (exif[key] !== undefined && exif[key] !== null && exif[key] !== '') {{
-            let value = '' + exif[key];
-            if (key === 'FNumber' && !/^f\\//i.test(value)) {{
-              value = 'f/' + value;
-            }} else if (key === 'ISO' && !/^ISO/i.test(value)) {{
-              value = 'ISO ' + value;
-            }}
-            chips.push(label + ': ' + value);
-          }}
+        ['City', 'Sub-location', 'Location'].forEach(key => {{
+          if (exif[key] !== undefined && exif[key] !== null) candidates.push(exif[key]);
         }});
       }}
-      return chips;
-    }}
-
-    function buildExifRaw(entry) {{
-      const data = normalizeExifEntry(entry);
-      if (data.exiftool && typeof data.exiftool === 'object') {{
-        return JSON.stringify(data.exiftool, null, 2);
-      }}
-      if (data.extra && typeof data.extra === 'object') {{
-        return JSON.stringify(data.extra, null, 2);
-      }}
-      const keys = Object.keys(data).filter(key => key !== 'url');
-      if (keys.length) {{
-        return JSON.stringify(data, null, 2);
+      for (const candidate of candidates) {{
+        if (candidate === undefined || candidate === null) continue;
+        const label = ('' + candidate).trim();
+        if (label) return label;
       }}
       return '';
     }}
@@ -2903,44 +2860,33 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         '<div class=\"stat\"><span class=\"value\">' + (user.comments_count || 0) + '</span><span class=\"label\">comments</span></div>'
       ].join('');
 
+      const metaList = Array.isArray(user.images_meta) ? user.images_meta : [];
+      const metaByUrl = new Map();
+      metaList.forEach(entry => {{
+        const data = normalizeExifEntry(entry);
+        const rawUrl = (data.url || entry.url || '').toString();
+        if (!rawUrl) return;
+        metaByUrl.set(rawUrl, data);
+        const bare = rawUrl.split('?')[0];
+        if (bare && bare !== rawUrl) metaByUrl.set(bare, data);
+      }});
+
       if (images.length) {{
-        profileGrid.innerHTML = images.map(src => '<div class=\"cell\"><img src=\"' + escapeHtml(src) + '\" loading=\"lazy\" alt=\"\"></div>').join('');
+        const cells = images.map(src => {{
+          const rawSrc = (src || '').toString();
+          if (!rawSrc) return '';
+          const safeSrc = escapeHtml(rawSrc);
+          const bareSrc = rawSrc.split('?')[0];
+          const meta = metaByUrl.get(rawSrc) || metaByUrl.get(bareSrc);
+          const city = meta ? getEntryCityLabel(meta) : '';
+          const cityHtml = city ? '<div class=\"cell-city\">📍 ' + escapeHtml(city) + '</div>' : '';
+          return '<div class=\"cell\"><div class=\"cell-thumb\"><img src=\"' + safeSrc + '\" loading=\"lazy\" alt=\"\"></div>' + cityHtml + '</div>';
+        }}).join('');
+        profileGrid.innerHTML = cells;
         profileEmpty.classList.add('hidden');
       }} else {{
         profileGrid.innerHTML = '';
         profileEmpty.classList.remove('hidden');
-      }}
-
-      if (profileExif) {{
-        const metaList = Array.isArray(user.images_meta) ? user.images_meta : [];
-        if (metaList.length) {{
-          const sections = metaList.map((entry, idx) => {{
-            const data = normalizeExifEntry(entry);
-            const rawUrl = (data.url || entry.url || '').toString();
-            const safeUrl = rawUrl ? escapeHtml(rawUrl) : '';
-            const thumb = rawUrl ? '<img src=\"' + safeUrl + '\" loading=\"lazy\" alt=\"\" />' : '';
-            const chips = collectExifChips(data);
-            const chipsHtml = chips.length ? '<div class=\"profile-exif-tags\">' + chips.map(chip => '<span class=\"chip\">' + escapeHtml(chip) + '</span>').join('') + '</div>' : '';
-            const raw = buildExifRaw(data);
-            const rawHtml = raw ? '<details><summary>Полные данные</summary><pre class=\"profile-exif-raw\">' + escapeHtml(raw) + '</pre></details>' : '';
-            const linkHtml = rawUrl ? ' • <a href=\"' + safeUrl + '\" target=\"_blank\" rel=\"noopener\">Открыть оригинал</a>' : '';
-            return [
-              '<div class=\"profile-exif-item\">',
-              '  <div class=\"profile-exif-thumb\">' + thumb + '</div>',
-              '  <div class=\"profile-exif-body\">',
-              '    <div class=\"profile-exif-title\">' + escapeHtml('#' + (idx + 1)) + linkHtml + '</div>',
-              chipsHtml,
-              rawHtml,
-              '  </div>',
-              '</div>',
-            ].join('');
-          }}).join('');
-          profileExif.innerHTML = '<h3>EXIF / Метаданные</h3><div class=\"profile-exif-list\">' + sections + '</div>';
-          profileExif.classList.remove('hidden');
-        }} else {{
-          profileExif.innerHTML = '';
-          profileExif.classList.add('hidden');
-        }}
       }}
 
       galleryView.classList.add('hidden');
