@@ -21,6 +21,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 VSCO_LOGO_MARKERS = ("vsco-logo-white",)
+PROFILE_TAB_ID_RE = re.compile(r"^profileTab-([A-Za-z0-9_-]+)$")
 
 # --- Domains & regexes shared between the bot and the ZIP helper ---
 VSCO_HOSTS = {"vsco.co", "www.vsco.co"}
@@ -334,6 +335,53 @@ def extract_media_urls_from_html(
     return dedupe_keep_order(urls)
 
 
+def extract_profile_tab_links(html: str, *, root: Optional[str] = None) -> list[dict[str, str]]:
+    """Return structured navigation tab links from a VSCO profile page."""
+
+    if not html or not BeautifulSoup:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    tabs: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    base_root = root or "https://vsco.co/"
+
+    for anchor in soup.select("a[id^='profileTab-'][href]"):
+        href_raw = anchor.get("href") or ""
+        if not href_raw:
+            continue
+        href_abs = urljoin(base_root, href_raw)
+        tab_id = (anchor.get("id") or "").strip()
+        key = (tab_id.lower(), href_abs)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        label = (anchor.get_text(strip=True) or "").strip()
+        slug_match = PROFILE_TAB_ID_RE.match(tab_id)
+        slug = slug_match.group(1) if slug_match else ""
+
+        entry: dict[str, str] = {
+            "id": tab_id,
+            "href": href_abs,
+        }
+        if label:
+            entry["label"] = label
+        elif slug:
+            entry["label"] = slug
+
+        if slug:
+            entry["slug"] = slug
+
+        aria_current = (anchor.get("aria-current") or "").strip()
+        if aria_current:
+            entry["active"] = aria_current
+
+        tabs.append(entry)
+
+    return tabs
+
+
 async def scan_profile_media(
     session,
     profile_url: str,
@@ -342,14 +390,8 @@ async def scan_profile_media(
     limit: int = 0,
     logger: Optional[logging.Logger] = None,
     request_kwargs: Optional[dict] = None,
-) -> list[str]:
-    """Fetch a VSCO profile page and return direct media asset URLs.
-
-    The helper performs a single HTTP GET (with optional ``request_kwargs``)
-    and extracts media links via :func:`extract_media_urls_from_html`. If no
-    direct ``img``/``video`` tags are present, a fallback scan through OG /
-    Twitter / responsive meta tags is attempted.
-    """
+) -> tuple[list[str], str]:
+    """Fetch a VSCO profile page and return media URLs along with HTML."""
 
     html = ""
     kwargs = {"allow_redirects": True}
@@ -362,7 +404,7 @@ async def scan_profile_media(
     except Exception as exc:
         if logger is not None:
             logger.warning("scan_profile_media: fetch failed for %s: %s", profile_url, exc)
-        return []
+        return [], html
 
     urls = extract_media_urls_from_html(html, max_width=max_width, root=profile_url)
 
@@ -380,7 +422,7 @@ async def scan_profile_media(
     if limit and len(urls) > limit:
         urls = urls[:limit]
 
-    return urls
+    return urls, html
 
 
 async def playwright_scan_profile(
@@ -403,12 +445,13 @@ async def playwright_scan_profile(
                 exc,
             )
         if session is not None:
-            return await scan_profile_media(
+            urls, _html = await scan_profile_media(
                 session,
                 profile_url,
                 max_width=max_width,
                 logger=logger,
             )
+            return urls
         return []
 
     gallery_url = profile_url.rstrip("/")
@@ -530,11 +573,12 @@ async def playwright_scan_profile(
                 pass
 
     if session is not None:
-        return await scan_profile_media(
+        urls, _html = await scan_profile_media(
             session,
             gallery_url,
             max_width=max_width,
             logger=logger,
         )
+        return urls
     return []
 
