@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from profile_link_scanner import (
+    ProfileDetails,
     resolve_profile_inputs,
     store_profile_media,
 )
@@ -43,6 +44,7 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
     )
     assert result.added_items == 2
     assert result.link_added is True
+    assert result.sections.get("gallery") == result.media_urls
 
     second = store_profile_media(
         db_path,
@@ -73,3 +75,37 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
         assert payload.get("exiftool", {}).get("Model") == "TestCam"
     finally:
         conn.close()
+
+
+def test_store_profile_media_updates_profile_details(tmp_path: Path):
+    db_path = tmp_path / "vsco.db"
+    profile_url = "https://vsco.co/example/gallery"
+    details = ProfileDetails(
+        bio="About this profile",
+        collection_url="https://vsco.co/example/collection/1",
+        journal_url="https://vsco.co/example/journal/p/1",
+    )
+
+    store_profile_media(
+        db_path,
+        321,
+        "example",
+        profile_url,
+        ["https://images.example.com/media1.jpg"],
+        profile_details=details,
+    )
+
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT profile_bio, collection_url, journal_url FROM links WHERE username=?",
+            ("example",),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row == (
+        "About this profile",
+        "https://vsco.co/example/collection/1",
+        "https://vsco.co/example/journal/p/1",
+    )

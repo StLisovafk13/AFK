@@ -43,6 +43,7 @@ import json
 import time
 import tempfile
 import zipfile
+import importlib.util
 from html import escape
 from enum import Enum
 
@@ -51,7 +52,13 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     reverse_geocoder = None  # type: ignore
 
-from dotenv import load_dotenv
+# Optional dependency: python-dotenv
+_dotenv_spec = importlib.util.find_spec("dotenv")
+if _dotenv_spec is not None:
+    from dotenv import load_dotenv  # type: ignore
+else:  # pragma: no cover - fallback when dotenv is absent
+    def load_dotenv(*_args, **_kwargs):
+        return False
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
@@ -79,7 +86,12 @@ import contextlib
 import shlex
 
 # ---- external utils (optional HTML export parser) ----
-from vsco_parser import parse_html_file, dedupe_rows
+_pandas_spec = importlib.util.find_spec("pandas")
+if _pandas_spec is not None:
+    from vsco_parser import parse_html_file, dedupe_rows  # type: ignore
+else:  # pragma: no cover - HTML parsing disabled when pandas is absent
+    parse_html_file = None  # type: ignore
+    dedupe_rows = None  # type: ignore
 
 from zip_profile import zip_router
 from vsco_export import ExportDependencies, ExportManager
@@ -750,6 +762,13 @@ def init_db():
       created_at TEXT NOT NULL,
       UNIQUE(chat_id, username)
     )""")
+    link_cols = {row[1] for row in conn.execute("PRAGMA table_info(links)")}
+    if "profile_bio" not in link_cols:
+        conn.execute("ALTER TABLE links ADD COLUMN profile_bio TEXT DEFAULT ''")
+    if "collection_url" not in link_cols:
+        conn.execute("ALTER TABLE links ADD COLUMN collection_url TEXT DEFAULT ''")
+    if "journal_url" not in link_cols:
+        conn.execute("ALTER TABLE links ADD COLUMN journal_url TEXT DEFAULT ''")
     conn.execute("""
     CREATE TABLE IF NOT EXISTS items(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -818,6 +837,22 @@ def added_by_html(value: str) -> str:
     if link:
         return f"<a href=\"{escape(link)}\">{escape(display)}</a>"
     return escape(display)
+
+
+SECTION_DEFINITIONS: Tuple[Tuple[str, str], ...] = (
+    ("gallery", "Gallery"),
+    ("collection", "Collection"),
+    ("journal", "Journal"),
+)
+
+
+def _profile_section_key(profile_url: Optional[str]) -> str:
+    url = (profile_url or "").strip().lower()
+    if "/journal" in url:
+        return "journal"
+    if "/collection" in url:
+        return "collection"
+    return "gallery"
 
 
 @dataclass
@@ -1912,12 +1947,40 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             " FROM items WHERE chat_id=?",
             (chat_id,),
         ).fetchall()
+        link_rows = conn.execute(
+            "SELECT username,profile_bio,collection_url,journal_url,url FROM links WHERE chat_id=?",
+            (chat_id,),
+        ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,meta_json,created_at FROM items"
+            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,meta_json,created_at FROM items",
+        ).fetchall()
+        link_rows = conn.execute(
+            "SELECT username,profile_bio,collection_url,journal_url,url FROM links",
         ).fetchall()
     if not rows:
         conn.close(); return []
+
+    link_map: Dict[str, Dict[str, str]] = {}
+    for uname, bio, coll, journal, link_url in link_rows:
+        key = (uname or "").strip()
+        info = link_map.setdefault(
+            key,
+            {
+                "profile_bio": "",
+                "collection_url": "",
+                "journal_url": "",
+                "url": "",
+            },
+        )
+        if bio and not info["profile_bio"]:
+            info["profile_bio"] = str(bio)
+        if coll and not info["collection_url"]:
+            info["collection_url"] = str(coll)
+        if journal and not info["journal_url"]:
+            info["journal_url"] = str(journal)
+        if link_url and not info["url"]:
+            info["url"] = str(link_url)
 
     groups: Dict[str, Dict[str, Any]] = {}
     ids_by_user: Dict[str,List[int]] = {}
@@ -1940,13 +2003,25 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
                 "camera_models": Counter(),
                 "camera_model_labels": {},
                 "geo_buckets": {},
+                "profile_bio": "",
+                "collection_url": "",
+                "journal_url": "",
+                "section_urls": {},
+                "image_sections": {},
             },
         )
         if purl and not g["profile_url"]:
             g["profile_url"] = purl
+        section_urls: Dict[str, str] = g.setdefault("section_urls", {})  # type: ignore[assignment]
+        section_key = _profile_section_key(purl or g.get("profile_url"))
+        if purl and section_key not in section_urls:
+            section_urls[section_key] = purl
         if img and img not in g["image_set"]:
             g["images"].append(img)
             g["image_set"].add(img)
+        if img:
+            image_sections: Dict[str, str] = g.setdefault("image_sections", {})  # type: ignore[assignment]
+            image_sections.setdefault(img, section_key)
         meta_payload: Optional[Dict[str, Any]] = None
         meta_for_extract: Optional[Dict[str, Any]] = None
         if meta_json:
@@ -2009,6 +2084,22 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
                 pass
         ids_by_user.setdefault(uname, []).append(iid)
 
+    for uname, g in groups.items():
+        info = link_map.get(uname)
+        if not info:
+            continue
+        section_urls: Dict[str, str] = g.setdefault("section_urls", {})  # type: ignore[assignment]
+        if info.get("url") and not g.get("profile_url"):
+            g["profile_url"] = info["url"]
+        if info.get("profile_bio") is not None:
+            g["profile_bio"] = info.get("profile_bio", "")
+        if info.get("collection_url"):
+            g["collection_url"] = info["collection_url"]
+            section_urls.setdefault("collection", info["collection_url"])
+        if info.get("journal_url"):
+            g["journal_url"] = info["journal_url"]
+            section_urls.setdefault("journal", info["journal_url"])
+
     all_ids = [iid for lst in ids_by_user.values() for iid in lst]
     comments_map: Dict[int,List[str]] = {}
     if all_ids:
@@ -2051,6 +2142,7 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
         image_coords_map: Dict[str, Tuple[float, float]] = g.get("image_coords", {})  # type: ignore
         images_ordered: List[str] = g.get("images", [])  # type: ignore
         meta_entries: List[Dict[str, Any]] = []
+        entry_by_url: Dict[str, Dict[str, Any]] = {}
         for img_url in images_ordered:
             payload = image_meta_map.get(img_url)
             entry: Dict[str, Any] = {"url": img_url}
@@ -2079,6 +2171,7 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
                 if city_label:
                     entry["city"] = city_label
             meta_entries.append(entry)
+            entry_by_url[img_url] = entry
 
         camera_counter_raw = g.get("camera_models", Counter())  # type: ignore
         camera_counter: Counter[str] = (
@@ -2096,9 +2189,46 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             if label and int(count or 0) > 0
         ]
 
+        section_urls_map: Dict[str, str] = g.get("section_urls", {})  # type: ignore
+        image_sections_map: Dict[str, str] = g.get("image_sections", {})  # type: ignore
+        info = link_map.get(uname, {})
+        if info.get("collection_url") and "collection" not in section_urls_map:
+            section_urls_map["collection"] = info["collection_url"]
+        if info.get("journal_url") and "journal" not in section_urls_map:
+            section_urls_map["journal"] = info["journal_url"]
+
+        sections_payload: List[Dict[str, Any]] = []
+        other_keys = {"collection", "journal"}
+        for key, label_text in SECTION_DEFINITIONS:
+            section_images = [
+                img for img in images_ordered if image_sections_map.get(img, "gallery") == key
+            ]
+            if key == "gallery":
+                if not section_images:
+                    section_images = [
+                        img for img in images_ordered if image_sections_map.get(img) not in other_keys
+                    ]
+            section_link = section_urls_map.get(key, "")
+            if key != "gallery" and not section_images and not section_link:
+                continue
+            section_meta = [entry_by_url[img] for img in section_images if img in entry_by_url]
+            sections_payload.append(
+                {
+                    "key": key,
+                    "label": label_text,
+                    "url": section_link,
+                    "images": section_images,
+                    "images_meta": section_meta,
+                }
+            )
+
         out.append({
             "username": uname,
-            "profile_url": g["profile_url"],
+            "profile_url": g.get("profile_url", ""),
+            "profile_bio": g.get("profile_bio", ""),
+            "collection_url": g.get("collection_url", "") or section_urls_map.get("collection", ""),
+            "journal_url": g.get("journal_url", "") or section_urls_map.get("journal", ""),
+            "sections": sections_payload,
             "lat": lat, "lon": lon,
             "images": images_ordered,
             "images_meta": meta_entries,
@@ -2269,6 +2399,15 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     .profile-actions .follow.disabled {{ pointer-events:none; opacity:0.5; }}
     .profile-actions .open {{ font-size:13px; color:#2563eb; text-decoration:none; font-weight:600; }}
     .profile-actions .open:hover {{ text-decoration:underline; }}
+    .profile-actions .open.disabled {{ pointer-events:none; opacity:0.5; }}
+    .profile-bio {{ font-size:14px; color:#1f2937; margin-bottom:14px; white-space:pre-line; }}
+    .profile-bio.hidden {{ display:none; }}
+    .profile-tabs {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:18px; }}
+    .profile-tabs.hidden {{ display:none; }}
+    .profile-tab {{ padding:6px 16px; border-radius:999px; background:#e5e7eb; border:none; cursor:pointer; font-size:13px; font-weight:600; color:#374151; transition:background .15s ease,color .15s ease; }}
+    .profile-tab:hover {{ background:#d1d5db; }}
+    .profile-tab.active {{ background:#111827; color:#fff; }}
+    .profile-tab.has-link::after {{ content:'↗'; margin-left:6px; font-size:12px; }}
     .profile-meta {{ display:flex; gap:16px; flex-wrap:wrap; font-size:13px; color:#4b5563; margin-bottom:10px; }}
     .profile-meta span {{ display:inline-flex; align-items:center; gap:6px; }}
     .profile-tags {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }}
@@ -2374,6 +2513,8 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
             <a class=\"follow\" id=\"profileFollow\" href=\"#\" target=\"_blank\" rel=\"noopener\">FOLLOW</a>
             <a class=\"open\" id=\"profileOpen\" href=\"#\" target=\"_blank\" rel=\"noopener\">Открыть оригинал</a>
           </div>
+          <div class=\"profile-bio hidden\" id=\"profileBio\"></div>
+          <div class=\"profile-tabs hidden\" id=\"profileTabs\"></div>
           <div class=\"profile-meta\" id=\"profileMeta\"></div>
       <div class=\"profile-tags\" id=\"profileDatasets\"></div>
       <div class=\"profile-phones\" id=\"profilePhones\"></div>
@@ -2401,6 +2542,8 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     const profileFollow = document.getElementById('profileFollow');
     const profileOpen = document.getElementById('profileOpen');
     const profileMeta = document.getElementById('profileMeta');
+    const profileBio = document.getElementById('profileBio');
+    const profileTabs = document.getElementById('profileTabs');
     const profileDatasets = document.getElementById('profileDatasets');
     const profilePhones = document.getElementById('profilePhones');
     const profileCities = document.getElementById('profileCities');
@@ -2615,6 +2758,8 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       if (username) searchParts.push(username.toLowerCase());
       if (u._commentText) searchParts.push(u._commentText);
       if (addedLabel) searchParts.push(addedLabel.toLowerCase());
+      const bioText = (u.profile_bio || '').toString().trim().toLowerCase();
+      if (bioText) searchParts.push(bioText);
       datasetList.forEach(ds => {{
         if (ds.labelLower) searchParts.push(ds.labelLower);
         if (ds.valueLower) searchParts.push(ds.valueLower);
@@ -2748,6 +2893,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       return '';
     }}
 
+
     function renderProfile(user, updateHash=true) {{
       if (!user) {{
         return;
@@ -2756,26 +2902,86 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       const safeUsername = username ? '@' + username : 'Без username';
       profileUsername.textContent = safeUsername;
 
-      const profileUrl = user.profile_url || '';
-      if (profileUrl) {{
-        profileFollow.href = profileUrl;
-        profileOpen.href = profileUrl;
+      const mainProfileUrl = (user.profile_url || '').toString();
+      if (mainProfileUrl) {{
+        profileFollow.href = mainProfileUrl;
         profileFollow.classList.remove('disabled');
       }} else {{
         profileFollow.href = '#';
-        profileOpen.href = '#';
         profileFollow.classList.add('disabled');
       }}
+      profileOpen.href = mainProfileUrl || '#';
 
-      const images = Array.isArray(user.images) ? user.images.filter(Boolean) : [];
-      if (images.length) {{
+      const rawImages = Array.isArray(user.images) ? user.images.filter(Boolean) : [];
+      const rawSections = Array.isArray(user.sections) ? user.sections : [];
+      const preparedSections = [];
+      const keyIndex = new Map();
+      rawSections.forEach(section => {{
+        if (!section) return;
+        const key = (section.key || '').toString().toLowerCase() || 'gallery';
+        const label = (section.label || section.title || key).toString();
+        const secImages = Array.isArray(section.images) ? section.images.filter(Boolean) : [];
+        const secMeta = Array.isArray(section.images_meta) ? section.images_meta : [];
+        const secUrl = (section.url || '').toString();
+        if (keyIndex.has(key)) {{
+          const target = keyIndex.get(key);
+          const extras = secImages.filter(src => target.images.indexOf(src) === -1);
+          if (extras.length) target.images = target.images.concat(extras);
+          if (secMeta.length) target.meta = (target.meta || []).concat(secMeta);
+          if (!target.url && secUrl) target.url = secUrl;
+        }} else {{
+          const entry = {{ key, label, url: secUrl, images: secImages, meta: secMeta }};
+          preparedSections.push(entry);
+          keyIndex.set(key, entry);
+        }}
+      }});
+      if (!keyIndex.has('gallery')) {{
+        preparedSections.unshift({{
+          key: 'gallery',
+          label: 'Gallery',
+          url: mainProfileUrl,
+          images: rawImages.slice(),
+          meta: Array.isArray(user.images_meta) ? user.images_meta : [],
+        }});
+      }}
+      if (preparedSections.length === 0) {{
+        preparedSections.push({{
+          key: 'gallery',
+          label: 'Gallery',
+          url: mainProfileUrl,
+          images: rawImages.slice(),
+          meta: Array.isArray(user.images_meta) ? user.images_meta : [],
+        }});
+      }}
+
+      const firstImage = preparedSections.reduce((acc, section) => {{
+        if (acc) return acc;
+        const list = Array.isArray(section.images) ? section.images : [];
+        return list.length ? list[0] : acc;
+      }}, null);
+      if (firstImage) {{
         profileAvatar.classList.add('has-image');
-        profileAvatar.style.backgroundImage = 'url(' + JSON.stringify(images[0]) + ')';
+        profileAvatar.style.backgroundImage = 'url(' + JSON.stringify(firstImage) + ')';
+        profileAvatar.textContent = '';
+      }} else if (rawImages.length) {{
+        profileAvatar.classList.add('has-image');
+        profileAvatar.style.backgroundImage = 'url(' + JSON.stringify(rawImages[0]) + ')';
         profileAvatar.textContent = '';
       }} else {{
         profileAvatar.classList.remove('has-image');
         profileAvatar.style.backgroundImage = '';
         profileAvatar.textContent = username ? username[0].toUpperCase() : '@';
+      }}
+
+      const bioText = (user.profile_bio || '').toString().trim();
+      if (profileBio) {{
+        if (bioText) {{
+          profileBio.innerHTML = bioText.split(/\r?\n/).map(line => escapeHtml(line)).join('<br>');
+          profileBio.classList.remove('hidden');
+        }} else {{
+          profileBio.innerHTML = '';
+          profileBio.classList.add('hidden');
+        }}
       }}
 
       const metaParts = [];
@@ -2796,7 +3002,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       profileMeta.innerHTML = metaParts.join('');
       profileMeta.classList.toggle('hidden', metaParts.length === 0);
 
-      const datasetParts = (user.datasets || []).map(ds => '<span class=\"tag\">' + escapeHtml(ds.label || ds.value || '') + '</span>');
+      const datasetParts = (user.datasets || []).map(ds => '<span class="tag">' + escapeHtml(ds.label || ds.value || '') + '</span>');
       profileDatasets.innerHTML = datasetParts.join('');
       profileDatasets.classList.toggle('hidden', datasetParts.length === 0);
 
@@ -2834,14 +3040,14 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       }}
       const phoneParts = (Array.isArray(phoneList) ? phoneList : []).map(phone => {{
         const label = (phone && (phone.display || phone.label)) ? (phone.display || phone.label) : '';
-        return label ? '<span class=\"tag\">' + escapeHtml(label) + '</span>' : '';
+        return label ? '<span class="tag">' + escapeHtml(label) + '</span>' : '';
       }}).filter(Boolean);
       if (profilePhones) {{
         profilePhones.innerHTML = phoneParts.join('');
         profilePhones.classList.toggle('hidden', phoneParts.length === 0);
       }}
 
-      const cityParts = (user.cities || []).map(city => '<span class=\"chip\">' + escapeHtml(city) + '</span>');
+      const cityParts = (user.cities || []).map(city => '<span class="chip">' + escapeHtml(city) + '</span>');
       profileCities.innerHTML = cityParts.join('');
       profileCities.classList.toggle('hidden', cityParts.length === 0);
 
@@ -2855,39 +3061,110 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       profileInfoExtra.innerHTML = infoExtra.join('');
       profileInfoExtra.classList.toggle('hidden', infoExtra.length === 0);
 
-      profileStats.innerHTML = [
-        '<div class=\"stat\"><span class=\"value\">' + images.length + '</span><span class=\"label\">posts</span></div>',
-        '<div class=\"stat\"><span class=\"value\">' + (user.comments_count || 0) + '</span><span class=\"label\">comments</span></div>'
-      ].join('');
+      const commentCount = typeof user.comments_count === 'number' ? user.comments_count : (Array.isArray(user.comments) ? user.comments.length : 0);
+      const totalImagesCount = preparedSections.reduce((sum, section) => sum + (Array.isArray(section.images) ? section.images.length : 0), 0) || rawImages.length;
 
-      const metaList = Array.isArray(user.images_meta) ? user.images_meta : [];
-      const metaByUrl = new Map();
-      metaList.forEach(entry => {{
-        const data = normalizeExifEntry(entry);
-        const rawUrl = (data.url || entry.url || '').toString();
-        if (!rawUrl) return;
-        metaByUrl.set(rawUrl, data);
-        const bare = rawUrl.split('?')[0];
-        if (bare && bare !== rawUrl) metaByUrl.set(bare, data);
-      }});
+      let activeSection = preparedSections.find(section => section.key === 'gallery') || preparedSections[0];
 
-      if (images.length) {{
-        const cells = images.map(src => {{
-          const rawSrc = (src || '').toString();
-          if (!rawSrc) return '';
-          const safeSrc = escapeHtml(rawSrc);
-          const bareSrc = rawSrc.split('?')[0];
-          const meta = metaByUrl.get(rawSrc) || metaByUrl.get(bareSrc);
-          const city = meta ? getEntryCityLabel(meta) : '';
-          const cityHtml = city ? '<div class=\"cell-city\">📍 ' + escapeHtml(city) + '</div>' : '';
-          return '<div class=\"cell\"><div class=\"cell-thumb\"><img src=\"' + safeSrc + '\" loading=\"lazy\" alt=\"\"></div>' + cityHtml + '</div>';
-        }}).join('');
-        profileGrid.innerHTML = cells;
-        profileEmpty.classList.add('hidden');
-      }} else {{
-        profileGrid.innerHTML = '';
-        profileEmpty.classList.remove('hidden');
+      function updateStats(section) {{
+        const currentCount = Array.isArray(section.images) ? section.images.length : 0;
+        const label = section.label || section.key || 'posts';
+        profileStats.innerHTML = [
+          '<div class="stat"><span class="value">' + totalImagesCount + '</span><span class="label">posts total</span></div>',
+          '<div class="stat"><span class="value">' + currentCount + '</span><span class="label">' + escapeHtml(label) + '</span></div>',
+          '<div class="stat"><span class="value">' + commentCount + '</span><span class="label">comments</span></div>'
+        ].join('');
       }}
+
+      function renderSection(section) {{
+        const sectionImages = Array.isArray(section.images) ? section.images.filter(Boolean) : [];
+        const metaList = Array.isArray(section.meta) ? section.meta : [];
+        const metaByUrl = new Map();
+        metaList.forEach(entry => {{
+          const data = normalizeExifEntry(entry);
+          const rawUrl = (data.url || entry.url || '').toString();
+          if (!rawUrl) return;
+          metaByUrl.set(rawUrl, data);
+          const bare = rawUrl.split('?')[0];
+          if (bare && bare !== rawUrl) metaByUrl.set(bare, data);
+        }});
+        const sectionLink = (section.url || '').toString() || mainProfileUrl || '#';
+        profileOpen.href = sectionLink || '#';
+        if (sectionLink && sectionLink !== '#') {{
+          profileOpen.classList.remove('disabled');
+        }} else {{
+          profileOpen.classList.add('disabled');
+        }}
+        if (sectionImages.length) {{
+          const cells = sectionImages.map(src => {{
+            const rawSrc = (src || '').toString();
+            if (!rawSrc) return '';
+            const safeSrc = escapeHtml(rawSrc);
+            const bareSrc = rawSrc.split('?')[0];
+            const meta = metaByUrl.get(rawSrc) || metaByUrl.get(bareSrc);
+            const city = meta ? getEntryCityLabel(meta) : '';
+            const cityHtml = city ? '<div class="cell-city">📍 ' + escapeHtml(city) + '</div>' : '';
+            return '<div class="cell"><div class="cell-thumb"><img src="' + safeSrc + '" loading="lazy" alt=""></div>' + cityHtml + '</div>';
+          }}).join('');
+          profileGrid.innerHTML = cells;
+          profileEmpty.classList.add('hidden');
+        }} else {{
+          profileGrid.innerHTML = '';
+          const label = section.label || section.key || '';
+          profileEmpty.textContent = label ? 'Нет элементов в разделе ' + label + '.' : 'Нет сохранённых фотографий для этого профиля.';
+          profileEmpty.classList.remove('hidden');
+        }}
+      }}
+
+      function syncTabs(section) {{
+        if (!profileTabs) return;
+        const activeKey = (section.key || '').toString();
+        const buttons = Array.from(profileTabs.querySelectorAll('button.profile-tab'));
+        buttons.forEach(btn => {{
+          if (!btn) return;
+          const key = btn.getAttribute('data-section');
+          if (key === activeKey) {{
+            btn.classList.add('active');
+          }} else {{
+            btn.classList.remove('active');
+          }}
+        }});
+      }}
+
+      function selectSection(section) {{
+        activeSection = section;
+        renderSection(section);
+        updateStats(section);
+        syncTabs(section);
+      }}
+
+      if (profileTabs) {{
+        const shouldShowTabs = preparedSections.length > 1 || preparedSections.some(section => section.key !== 'gallery');
+        if (!shouldShowTabs) {{
+          profileTabs.innerHTML = '';
+          profileTabs.classList.add('hidden');
+        }} else {{
+          const frag = document.createDocumentFragment();
+          preparedSections.forEach(section => {{
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            const label = (section.label || section.key || 'Section').toString();
+            const hasLink = !!(section.url || '');
+            btn.className = 'profile-tab' + (hasLink ? ' has-link' : '');
+            btn.textContent = label;
+            btn.setAttribute('data-section', section.key || label.toLowerCase());
+            btn.addEventListener('click', () => {{
+              selectSection(section);
+            }});
+            frag.appendChild(btn);
+          }});
+          profileTabs.innerHTML = '';
+          profileTabs.appendChild(frag);
+          profileTabs.classList.remove('hidden');
+        }}
+      }}
+
+      selectSection(activeSection || preparedSections[0]);
 
       galleryView.classList.add('hidden');
       profileView.classList.remove('hidden');
@@ -4308,6 +4585,11 @@ async def on_document(msg: Message):
         return
 
     if low.endswith(".html") or low.endswith(".htm"):
+        if parse_html_file is None or dedupe_rows is None:
+            await msg.answer(
+                "HTML обработка недоступна: требуется пакет pandas."
+            )
+            return
         ses.uploaded_html.append(p)
         try:
             rows = dedupe_rows(parse_html_file(p), mode="safe")
