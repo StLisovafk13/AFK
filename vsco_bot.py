@@ -23,11 +23,13 @@
 # - Парсинг комментария: сразу после ссылки через запятую до следующей ссылки.
 
 import csv
+import math
 import os
 import re
 import sqlite3
 import asyncio
 import logging
+from collections import Counter
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -184,6 +186,177 @@ def resolve_city_label(lat: Optional[float], lon: Optional[float]) -> Optional[s
         label = f"{lat_f:.3f}, {lon_f:.3f}"
     _CITY_CACHE[key] = label
     return label or None
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_coord_pair(lat_raw: Any, lon_raw: Any) -> Optional[Tuple[float, float]]:
+    lat = _safe_float(lat_raw)
+    lon = _safe_float(lon_raw)
+    if lat is None or lon is None:
+        return None
+    return lat, lon
+
+
+def _apply_gps_ref(value: float, ref: Any, positive_refs: Tuple[str, ...]) -> float:
+    ref_str = str(ref or "").strip().upper()
+    if not ref_str:
+        return value
+    positive = {item.upper() for item in positive_refs}
+    if ref_str in positive:
+        return abs(value)
+    return -abs(value)
+
+
+def _extract_coords_from_dict(data: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    # Direct numeric fields (lat/lon)
+    direct_pairs = [
+        ("lat", "lon"),
+        ("latitude", "longitude"),
+        ("Latitude", "Longitude"),
+    ]
+    for lat_key, lon_key in direct_pairs:
+        lat = _safe_float(data.get(lat_key))
+        lon = _safe_float(data.get(lon_key))
+        if lat is not None and lon is not None:
+            return lat, lon
+
+    # EXIF-specific fields with optional reference
+    lat = _safe_float(data.get("GPSLatitude"))
+    lon = _safe_float(data.get("GPSLongitude"))
+    if lat is not None and lon is not None:
+        lat = _apply_gps_ref(lat, data.get("GPSLatitudeRef") or data.get("LatitudeRef"), ("N",))
+        lon = _apply_gps_ref(lon, data.get("GPSLongitudeRef") or data.get("LongitudeRef"), ("E",))
+        return lat, lon
+
+    lat = _safe_float(data.get("GeoLatitude"))
+    lon = _safe_float(data.get("GeoLongitude"))
+    if lat is not None and lon is not None:
+        return lat, lon
+
+    gps_position = data.get("GPSPosition")
+    if isinstance(gps_position, str):
+        parts = re.split(r"[ ,;]+", gps_position.strip())
+        if len(parts) >= 2:
+            lat = _safe_float(parts[0])
+            lon = _safe_float(parts[1])
+            if lat is not None and lon is not None:
+                return lat, lon
+
+    return None
+
+
+def extract_coordinates_from_meta(meta: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    to_visit: List[Any] = [meta]
+    seen: set[int] = set()
+    while to_visit:
+        current = to_visit.pop()
+        if isinstance(current, dict):
+            obj_id = id(current)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            coords = _extract_coords_from_dict(current)
+            if coords:
+                return coords
+            for value in current.values():
+                if isinstance(value, dict):
+                    to_visit.append(value)
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        if isinstance(item, dict):
+                            to_visit.append(item)
+        elif isinstance(current, (list, tuple)):
+            for item in current:
+                if isinstance(item, dict):
+                    to_visit.append(item)
+    return None
+
+
+_MODEL_KEYS = {"Model", "DeviceModel", "CameraModelName"}
+
+
+def _normalize_model_label(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    return " ".join(value.split())
+
+
+def extract_camera_models_from_meta(meta: Dict[str, Any]) -> List[str]:
+    models: List[str] = []
+    to_visit: List[Any] = [meta]
+    seen: set[int] = set()
+    while to_visit:
+        current = to_visit.pop()
+        if isinstance(current, dict):
+            obj_id = id(current)
+            if obj_id in seen:
+                continue
+            seen.add(obj_id)
+            for key, value in current.items():
+                if key in _MODEL_KEYS and isinstance(value, str):
+                    normalized = _normalize_model_label(value)
+                    if normalized:
+                        models.append(normalized)
+                if isinstance(value, dict):
+                    to_visit.append(value)
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        if isinstance(item, dict):
+                            to_visit.append(item)
+        elif isinstance(current, (list, tuple)):
+            for item in current:
+                if isinstance(item, dict):
+                    to_visit.append(item)
+    return models
+
+
+def _update_geo_bucket(
+    buckets: Dict[Tuple[int, int], Dict[str, float]],
+    lat: float,
+    lon: float,
+    *,
+    precision: int = 5,
+) -> None:
+    scale = 10 ** precision
+    key = (int(round(lat * scale)), int(round(lon * scale)))
+    bucket = buckets.setdefault(key, {"count": 0, "lat_sum": 0.0, "lon_sum": 0.0})
+    bucket["count"] = int(bucket.get("count", 0)) + 1
+    bucket["lat_sum"] = float(bucket.get("lat_sum", 0.0)) + lat
+    bucket["lon_sum"] = float(bucket.get("lon_sum", 0.0)) + lon
+
+
+def _select_primary_location(
+    buckets: Dict[Tuple[int, int], Dict[str, float]]
+) -> Tuple[Optional[float], Optional[float], int]:
+    best_lat: Optional[float] = None
+    best_lon: Optional[float] = None
+    best_count = 0
+    for data in buckets.values():
+        count = int(data.get("count", 0) or 0)
+        if count <= 0:
+            continue
+        lat_sum = float(data.get("lat_sum", 0.0))
+        lon_sum = float(data.get("lon_sum", 0.0))
+        lat_avg = lat_sum / count
+        lon_avg = lon_sum / count
+        if (
+            best_lat is None
+            or count > best_count
+            or (count == best_count and (lat_avg, lon_avg) < (best_lat, best_lon))
+        ):
+            best_lat = lat_avg
+            best_lon = lon_avg
+            best_count = count
+    return best_lat, best_lon, best_count
 
 
 def dataset_token_pairs(source: Optional[str], source_file: Optional[str]) -> List[Tuple[str, str]]:
@@ -1750,35 +1923,76 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     ids_by_user: Dict[str,List[int]] = {}
     for iid, uname, purl, lat, lon, img, added_by, source, source_file, meta_json, created_at in rows:
         uname = uname or ""
-        g = groups.setdefault(uname, {
-            "username": uname, "profile_url": purl or (f"https://vsco.co/{uname}" if uname else ""),
-            "lat_sum":0.0, "lon_sum":0.0, "lat_n":0, "lon_n":0,
-            "images": [], "image_set": set(), "image_meta": {}, "added_by": "",
-            "sources": {}, "cities": set(), "first_at": None, "last_at": None,
-        })
+        g = groups.setdefault(
+            uname,
+            {
+                "username": uname,
+                "profile_url": purl or (f"https://vsco.co/{uname}" if uname else ""),
+                "images": [],
+                "image_set": set(),
+                "image_meta": {},
+                "image_coords": {},
+                "added_by": "",
+                "sources": {},
+                "cities": set(),
+                "first_at": None,
+                "last_at": None,
+                "camera_models": Counter(),
+                "camera_model_labels": {},
+                "geo_buckets": {},
+            },
+        )
         if purl and not g["profile_url"]:
             g["profile_url"] = purl
         if img and img not in g["image_set"]:
             g["images"].append(img)
             g["image_set"].add(img)
-        if img and meta_json:
+        meta_payload: Optional[Dict[str, Any]] = None
+        meta_for_extract: Optional[Dict[str, Any]] = None
+        if meta_json:
             try:
-                parsed_meta = json.loads(meta_json)
+                decoded_meta = json.loads(meta_json)
             except Exception:
-                parsed_meta = {"raw": meta_json}
-            if isinstance(parsed_meta, dict):
-                g["image_meta"][img] = parsed_meta
+                meta_payload = {"raw": meta_json}
             else:
-                g["image_meta"][img] = {"raw": parsed_meta}
-        if lat is not None and lon is not None:
-            try:
-                lat_f = float(lat); lon_f = float(lon)
-                g["lat_sum"] += lat_f; g["lon_sum"] += lon_f
-                g["lat_n"] += 1; g["lon_n"] += 1
-                city_label = resolve_city_label(lat_f, lon_f)
-                if city_label:
-                    g["cities"].add(city_label)
-            except Exception: pass
+                if isinstance(decoded_meta, dict):
+                    meta_payload = decoded_meta
+                    meta_for_extract = decoded_meta
+                else:
+                    meta_payload = {"raw": decoded_meta}
+        if img and meta_payload:
+            g["image_meta"][img] = meta_payload
+        elif img and meta_json and img not in g["image_meta"]:
+            g["image_meta"][img] = {"raw": meta_json}
+
+        if meta_for_extract:
+            camera_counter: Counter[str] = g["camera_models"]  # type: ignore[assignment]
+            labels_map: Dict[str, str] = g["camera_model_labels"]  # type: ignore[assignment]
+            seen_models: set[str] = set()
+            for model in extract_camera_models_from_meta(meta_for_extract):
+                key = model.lower()
+                if not key:
+                    continue
+                if key not in labels_map:
+                    labels_map[key] = model
+                display_label = labels_map[key]
+                if key in seen_models:
+                    continue
+                seen_models.add(key)
+                camera_counter[display_label] += 1
+
+        coords_from_meta = extract_coordinates_from_meta(meta_for_extract) if meta_for_extract else None
+        db_coords = _safe_coord_pair(lat, lon)
+        resolved_coords = coords_from_meta or db_coords
+        if resolved_coords:
+            lat_val, lon_val = resolved_coords
+            geo_buckets: Dict[Tuple[int, int], Dict[str, float]] = g["geo_buckets"]  # type: ignore[assignment]
+            _update_geo_bucket(geo_buckets, lat_val, lon_val)
+            city_label = resolve_city_label(lat_val, lon_val)
+            if city_label:
+                g["cities"].add(city_label)
+            if img:
+                g["image_coords"][img] = (lat_val, lon_val)
         if added_by and not g.get("added_by"):
             g["added_by"] = added_by
         for token_value, token_label in dataset_token_pairs(source, source_file):
@@ -1810,8 +2024,11 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
 
     out = []
     for uname, g in groups.items():
-        lat = (g["lat_sum"]/g["lat_n"]) if g["lat_n"] else None
-        lon = (g["lon_sum"]/g["lon_n"]) if g["lon_n"] else None
+        geo_buckets_raw = g.get("geo_buckets", {})  # type: ignore
+        geo_buckets: Dict[Tuple[int, int], Dict[str, float]] = (
+            geo_buckets_raw if isinstance(geo_buckets_raw, dict) else {}
+        )
+        lat, lon, location_count = _select_primary_location(geo_buckets)
         u_comments: List[str] = []
         for iid in ids_by_user[uname]:
             u_comments.extend(comments_map.get(iid, []))
@@ -1831,6 +2048,7 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
         city_list = sorted(str(city) for city in g.get("cities", []))  # type: ignore
         added_key = (display or "").strip().lower()
         image_meta_map: Dict[str, Any] = g.get("image_meta", {})  # type: ignore
+        image_coords_map: Dict[str, Tuple[float, float]] = g.get("image_coords", {})  # type: ignore
         images_ordered: List[str] = g.get("images", [])  # type: ignore
         meta_entries: List[Dict[str, Any]] = []
         for img_url in images_ordered:
@@ -1852,7 +2070,31 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
                     entry["extra"] = extra_keys
             elif payload not in (None, ""):
                 entry["extra"] = {"raw": payload}
+            coords = image_coords_map.get(img_url)
+            if coords:
+                lat_val, lon_val = coords
+                entry["lat"] = lat_val
+                entry["lon"] = lon_val
+                city_label = resolve_city_label(lat_val, lon_val)
+                if city_label:
+                    entry["city"] = city_label
             meta_entries.append(entry)
+
+        camera_counter_raw = g.get("camera_models", Counter())  # type: ignore
+        camera_counter: Counter[str] = (
+            camera_counter_raw if isinstance(camera_counter_raw, Counter) else Counter(camera_counter_raw)
+        )
+        phone_models = [
+            {
+                "model": label,
+                "count": int(count),
+            }
+            for label, count in sorted(
+                camera_counter.items(),
+                key=lambda item: (-int(item[1] or 0), item[0].lower()),
+            )
+            if label and int(count or 0) > 0
+        ]
 
         out.append({
             "username": uname,
@@ -1869,6 +2111,8 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "added_by_key": added_key,
             "datasets": datasets,
             "cities": city_list,
+            "phone_models": phone_models,
+            "location_photo_count": location_count,
             "first_created": g.get("first_at"),
             "last_created": g.get("last_at"),
         })
@@ -1879,13 +2123,13 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     conn = db_connect(); conn.execute("PRAGMA read_uncommitted=1;")
     if scope == "chat":
         rows = conn.execute(
-            "SELECT id,username,profile_url,image_url,latitude,longitude,added_by,source,source_file,created_at"
+            "SELECT id,username,profile_url,image_url,latitude,longitude,added_by,source,source_file,meta_json,created_at"
             " FROM items WHERE chat_id=?",
             (chat_id,),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id,username,profile_url,image_url,latitude,longitude,added_by,source,source_file,created_at FROM items"
+            "SELECT id,username,profile_url,image_url,latitude,longitude,added_by,source,source_file,meta_json,created_at FROM items"
         ).fetchall()
     if not rows:
         conn.close(); return []
@@ -1902,13 +2146,30 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             ):
                 comments_map.setdefault(iid, []).append(c)
     out = []
-    for iid, uname, purl, img, lat, lon, added_by, source, source_file, created_at in rows:
-        try: lat = float(lat) if lat not in ("", None, "None") else None
-        except Exception: lat = None
-        try: lon = float(lon) if lon not in ("", None, "None") else None
-        except Exception: lon = None
+    for iid, uname, purl, img, raw_lat, raw_lon, added_by, source, source_file, meta_json, created_at in rows:
+        meta_for_extract: Optional[Dict[str, Any]] = None
+        if meta_json:
+            try:
+                decoded_meta = json.loads(meta_json)
+            except Exception:
+                decoded_meta = None
+            if isinstance(decoded_meta, dict):
+                meta_for_extract = decoded_meta
+
+        coords_from_meta = extract_coordinates_from_meta(meta_for_extract) if meta_for_extract else None
+        db_coords = _safe_coord_pair(raw_lat, raw_lon)
+        resolved_coords = coords_from_meta or db_coords
+        lat_val: Optional[float] = None
+        lon_val: Optional[float] = None
+        if resolved_coords:
+            lat_val, lon_val = resolved_coords
+
         display, link = added_by_display_and_link(added_by or "")
-        city_label = resolve_city_label(lat, lon) if lat is not None and lon is not None else None
+        city_label = (
+            resolve_city_label(lat_val, lon_val)
+            if lat_val is not None and lon_val is not None
+            else None
+        )
         dataset_map = {}
         for token_value, token_label in dataset_token_pairs(source, source_file):
             if token_value:
@@ -1918,7 +2179,7 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "username": uname or "",
             "profile_url": purl or (f"https://vsco.co/{uname}" if uname else ""),
             "image_url": img or "",
-            "lat": lat, "lon": lon,
+            "lat": lat_val, "lon": lon_val,
             "comments": comments_map.get(iid, []),
             "added_by": display,
             "added_by_link": link or "",
@@ -1929,6 +2190,7 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
                 if key and dataset_map.get(key)
             ],
             "cities": [city_label] if city_label else [],
+            "coord_source": "exif" if coords_from_meta else ("db" if db_coords else ""),
             "created_at": created_at,
         })
     conn.close()
@@ -1972,6 +2234,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     .chip {{ display:inline-flex; align-items:center; padding:4px 8px; border-radius:999px; font-size:11px; background:#f3f4f6; color:#374151; }}
     .chip-city {{ background:#dbeafe; color:#1d4ed8; }}
     .chip-data {{ background:#dcfce7; color:#047857; }}
+    .chip-device {{ background:#ede9fe; color:#5b21b6; }}
     .meta.created {{ color:#4b5563; }}
     .stats {{ color:#6b7280; margin: 6px 0 10px 0; }}
     .grid {{ display:grid; grid-template-columns: repeat(auto-fill,minmax(300px,1fr)); gap:14px; }}
@@ -2010,6 +2273,8 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     .profile-meta span {{ display:inline-flex; align-items:center; gap:6px; }}
     .profile-tags {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }}
     .profile-tags .tag {{ background:#f3f4f6; border-radius:999px; padding:4px 10px; font-size:12px; color:#4b5563; }}
+    .profile-phones {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }}
+    .profile-phones .tag {{ background:#ede9fe; color:#4c1d95; border-radius:999px; padding:4px 10px; font-size:12px; display:inline-flex; align-items:center; gap:6px; }}
     .profile-cities {{ display:flex; gap:8px; flex-wrap:wrap; font-size:12px; color:#1f2937; margin-bottom:18px; }}
     .profile-cities .chip {{ background:#e0f2fe; color:#1d4ed8; border-radius:999px; padding:4px 12px; }}
     .profile-stats {{ display:flex; gap:32px; margin-bottom:28px; }}
@@ -2123,8 +2388,9 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
             <a class=\"open\" id=\"profileOpen\" href=\"#\" target=\"_blank\" rel=\"noopener\">Открыть оригинал</a>
           </div>
           <div class=\"profile-meta\" id=\"profileMeta\"></div>
-          <div class=\"profile-tags\" id=\"profileDatasets\"></div>
-          <div class=\"profile-cities\" id=\"profileCities\"></div>
+      <div class=\"profile-tags\" id=\"profileDatasets\"></div>
+      <div class=\"profile-phones\" id=\"profilePhones\"></div>
+      <div class=\"profile-cities\" id=\"profileCities\"></div>
           <div class=\"profile-meta\" id=\"profileInfoExtra\"></div>
         </div>
       </div>
@@ -2150,6 +2416,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     const profileOpen = document.getElementById('profileOpen');
     const profileMeta = document.getElementById('profileMeta');
     const profileDatasets = document.getElementById('profileDatasets');
+    const profilePhones = document.getElementById('profilePhones');
     const profileCities = document.getElementById('profileCities');
     const profileInfoExtra = document.getElementById('profileInfoExtra');
     const profileStats = document.getElementById('profileStats');
@@ -2320,6 +2587,38 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       }});
       u._cityList = preparedCities;
       u._cityText = preparedCities.map(entry => entry.lower).join(' ');
+      const phoneRaw = Array.isArray(u.phone_models) ? u.phone_models : [];
+      const phoneList = [];
+      const phoneSeen = new Set();
+      phoneRaw.forEach(entry => {{
+        if (!entry) return;
+        let model = '';
+        let count = 0;
+        let rawCount = null;
+        if (typeof entry === 'object') {{
+          model = (entry.model || entry.value || '').toString();
+          rawCount = entry.count;
+          if (rawCount === undefined || rawCount === null) rawCount = entry.cnt;
+          if (rawCount === undefined || rawCount === null) rawCount = entry.total;
+        }} else {{
+          model = entry.toString();
+        }}
+        model = model.trim();
+        if (!model) return;
+        const lower = model.toLowerCase();
+        if (phoneSeen.has(lower)) return;
+        phoneSeen.add(lower);
+        if (rawCount !== null && rawCount !== undefined) {{
+          const num = Number(rawCount);
+          if (Number.isFinite(num) && num > 0) {{
+            count = Math.round(num);
+          }}
+        }}
+        const display = count > 1 ? model + ' ×' + count : model;
+        phoneList.push({{ label: model, lower, display, count }});
+      }});
+      u._phoneList = phoneList;
+      u._phoneText = phoneList.map(entry => entry.lower).join(' ');
       const addedLabel = (u.added_by || '').toString();
       const addedKey = (u.added_by_key || addedLabel).toString().trim().toLowerCase();
       u._addedKey = addedKey;
@@ -2336,6 +2635,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         if (ds.valueLower) searchParts.push(ds.valueLower);
       }});
       preparedCities.forEach(entry => searchParts.push(entry.lower));
+      phoneList.forEach(entry => searchParts.push(entry.lower));
       u._searchText = searchParts.join(' ');
       const firstTs = parseDateValue(u.first_created);
       const lastTs = parseDateValue(u.last_created);
@@ -2443,6 +2743,13 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         const sizeLabel = formatBytes(data.size_bytes);
         if (sizeLabel) chips.push('Размер: ' + sizeLabel);
       }}
+      if (typeof data.lat === 'number' && isFinite(data.lat) && typeof data.lon === 'number' && isFinite(data.lon)) {{
+        chips.push('GPS: ' + data.lat.toFixed(5) + ', ' + data.lon.toFixed(5));
+      }}
+      if (data.city) {{
+        const cityLabel = ('' + data.city).trim();
+        if (cityLabel) chips.push('Город: ' + cityLabel);
+      }}
       const exif = data.exiftool && typeof data.exiftool === 'object' ? data.exiftool : null;
       if (exif) {{
         const mapping = [
@@ -2516,7 +2823,11 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
 
       const metaParts = [];
       if (user.lat != null && user.lon != null) {{
-        metaParts.push('<span>📍 ' + user.lat.toFixed(5) + ', ' + user.lon.toFixed(5) + '</span>');
+        let coordLabel = user.lat.toFixed(5) + ', ' + user.lon.toFixed(5);
+        if (typeof user.location_photo_count === 'number' && user.location_photo_count > 0) {{
+          coordLabel += ' • ' + user.location_photo_count + ' фото';
+        }}
+        metaParts.push('<span>📍 ' + coordLabel + '</span>');
       }}
       if (user.added_by) {{
         if (user.added_by_link) {{
@@ -2531,6 +2842,47 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       const datasetParts = (user.datasets || []).map(ds => '<span class=\"tag\">' + escapeHtml(ds.label || ds.value || '') + '</span>');
       profileDatasets.innerHTML = datasetParts.join('');
       profileDatasets.classList.toggle('hidden', datasetParts.length === 0);
+
+      let phoneList = Array.isArray(user._phoneList) ? user._phoneList : [];
+      if ((!phoneList || phoneList.length === 0) && Array.isArray(user.phone_models)) {{
+        const fallback = [];
+        const seen = new Set();
+        user.phone_models.forEach(entry => {{
+          if (!entry) return;
+          let model = '';
+          let count = 0;
+          let rawCount = null;
+          if (typeof entry === 'object') {{
+            model = (entry.model || entry.value || '').toString();
+            rawCount = entry.count;
+            if (rawCount === undefined || rawCount === null) rawCount = entry.cnt;
+            if (rawCount === undefined || rawCount === null) rawCount = entry.total;
+          }} else {{
+            model = entry.toString();
+          }}
+          model = model.trim();
+          if (!model) return;
+          const lower = model.toLowerCase();
+          if (seen.has(lower)) return;
+          seen.add(lower);
+          if (rawCount !== null && rawCount !== undefined) {{
+            const num = Number(rawCount);
+            if (Number.isFinite(num) && num > 0) {{
+              count = Math.round(num);
+            }}
+          }}
+          fallback.push({{ label: model, display: count > 1 ? model + ' ×' + count : model }});
+        }});
+        phoneList = fallback;
+      }}
+      const phoneParts = (Array.isArray(phoneList) ? phoneList : []).map(phone => {{
+        const label = (phone && (phone.display || phone.label)) ? (phone.display || phone.label) : '';
+        return label ? '<span class=\"tag\">' + escapeHtml(label) + '</span>' : '';
+      }}).filter(Boolean);
+      if (profilePhones) {{
+        profilePhones.innerHTML = phoneParts.join('');
+        profilePhones.classList.toggle('hidden', phoneParts.length === 0);
+      }}
 
       const cityParts = (user.cities || []).map(city => '<span class=\"chip\">' + escapeHtml(city) + '</span>');
       profileCities.innerHTML = cityParts.join('');
@@ -2645,6 +2997,11 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         (u._datasetList || []).slice(0,3).forEach(ds=>{{
           const label = ds.label || ds.value;
           if (label) chipParts.push('<span class="chip chip-data">' + escapeHtml(label) + '</span>');
+        }});
+        (u._phoneList || []).slice(0,3).forEach(phone=>{{
+          if (!phone) return;
+          const label = phone.display || phone.label || '';
+          if (label) chipParts.push('<span class="chip chip-device">' + escapeHtml(label) + '</span>');
         }});
         const chipsHtml = chipParts.length ? '<div class="chips">' + chipParts.join('') + '</div>' : '';
         const createdHtml = u._createdRangeLabel ? '<div class="meta created">Добавлено: ' + escapeHtml(u._createdRangeLabel) + '</div>' : '';
@@ -2849,6 +3206,8 @@ def _map_html(
     .panel .row .meta .chip-city::before {{ content:"📍"; }}
     .panel .row .meta .chip-data {{ background:#fef3c7; color:#92400e; }}
     .panel .row .meta .chip-data::before {{ content:"💾"; }}
+    .panel .row .meta .chip-device {{ background:#ede9fe; color:#5b21b6; }}
+    .panel .row .meta .chip-device::before {{ content:"📱"; }}
     .panel .row .ab {{ grid-column:1 / -1; font-size:12px; color:#4b5563; }}
     .panel .row.row-user .u {{ grid-column:1 / -1; }}
     @media (max-width: 900px) {{
@@ -3363,6 +3722,42 @@ def _map_html(
 </body>
 </html>"""
 def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
+    def _prepare_phone_labels(value: Any) -> Tuple[List[str], List[str]]:
+        raw: List[str] = []
+        display: List[str] = []
+        seen: set[str] = set()
+        if not isinstance(value, (list, tuple)):
+            return raw, display
+        for entry in value:
+            model = ""
+            count_val = 0
+            raw_count: Any = None
+            if isinstance(entry, dict):
+                model = str(entry.get("model") or entry.get("value") or "").strip()
+                raw_count = entry.get("count")
+                if raw_count is None:
+                    raw_count = entry.get("cnt")
+                if raw_count is None:
+                    raw_count = entry.get("total")
+            else:
+                model = str(entry or "").strip()
+            if not model:
+                continue
+            key = model.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if raw_count is not None:
+                try:
+                    num = float(raw_count)
+                except (TypeError, ValueError):
+                    num = 0.0
+                if math.isfinite(num) and num > 0:
+                    count_val = int(round(num))
+            raw.append(model)
+            display.append(f"{model} ×{count_val}" if count_val > 1 else model)
+        return raw, display
+
     meta: List[Tuple[Dict[str, Any], Optional[float], Optional[float], str, bool]] = []
     list_rows: List[str] = []
     for idx, u in enumerate(users):
@@ -3412,6 +3807,8 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
             dataset_payload.append({"value": value, "label": label})
 
         raw_cities = [str(city) for city in (u.get("cities") or []) if city]
+        phone_raw_labels, phone_display_labels = _prepare_phone_labels(u.get("phone_models"))
+        u["_phone_display_cache"] = phone_display_labels
 
         search_parts = [str(u.get("username") or "")]
         search_parts.extend(str(x or "") for x in cm)
@@ -3419,6 +3816,7 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
             search_parts.append(added_display)
         search_parts.extend(dataset_labels)
         search_parts.extend(raw_cities)
+        search_parts.extend(phone_raw_labels)
         search_text = " ".join(p.strip() for p in search_parts if p).lower()
 
         comment_filter_text = " ".join(str(x or "") for x in cm).lower()
@@ -3431,6 +3829,7 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
             f"data-added=\"{escape(added_filter_text, quote=True)}\"",
             f"data-cities=\"{escape(json.dumps(raw_cities, ensure_ascii=False), quote=True)}\"",
             f"data-datasets=\"{escape(json.dumps(dataset_payload, ensure_ascii=False), quote=True)}\"",
+            f"data-phones=\"{escape(json.dumps(phone_raw_labels, ensure_ascii=False), quote=True)}\"",
             f"data-comments-count=\"{comment_count}\"",
             f"data-added-key=\"{escape(added_key, quote=True)}\"",
             f"data-added-label=\"{escape(added_display or '', quote=True)}\"",
@@ -3448,6 +3847,8 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
             meta_chips.append(f"<span class='chip chip-city'>{escape(city)}</span>")
         for label in dataset_labels[:3]:
             meta_chips.append(f"<span class='chip chip-data'>{escape(label)}</span>")
+        for label in phone_display_labels[:3]:
+            meta_chips.append(f"<span class='chip chip-device'>{escape(label)}</span>")
         meta_block = f"<div class='meta'>{''.join(meta_chips)}</div>" if meta_chips else ""
 
         attr_html = " " + " ".join(attrs)
@@ -3506,6 +3907,11 @@ def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
                 parts.append("<br/>📍 " + ", ".join(city_values[:3]))
             if dataset_labels_marker:
                 parts.append("<br/>💾 " + ", ".join(dataset_labels_marker[:3]))
+            phone_display_marker = u.get("_phone_display_cache")
+            if not phone_display_marker:
+                _, phone_display_marker = _prepare_phone_labels(u.get("phone_models"))
+            if phone_display_marker:
+                parts.append("<br/>📱 " + ", ".join(escape(label) for label in phone_display_marker[:3]))
             if added_html:
                 parts.append(f"<br/>Добавил: {added_html}")
             parts.append("</div>")
