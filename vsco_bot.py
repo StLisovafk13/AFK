@@ -2976,7 +2976,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       const bioText = (user.profile_bio || '').toString().trim();
       if (profileBio) {{
         if (bioText) {{
-          profileBio.innerHTML = bioText.split(/\r?\n/).map(line => escapeHtml(line)).join('<br>');
+          profileBio.innerHTML = bioText.split(/\\r?\\n/).map(line => escapeHtml(line)).join('<br>');
           profileBio.classList.remove('hidden');
         }} else {{
           profileBio.innerHTML = '';
