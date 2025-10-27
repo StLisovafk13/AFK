@@ -4929,9 +4929,11 @@ async def _profile_scan_worker() -> None:
             if isinstance(collected, ProfileMediaCollection):
                 media_urls = collected.media_urls
                 profile_tabs = collected.profile_tabs
+                media_by_tab = collected.media_by_tab
             else:
                 media_urls = collected
                 profile_tabs = []
+                media_by_tab = None
             result: ScanResult = store_profile_media(
                 Path(DB_PATH),
                 job.chat_id,
@@ -4941,6 +4943,7 @@ async def _profile_scan_worker() -> None:
                 source=job.source,
                 added_by=job.added_by,
                 profile_tabs=profile_tabs,
+                media_by_tab=media_by_tab,
             )
             if result.added_items > 0 or not result.media_urls:
                 total = len(result.media_urls)

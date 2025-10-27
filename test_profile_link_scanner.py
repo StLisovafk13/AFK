@@ -25,12 +25,6 @@ def test_resolve_profile_inputs(username, profile_url, expected):
 def test_store_profile_media_deduplicates(tmp_path: Path):
     db_path = tmp_path / "vsco.db"
     profile_url = "https://vsco.co/example/gallery"
-    urls = [
-        "https://images.example.com/media1.jpg",
-        "https://images.example.com/media1.jpg",
-        "https://images.example.com/media2.jpg",
-    ]
-
     stub_meta = lambda url: {"size_bytes": 123, "exiftool": {"Model": "TestCam"}}
 
     tabs = [
@@ -38,37 +32,82 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
         {"href": "https://vsco.co/example/gallery", "label": "RECENT"},
     ]
 
+    media_urls = [
+        "https://images.example.com/media1.jpg",
+        "https://images.example.com/media2.jpg",
+        "https://images.example.com/media3.jpg",
+    ]
+    media_by_tab = {
+        "https://vsco.co/example/gallery": [
+            "https://images.example.com/media1.jpg",
+            "https://images.example.com/media1.jpg",
+            "https://images.example.com/media2.jpg",
+        ],
+        "https://vsco.co/example/collection/1": [
+            "https://images.example.com/media3.jpg",
+        ],
+    }
+
     result = store_profile_media(
         db_path,
         123,
         "example",
         profile_url,
-        urls,
+        media_urls,
         profile_tabs=tabs,
+        media_by_tab=media_by_tab,
         meta_fetcher=stub_meta,
     )
-    assert result.added_items == 2
+    assert result.added_items == 3
     assert result.link_added is True
     assert result.profile_tabs and result.profile_tabs[0]["href"].endswith("/collection/1")
+    assert result.media_by_tab["https://vsco.co/example/gallery"] == [
+        "https://images.example.com/media1.jpg",
+        "https://images.example.com/media2.jpg",
+    ]
 
     second = store_profile_media(
         db_path,
         123,
         "example",
         profile_url,
-        [urls[0], "https://images.example.com/media3.jpg"],
+        [
+            "https://images.example.com/media2.jpg",
+            "https://images.example.com/media4.jpg",
+            "https://images.example.com/media5.jpg",
+        ],
+        media_by_tab={
+            "https://vsco.co/example/gallery": [
+                "https://images.example.com/media2.jpg",
+                "https://images.example.com/media4.jpg",
+            ],
+            "https://vsco.co/example/spaces": [
+                "https://images.example.com/media5.jpg",
+            ],
+        },
         meta_fetcher=stub_meta,
     )
-    assert second.added_items == 1
+    assert second.added_items == 2
     assert second.link_added is True
 
     conn = sqlite3.connect(db_path)
     try:
         count_items = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-        assert count_items == 3
+        assert count_items == 5
 
         count_links = conn.execute("SELECT COUNT(*) FROM links").fetchone()[0]
         assert count_links == 1
+
+        stored = conn.execute(
+            "SELECT profile_url, image_url FROM items ORDER BY image_url"
+        ).fetchall()
+        assert stored == [
+            ("https://vsco.co/example/gallery", "https://images.example.com/media1.jpg"),
+            ("https://vsco.co/example/gallery", "https://images.example.com/media2.jpg"),
+            ("https://vsco.co/example/collection/1", "https://images.example.com/media3.jpg"),
+            ("https://vsco.co/example/gallery", "https://images.example.com/media4.jpg"),
+            ("https://vsco.co/example/spaces", "https://images.example.com/media5.jpg"),
+        ]
 
         meta_row = conn.execute(
             "SELECT meta_json FROM items WHERE image_url=?",
