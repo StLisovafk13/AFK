@@ -27,6 +27,7 @@ from exif_fetcher import extract_exif_from_url
 
 from vsco_utils import (
     dedupe_keep_order,
+    extract_gallery_collections,
     extract_media_urls_from_html,
     extract_profile_tab_links,
     is_media_url,
@@ -56,7 +57,7 @@ class ScanResult:
     media_urls: list[str]
     added_items: int = 0
     link_added: bool = False
-    profile_tabs: list[dict[str, str]] = field(default_factory=list)
+    profile_tabs: list[dict[str, Any]] = field(default_factory=list)
     media_by_tab: dict[str, list[str]] = field(default_factory=dict)
 
 
@@ -65,7 +66,7 @@ class ProfileMediaCollection:
     """Container with extracted media URLs and profile metadata."""
 
     media_urls: list[str]
-    profile_tabs: list[dict[str, str]] = field(default_factory=list)
+    profile_tabs: list[dict[str, Any]] = field(default_factory=list)
     media_by_tab: dict[str, list[str]] = field(default_factory=dict)
 
 
@@ -361,6 +362,18 @@ async def collect_profile_media(
     if headers:
         session_headers.update(headers)
 
+    tab_entries_by_url: dict[str, list[dict[str, Any]]] = {}
+
+    def capture_tab_entries(tab_url: str, tab_html: str) -> None:
+        if not tab_html:
+            return
+        normalized = _normalize_tab_url(tab_url)
+        if not normalized or "galleries" not in normalized.lower():
+            return
+        entries = extract_gallery_collections(tab_html, root=tab_url)
+        if entries:
+            tab_entries_by_url[normalized] = entries
+
     urls, html = await _collect_with_playwright(
         profile_url,
         headers=session_headers,
@@ -376,6 +389,7 @@ async def collect_profile_media(
         media_by_tab[normalized_profile_url] = aggregated_urls
 
     tabs = extract_profile_tab_links(html, root=profile_url)
+    capture_tab_entries(profile_url, html)
 
     async with aiohttp.ClientSession(headers=session_headers) as session:
         if not aggregated_urls:
@@ -390,6 +404,7 @@ async def collect_profile_media(
                 media_by_tab[normalized_profile_url] = aggregated_urls
             if not tabs:
                 tabs = extract_profile_tab_links(html, root=profile_url)
+            capture_tab_entries(profile_url, html)
 
         # Collect media from secondary tabs (e.g. /galleries, /spaces, ...)
         tab_urls_to_fetch: list[str] = []
@@ -403,7 +418,7 @@ async def collect_profile_media(
             tab_urls_to_fetch.append(normalized_href)
 
         for tab_url in tab_urls_to_fetch:
-            tab_media, _ = await scan_profile_media(
+            tab_media, tab_html = await scan_profile_media(
                 session,
                 tab_url,
                 max_width=max_width,
@@ -413,6 +428,20 @@ async def collect_profile_media(
             media_by_tab[tab_url] = cleaned
             if cleaned:
                 aggregated_urls = dedupe_keep_order(aggregated_urls + cleaned)
+            capture_tab_entries(tab_url, tab_html)
+
+    if tabs:
+        augmented_tabs: list[dict[str, Any]] = []
+        for tab in tabs:
+            href = tab.get("href") or ""
+            normalized_href = _normalize_tab_url(href)
+            if normalized_href and normalized_href in tab_entries_by_url:
+                updated = dict(tab)
+                updated["entries"] = tab_entries_by_url[normalized_href]
+                augmented_tabs.append(updated)
+            else:
+                augmented_tabs.append(tab)
+        tabs = augmented_tabs
 
     if not aggregated_urls:
         LOGGER.warning("Не удалось получить ссылки медиа для %s", profile_url)
@@ -469,8 +498,8 @@ def _normalize_tab_url(url: str) -> str:
 
 def _sanitize_profile_tabs(
     tabs: Optional[Sequence[Dict[str, Any]]],
-) -> list[dict[str, str]]:
-    sanitized: list[dict[str, str]] = []
+) -> list[dict[str, Any]]:
+    sanitized: list[dict[str, Any]] = []
     if not tabs:
         return sanitized
     for tab in tabs:
@@ -480,7 +509,7 @@ def _sanitize_profile_tabs(
         href = str(href_raw).strip() if href_raw is not None else ""
         if not href:
             continue
-        entry: dict[str, str] = {"href": _normalize_tab_url(href)}
+        entry: dict[str, Any] = {"href": _normalize_tab_url(href)}
         for key in ("id", "label", "slug", "active"):
             value = tab.get(key)
             if value is None:
@@ -488,6 +517,38 @@ def _sanitize_profile_tabs(
             text = str(value).strip()
             if text:
                 entry[key] = text
+        raw_entries = tab.get("entries")
+        cleaned_entries: list[dict[str, Any]] = []
+        if isinstance(raw_entries, (list, tuple)):
+            for raw_entry in raw_entries:
+                if not isinstance(raw_entry, dict):
+                    continue
+                cleaned_entry: dict[str, Any] = {}
+                title_value = raw_entry.get("title")
+                if isinstance(title_value, str) and title_value.strip():
+                    cleaned_entry["title"] = title_value.strip()
+                slug_value = raw_entry.get("slug")
+                if isinstance(slug_value, str) and slug_value.strip():
+                    cleaned_entry["slug"] = slug_value.strip()
+                label_value = raw_entry.get("count_label")
+                if isinstance(label_value, str) and label_value.strip():
+                    cleaned_entry["count_label"] = label_value.strip()
+                href_value = raw_entry.get("href")
+                if isinstance(href_value, str) and href_value.strip():
+                    cleaned_entry["href"] = _normalize_tab_url(href_value)
+                image_value = raw_entry.get("image")
+                if isinstance(image_value, str) and image_value.strip():
+                    cleaned_entry["image"] = normalize_media_url(image_value, root="https://vsco.co/")
+                count_value = raw_entry.get("count")
+                try:
+                    if count_value is not None:
+                        cleaned_entry["count"] = int(count_value)
+                except (ValueError, TypeError):
+                    pass
+                if cleaned_entry:
+                    cleaned_entries.append(cleaned_entry)
+        if cleaned_entries:
+            entry["entries"] = cleaned_entries
         sanitized.append(entry)
     return sanitized
 

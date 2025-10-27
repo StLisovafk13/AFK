@@ -382,6 +382,78 @@ def extract_profile_tab_links(html: str, *, root: Optional[str] = None) -> list[
     return tabs
 
 
+def extract_gallery_collections(html: str, *, root: Optional[str] = None) -> list[dict[str, Any]]:
+    """Extract VSCO gallery cards (title/count/link/cover) from a tab page."""
+
+    if not html or not BeautifulSoup:
+        return []
+
+    soup = BeautifulSoup(html, "html.parser")
+    base_root = root or "https://vsco.co/"
+    entries: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for info_block in soup.find_all("div"):
+        spans = [span for span in info_block.find_all("span", recursive=False) if span.get_text(strip=True)]
+        if len(spans) < 2:
+            continue
+        count_span = None
+        for span in spans[1:]:
+            text = span.get_text(strip=True)
+            if text and "post" in text.lower():
+                count_span = span
+                break
+        if not count_span:
+            continue
+        title_text = spans[0].get_text(strip=True)
+        count_text = count_span.get_text(strip=True)
+        if not title_text:
+            continue
+
+        parent = info_block.parent
+        anchor = None
+        if parent:
+            for candidate in parent.find_all("a", href=True, recursive=False):
+                anchor = candidate
+                break
+        if not anchor and parent:
+            anchor = parent.find("a", href=True)
+        href = ""
+        if anchor:
+            href = normalize_media_url(anchor.get("href") or "", root=base_root) or ""
+        image_url = None
+        img_tag = anchor.find("img") if anchor else None
+        if not img_tag and parent:
+            img_tag = parent.find("img")
+        if img_tag:
+            image_url = normalize_media_url(img_tag.get("src"), root=base_root)
+
+        key = (title_text.lower(), href)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        entry: dict[str, Any] = {
+            "title": title_text,
+            "count_label": count_text,
+        }
+        if href:
+            entry["href"] = href
+            entry["slug"] = href.rstrip("/").split("/")[-1]
+        match = re.search(r"(\d+)", count_text)
+        if match:
+            try:
+                entry["count"] = int(match.group(1))
+            except ValueError:
+                pass
+        if image_url:
+            entry["image"] = image_url
+
+        entries.append(entry)
+
+    return entries
+
+
 async def scan_profile_media(
     session,
     profile_url: str,

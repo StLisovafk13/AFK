@@ -128,3 +128,62 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
         assert stored_tabs and stored_tabs[0]["href"].endswith("/collection/1")
     finally:
         conn.close()
+
+
+def test_store_profile_media_preserves_gallery_entries(tmp_path: Path):
+    db_path = tmp_path / "vsco_entries.db"
+    profile_url = "https://vsco.co/example/gallery"
+    tabs = [
+        {
+            "href": "https://vsco.co/example/galleries",
+            "label": "GALLERIES",
+            "entries": [
+                {
+                    "title": "Urban still life",
+                    "href": "https://vsco.co/example/galleries/abc",
+                    "image": "//images.example.com/cover.jpg",
+                    "count": 17,
+                    "count_label": "17 posts",
+                },
+                {
+                    "title": "Empty gallery",
+                    "count": 0,
+                },
+            ],
+        }
+    ]
+
+    media_urls = ["https://images.example.com/media10.jpg"]
+    media_by_tab = {"https://vsco.co/example/gallery": media_urls}
+
+    result = store_profile_media(
+        db_path,
+        100,
+        "example",
+        profile_url,
+        media_urls,
+        profile_tabs=tabs,
+        media_by_tab=media_by_tab,
+        meta_fetcher=lambda url: {},
+    )
+
+    assert result.profile_tabs
+    tab_entry = result.profile_tabs[0]
+    assert tab_entry["entries"][0]["title"] == "Urban still life"
+    assert tab_entry["entries"][0]["href"].startswith("https://")
+    assert tab_entry["entries"][0]["count"] == 17
+
+    conn = sqlite3.connect(db_path)
+    try:
+        payload_row = conn.execute(
+            "SELECT extra_json FROM links WHERE username=?",
+            ("example",),
+        ).fetchone()
+        assert payload_row and payload_row[0]
+        payload = json.loads(payload_row[0])
+        stored_tabs = payload.get("profile_tabs") or []
+        assert stored_tabs
+        stored_entries = stored_tabs[0].get("entries") or []
+        assert stored_entries and stored_entries[0]["count_label"] == "17 posts"
+    finally:
+        conn.close()

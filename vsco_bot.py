@@ -891,7 +891,7 @@ def added_by_html(value: str) -> str:
     return escape(display)
 
 
-def parse_profile_tabs_payload(raw: str) -> List[Dict[str, str]]:
+def parse_profile_tabs_payload(raw: str) -> List[Dict[str, Any]]:
     if not raw:
         return []
     try:
@@ -907,20 +907,23 @@ def parse_profile_tabs_payload(raw: str) -> List[Dict[str, str]]:
     elif isinstance(payload, list):
         candidates = [entry for entry in payload if isinstance(entry, dict)]
 
-    sanitized: List[Dict[str, str]] = []
+    sanitized: List[Dict[str, Any]] = []
     seen: set[Tuple[str, str]] = set()
     for tab in candidates:
         href_raw = tab.get("href")
         href = str(href_raw).strip() if href_raw is not None else ""
         if not href:
             continue
+        normalized_href = _normalize_tab_url(href)
+        if not normalized_href:
+            continue
         tab_id_raw = tab.get("id")
         tab_id = str(tab_id_raw).strip() if tab_id_raw is not None else ""
-        key = (tab_id.lower(), href)
+        key = (tab_id.lower(), normalized_href)
         if key in seen:
             continue
         seen.add(key)
-        entry: Dict[str, str] = {"href": href}
+        entry: Dict[str, Any] = {"href": normalized_href}
         if tab_id:
             entry["id"] = tab_id
         for field_name in ("label", "slug", "active"):
@@ -930,6 +933,38 @@ def parse_profile_tabs_payload(raw: str) -> List[Dict[str, str]]:
             text = str(value).strip()
             if text:
                 entry[field_name] = text
+        raw_entries = tab.get("entries")
+        cleaned_entries: List[Dict[str, Any]] = []
+        if isinstance(raw_entries, list):
+            for raw_entry in raw_entries:
+                if not isinstance(raw_entry, dict):
+                    continue
+                cleaned_entry: Dict[str, Any] = {}
+                title_value = raw_entry.get("title")
+                if isinstance(title_value, str) and title_value.strip():
+                    cleaned_entry["title"] = title_value.strip()
+                slug_value = raw_entry.get("slug")
+                if isinstance(slug_value, str) and slug_value.strip():
+                    cleaned_entry["slug"] = slug_value.strip()
+                label_value = raw_entry.get("count_label")
+                if isinstance(label_value, str) and label_value.strip():
+                    cleaned_entry["count_label"] = label_value.strip()
+                href_value = raw_entry.get("href")
+                if isinstance(href_value, str) and href_value.strip():
+                    cleaned_entry["href"] = _normalize_tab_url(href_value)
+                image_value = raw_entry.get("image")
+                if isinstance(image_value, str) and image_value.strip():
+                    cleaned_entry["image"] = normalize_media_url(image_value, root=normalized_href)
+                count_value = raw_entry.get("count")
+                try:
+                    if count_value is not None:
+                        cleaned_entry["count"] = int(count_value)
+                except (ValueError, TypeError):
+                    pass
+                if cleaned_entry:
+                    cleaned_entries.append(cleaned_entry)
+        if cleaned_entries:
+            entry["entries"] = cleaned_entries
         sanitized.append(entry)
     return sanitized
 
@@ -2324,6 +2359,47 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             entry["media"] = media_list
             entry["media_count"] = len(media_list)
             entry["has_media"] = len(media_list) > 0
+            raw_entries = entry.get("entries") if isinstance(entry, dict) else None
+            sanitized_entries: List[Dict[str, Any]] = []
+            if isinstance(raw_entries, list):
+                for raw_entry in raw_entries:
+                    if not isinstance(raw_entry, dict):
+                        continue
+                    cleaned_entry: Dict[str, Any] = {}
+                    title_value = raw_entry.get("title")
+                    if isinstance(title_value, str) and title_value.strip():
+                        cleaned_entry["title"] = title_value.strip()
+                    slug_value = raw_entry.get("slug")
+                    if isinstance(slug_value, str) and slug_value.strip():
+                        cleaned_entry["slug"] = slug_value.strip()
+                    label_value = raw_entry.get("count_label")
+                    if isinstance(label_value, str) and label_value.strip():
+                        cleaned_entry["count_label"] = label_value.strip()
+                    href_value = raw_entry.get("href")
+                    normalized_entry_href = ""
+                    if isinstance(href_value, str) and href_value.strip():
+                        normalized_entry_href = _normalize_tab_url(href_value)
+                        if normalized_entry_href:
+                            cleaned_entry["href"] = normalized_entry_href
+                    image_value = raw_entry.get("image")
+                    if isinstance(image_value, str) and image_value.strip():
+                        root_href = normalized_entry_href or normalized
+                        cleaned_entry["image"] = normalize_media_url(image_value, root=root_href)
+                    count_value = raw_entry.get("count")
+                    try:
+                        if count_value is not None:
+                            cleaned_entry["count"] = int(count_value)
+                    except (ValueError, TypeError):
+                        pass
+                    if cleaned_entry:
+                        sanitized_entries.append(cleaned_entry)
+            entry["entries"] = sanitized_entries
+            entry["entries_count"] = len(sanitized_entries)
+            entry["entries_posts_total"] = sum(
+                int(item.get("count") or 0)
+                for item in sanitized_entries
+                if isinstance(item, dict)
+            )
             profile_tabs.append(entry)
             used_tab_urls.add(normalized)
 
@@ -2567,6 +2643,21 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     .profile-grid .cell-thumb {{ position:relative; width:100%; padding-bottom:100%; background:#e5e7eb; }}
     .profile-grid .cell-thumb img {{ position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; }}
     .profile-grid .cell-city {{ font-size:12px; color:#4b5563; padding:6px 8px 10px; background:#fff; text-align:center; line-height:1.4; border-top:1px solid #e5e7eb; }}
+    .profile-grid.hidden {{ display:none !important; }}
+    .profile-galleries {{ display:grid; grid-template-columns: repeat(auto-fill,minmax(280px,1fr)); gap:16px; }}
+    .profile-galleries.hidden {{ display:none !important; }}
+    .gallery-card {{ display:flex; flex-direction:column; border-radius:18px; overflow:hidden; background:#fff; border:1px solid #e5e7eb; box-shadow:0 1px 4px rgba(15,23,42,0.08); }}
+    .gallery-card-thumb {{ position:relative; width:100%; padding-bottom:66%; background:linear-gradient(135deg,#e5e7eb,#d1d5db); display:flex; align-items:center; justify-content:center; color:#6b7280; font-size:22px; font-weight:600; letter-spacing:0.08em; text-transform:uppercase; }}
+    .gallery-card-thumb img {{ position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; }}
+    .gallery-card-thumb span {{ display:inline-flex; align-items:center; justify-content:center; width:100%; height:100%; }}
+    .gallery-card-body {{ padding:14px 16px 16px; display:flex; flex-direction:column; gap:8px; }}
+    .gallery-card-title {{ font-weight:600; font-size:16px; color:#111827; }}
+    .gallery-card-meta {{ font-size:12px; color:#6b7280; display:flex; flex-wrap:wrap; gap:6px; }}
+    .gallery-card-actions {{ display:flex; gap:8px; }}
+    .gallery-card-actions a {{ display:inline-flex; align-items:center; justify-content:center; padding:6px 14px; border-radius:999px; background:#111827; color:#fff; font-size:12px; font-weight:600; text-decoration:none; transition:background .15s ease; }}
+    .gallery-card-actions a:hover {{ background:#374151; }}
+    .profile-galleries-empty {{ font-size:14px; color:#6b7280; text-align:center; padding:28px 0; }}
+    .profile-galleries-empty.hidden {{ display:none !important; }}
     .profile-empty {{ text-align:center; font-size:15px; color:#6b7280; padding:40px 0; }}
     @media (max-width: 900px) {{
       .profile-wrap {{ padding:24px; }}
@@ -2666,6 +2757,8 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       </div>
       <div class=\"profile-stats\" id=\"profileStats\"></div>
       <div class=\"profile-grid\" id=\"profileGrid\"></div>
+      <div class=\"profile-galleries hidden\" id=\"profileGalleries\"></div>
+      <div class=\"profile-galleries-empty hidden\" id=\"profileGalleriesEmpty\">Нет сохранённых галерей для этого профиля.</div>
       <div class=\"profile-empty hidden\" id=\"profileEmpty\">Нет сохранённых фотографий для этого профиля.</div>
     </div>
   </div>
@@ -2694,6 +2787,8 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     const profileInfoExtra = document.getElementById('profileInfoExtra');
     const profileStats = document.getElementById('profileStats');
     const profileGrid = document.getElementById('profileGrid');
+    const profileGalleries = document.getElementById('profileGalleries');
+    const profileGalleriesEmpty = document.getElementById('profileGalleriesEmpty');
     const profileEmpty = document.getElementById('profileEmpty');
 
     const searchInput = document.getElementById('q');
@@ -3150,6 +3245,30 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
 
       const slugifyTabKey = value => (value || '').toString().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 
+      const normalizeGalleryEntries = entries => {{
+        if (!Array.isArray(entries)) return [];
+        const out = [];
+        entries.forEach(item => {{
+          if (!item || typeof item !== 'object') return;
+          const rawTitle = (item.title || item.slug || item.href || 'Галерея').toString();
+          const title = rawTitle.trim() || 'Галерея';
+          const slug = item.slug ? item.slug.toString().trim() : '';
+          const href = item.href ? item.href.toString().trim() : '';
+          const image = item.image ? item.image.toString().trim() : '';
+          let count = null;
+          if (typeof item.count === 'number' && Number.isFinite(item.count)) {{
+            count = item.count;
+          }} else if (item.count !== undefined && item.count !== null) {{
+            const parsed = parseInt(item.count, 10);
+            if (!Number.isNaN(parsed)) count = parsed;
+          }}
+          const countLabelRaw = item.count_label !== undefined ? item.count_label : item.countLabel;
+          const countLabel = countLabelRaw ? countLabelRaw.toString().trim() : '';
+          out.push({{ title, slug, href, image, count, countLabel }});
+        }});
+        return out;
+      }};
+
       const tabsRaw = Array.isArray(user.profile_tabs) ? user.profile_tabs : [];
       const tabList = [];
       const tabMap = new Map();
@@ -3178,12 +3297,14 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         const media = mediaRaw.map(item => (item || '').toString().trim()).filter(Boolean);
         const labelRaw = (tab.label || tab.slug || tab.id || '').toString().trim();
         const label = labelRaw ? labelRaw : uniqueKey.toUpperCase();
+        const entries = normalizeGalleryEntries(tab.entries);
         const entry = {{
           key: uniqueKey,
           label,
           media,
           remoteHref: typeof tab.remote_href === 'string' ? tab.remote_href : (typeof tab.href === 'string' ? tab.href : ''),
-          tabUrl: typeof tab.tab_url === 'string' ? tab.tab_url : ''
+          tabUrl: typeof tab.tab_url === 'string' ? tab.tab_url : '',
+          entries
         }};
         tabList.push(entry);
         tabMap.set(uniqueKey, entry);
@@ -3196,7 +3317,8 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
           label: 'RECENT',
           media: allImages.slice(),
           remoteHref: profileUrl,
-          tabUrl: profileUrl
+          tabUrl: profileUrl,
+          entries: []
         }};
         tabList.push(fallbackEntry);
         tabMap.set(fallbackKey, fallbackEntry);
@@ -3226,6 +3348,9 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
 
       function renderImagesGrid(imageList) {{
         if (!profileGrid) return;
+        profileGrid.classList.remove('hidden');
+        if (profileGalleries) profileGalleries.classList.add('hidden');
+        if (profileGalleriesEmpty) profileGalleriesEmpty.classList.add('hidden');
         if (imageList.length) {{
           const cells = imageList.map(src => {{
             const rawSrc = (src || '').toString();
@@ -3245,6 +3370,45 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         }}
       }}
 
+      function renderGalleryEntries(entriesList, showEmptyState) {{
+        if (!profileGalleries) return;
+        const list = Array.isArray(entriesList) ? entriesList : [];
+        if (list.length === 0) {{
+          profileGalleries.innerHTML = '';
+          if (showEmptyState) {{
+            profileGalleries.classList.remove('hidden');
+            if (profileGalleriesEmpty) profileGalleriesEmpty.classList.remove('hidden');
+          }} else {{
+            profileGalleries.classList.add('hidden');
+            if (profileGalleriesEmpty) profileGalleriesEmpty.classList.add('hidden');
+          }}
+          return;
+        }}
+        const cards = list.map(entry => {{
+          const title = (entry.title || entry.slug || entry.href || 'Галерея').toString();
+          const displayTitle = escapeHtml(title);
+          const slug = entry.slug ? entry.slug.toString() : '';
+          const slugLabel = slug ? '#' + escapeHtml(slug) : '';
+          const postsLabel = entry.countLabel ? entry.countLabel.toString() : (entry.count != null ? entry.count + ' posts' : '');
+          const metaParts = [];
+          if (postsLabel) metaParts.push(escapeHtml(postsLabel));
+          if (slugLabel) metaParts.push(slugLabel);
+          const metaHtml = metaParts.length ? '<div class="gallery-card-meta">' + metaParts.join(' • ') + '</div>' : '';
+          const href = entry.href ? entry.href.toString() : '';
+          const image = entry.image ? entry.image.toString() : '';
+          const thumbInner = image
+            ? '<img src="' + escapeHtml(image) + '" loading="lazy" alt="">'
+            : '<span>' + escapeHtml((title.charAt(0) || 'G').toUpperCase()) + '</span>';
+          const actionsHtml = href
+            ? '<div class="gallery-card-actions"><a href="' + escapeHtml(href) + '" target="_blank" rel="noopener">Открыть</a></div>'
+            : '';
+          return '<div class="gallery-card"><div class="gallery-card-thumb">' + thumbInner + '</div><div class="gallery-card-body"><div class="gallery-card-title">' + displayTitle + '</div>' + metaHtml + actionsHtml + '</div></div>';
+        }}).join('');
+        profileGalleries.innerHTML = cards;
+        profileGalleries.classList.remove('hidden');
+        if (profileGalleriesEmpty) profileGalleriesEmpty.classList.add('hidden');
+      }}
+
       function activateTab(key, shouldUpdateHash) {{
         let entry = null;
         if (key && tabMap.has(key)) {{
@@ -3262,7 +3426,10 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
           }});
         }}
         const imagesForTab = entry && Array.isArray(entry.media) ? entry.media : [];
-        const imagesToRender = tabList.length ? imagesForTab : allImages;
+        const galleryEntries = entry && Array.isArray(entry.entries) ? entry.entries : [];
+        const isGalleryList = entry && Array.isArray(entry.entries);
+        const galleryImages = isGalleryList ? galleryEntries.map(item => (item && item.image ? item.image.toString() : '')).filter(Boolean) : [];
+        const imagesToRender = isGalleryList ? galleryImages : (tabList.length ? imagesForTab : allImages);
         if (profileAvatar) {{
           if (imagesToRender.length) {{
             profileAvatar.classList.add('has-image');
@@ -3275,12 +3442,37 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
           }}
         }}
         if (profileStats) {{
-          profileStats.innerHTML = [
-            '<div class="stat"><span class="value">' + imagesToRender.length + '</span><span class="label">posts</span></div>',
-            '<div class="stat"><span class="value">' + commentCount + '</span><span class="label">comments</span></div>'
-          ].join('');
+          if (isGalleryList) {{
+            const galleryCount = galleryEntries.length;
+            const postsTotal = galleryEntries.reduce((acc, item) => {{
+              if (!item) return acc;
+              const cnt = typeof item.count === 'number' && Number.isFinite(item.count) ? item.count : parseInt(item.count, 10);
+              if (Number.isNaN(cnt)) return acc;
+              return acc + cnt;
+            }}, 0);
+            profileStats.innerHTML = [
+              '<div class="stat"><span class="value">' + galleryCount + '</span><span class="label">galleries</span></div>',
+              '<div class="stat"><span class="value">' + postsTotal + '</span><span class="label">posts</span></div>',
+              '<div class="stat"><span class="value">' + commentCount + '</span><span class="label">comments</span></div>'
+            ].join('');
+          }} else {{
+            profileStats.innerHTML = [
+              '<div class="stat"><span class="value">' + imagesToRender.length + '</span><span class="label">posts</span></div>',
+              '<div class="stat"><span class="value">' + commentCount + '</span><span class="label">comments</span></div>'
+            ].join('');
+          }}
         }}
-        renderImagesGrid(imagesToRender);
+        if (isGalleryList) {{
+          if (profileGrid) {{
+            profileGrid.innerHTML = '';
+            profileGrid.classList.add('hidden');
+          }}
+          if (profileEmpty) profileEmpty.classList.add('hidden');
+          renderGalleryEntries(galleryEntries, true);
+        }} else {{
+          renderGalleryEntries([], false);
+          renderImagesGrid(imagesToRender);
+        }}
         galleryView.classList.add('hidden');
         profileView.classList.remove('hidden');
         if (shouldUpdateHash && updateHash) {{
@@ -3296,7 +3488,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       const normalizedPreferred = typeof preferredTabKey === 'string' ? slugifyTabKey(preferredTabKey) : '';
       let initialKey = normalizedPreferred && tabMap.has(normalizedPreferred) ? normalizedPreferred : null;
       if (!initialKey && tabList.length) {{
-        const withMedia = tabList.find(tab => Array.isArray(tab.media) && tab.media.length > 0);
+        const withMedia = tabList.find(tab => (Array.isArray(tab.media) && tab.media.length > 0) || (Array.isArray(tab.entries) && tab.entries.length > 0));
         initialKey = withMedia ? withMedia.key : tabList[0].key;
       }}
 
