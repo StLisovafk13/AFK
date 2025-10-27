@@ -33,11 +33,13 @@ from collections import Counter
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Optional, Dict, Any, Tuple, Sequence
+from typing import Iterable, List, Optional, Dict, Any, Tuple, Sequence, Set
 from datetime import datetime, timedelta, timezone
 from urllib.parse import (
     urljoin,
     urlparse,
+    urlsplit,
+    urlunsplit,
 )
 import json
 import time
@@ -196,6 +198,70 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_tab_url(url: str) -> str:
+    candidate = (url or "").strip()
+    if not candidate:
+        return ""
+    try:
+        parsed = urlsplit(candidate)
+    except Exception:
+        return candidate
+
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc
+    path = parsed.path or ""
+    if path and path != "/":
+        path = path.rstrip("/")
+
+    return urlunsplit((scheme, netloc, path or "/", parsed.query, parsed.fragment))
+
+
+def _tab_slug_from_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        path = parsed.path or ""
+    except Exception:
+        path = url or ""
+
+    parts = [part for part in path.split("/") if part]
+    if not parts:
+        return "gallery"
+
+    last = parts[-1]
+    if last.isdigit() and len(parts) >= 2:
+        last = parts[-2]
+    return last or "gallery"
+
+
+_TAB_LABEL_OVERRIDES = {
+    "gallery": "RECENT",
+    "recent": "RECENT",
+    "galleries": "GALLERIES",
+    "spaces": "SPACES",
+    "collection": "REPOSTS",
+    "collections": "REPOSTS",
+    "reposts": "REPOSTS",
+}
+
+
+def _tab_label_from_slug(slug: str) -> str:
+    if not slug:
+        return "RECENT"
+    lower = slug.lower()
+    if lower in _TAB_LABEL_OVERRIDES:
+        return _TAB_LABEL_OVERRIDES[lower]
+    cleaned = re.split(r"[-_]+", slug)
+    cleaned = [chunk for chunk in cleaned if chunk]
+    if not cleaned:
+        return slug.upper()
+    return " ".join(chunk.upper() for chunk in cleaned)
+
+
+def _slugify_tab_key(seed: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "-", (seed or "").lower()).strip("-")
+    return cleaned
 
 
 def _safe_coord_pair(lat_raw: Any, lon_raw: Any) -> Optional[Tuple[float, float]]:
@@ -1988,6 +2054,8 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
                 "camera_models": Counter(),
                 "camera_model_labels": {},
                 "geo_buckets": {},
+                "tab_media": {},
+                "tab_media_seen": {},
             },
         )
         if purl and not g["profile_url"]:
@@ -1995,6 +2063,17 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
         if img and img not in g["image_set"]:
             g["images"].append(img)
             g["image_set"].add(img)
+
+        normalized_tab_url = _normalize_tab_url(purl or g.get("profile_url") or "")
+        if normalized_tab_url:
+            tab_media_map: Dict[str, List[str]] = g["tab_media"]  # type: ignore[assignment]
+            tab_media_seen: Dict[str, Set[str]] = g["tab_media_seen"]  # type: ignore[assignment]
+            bucket = tab_media_map.setdefault(normalized_tab_url, [])
+            seen_bucket = tab_media_seen.setdefault(normalized_tab_url, set())
+            if img and img not in seen_bucket:
+                bucket.append(img)
+                seen_bucket.add(img)
+
         meta_payload: Optional[Dict[str, Any]] = None
         meta_for_extract: Optional[Dict[str, Any]] = None
         if meta_json:
@@ -2167,13 +2246,93 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
 
         link_info = tab_info_by_user.get(uname, {})
         link_profile_url = link_info.get("url") if isinstance(link_info, dict) else None
-        profile_tabs: List[Dict[str, str]] = []
+
+        tab_media: Dict[str, List[str]] = {}
+        raw_tab_media = g.get("tab_media")  # type: ignore[var-annotated]
+        if isinstance(raw_tab_media, dict):
+            for tab_url_raw, media_list in raw_tab_media.items():
+                if not isinstance(tab_url_raw, str):
+                    continue
+                normalized_tab_url = _normalize_tab_url(tab_url_raw)
+                if not normalized_tab_url:
+                    continue
+                cleaned_media: List[str] = []
+                if isinstance(media_list, (list, tuple, set)):
+                    for entry in media_list:
+                        if not isinstance(entry, str):
+                            continue
+                        text = entry.strip()
+                        if text:
+                            cleaned_media.append(text)
+                tab_media[normalized_tab_url] = cleaned_media
+
+        profile_tabs: List[Dict[str, Any]] = []
+        used_tab_urls: Set[str] = set()
+        used_tab_keys: Set[str] = set()
+
+        def _allocate_tab_key(seed: str) -> str:
+            base = _slugify_tab_key(seed) or "tab"
+            candidate = base
+            idx = 2
+            while candidate in used_tab_keys:
+                candidate = f"{base}-{idx}"
+                idx += 1
+            used_tab_keys.add(candidate)
+            return candidate
+
+        def _append_tab_entry(source: Optional[Dict[str, Any]], tab_url: str) -> None:
+            normalized = _normalize_tab_url(tab_url)
+            if not normalized:
+                return
+            entry: Dict[str, Any] = {}
+            if isinstance(source, dict):
+                for key, value in source.items():
+                    if isinstance(key, str):
+                        entry[key] = value
+            provided_media: List[str] = []
+            if isinstance(source, dict):
+                maybe_media = source.get("media")
+                if isinstance(maybe_media, (list, tuple, set)):
+                    for raw_media in maybe_media:
+                        if isinstance(raw_media, str):
+                            media_text = raw_media.strip()
+                            if media_text:
+                                provided_media.append(media_text)
+            entry_href = entry.get("href") or normalized
+            entry["href"] = entry_href
+            entry["remote_href"] = entry_href
+            entry["tab_url"] = normalized
+            slug_value = entry.get("slug") or entry.get("id") or _tab_slug_from_url(normalized)
+            if slug_value:
+                entry["slug"] = slug_value
+            label_value = entry.get("label") or _tab_label_from_slug(entry.get("slug") or slug_value or "")
+            entry["label"] = label_value
+            key_seed = entry.get("tab_key") or entry.get("slug") or entry.get("id") or entry.get("label") or normalized
+            tab_key = _slugify_tab_key(str(key_seed)) if key_seed is not None else ""
+            if not tab_key:
+                tab_key = _allocate_tab_key(entry.get("slug") or normalized)
+            else:
+                if tab_key in used_tab_keys:
+                    tab_key = _allocate_tab_key(tab_key)
+                else:
+                    used_tab_keys.add(tab_key)
+            entry["tab_key"] = tab_key
+            media_list = list(tab_media.get(normalized, []))
+            if not media_list and provided_media:
+                media_list = provided_media
+                tab_media[normalized] = media_list
+            entry["media"] = media_list
+            entry["media_count"] = len(media_list)
+            entry["has_media"] = len(media_list) > 0
+            profile_tabs.append(entry)
+            used_tab_urls.add(normalized)
+
         raw_tabs = link_info.get("tabs") if isinstance(link_info, dict) else None
         if isinstance(raw_tabs, list):
             for tab in raw_tabs:
                 if not isinstance(tab, dict):
                     continue
-                cleaned: Dict[str, str] = {}
+                cleaned: Dict[str, Any] = {}
                 for key, value in tab.items():
                     if not isinstance(key, str):
                         continue
@@ -2182,8 +2341,33 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
                     text = str(value).strip()
                     if text:
                         cleaned[key] = text
-                if cleaned.get("href"):
-                    profile_tabs.append(cleaned)
+                href = cleaned.get("href")
+                if href:
+                    _append_tab_entry(cleaned, href)
+
+        for tab_url, media_list in list(tab_media.items()):
+            if tab_url in used_tab_urls:
+                continue
+            slug_value = _tab_slug_from_url(tab_url)
+            fallback_tab = {
+                "href": tab_url,
+                "slug": slug_value,
+                "label": _tab_label_from_slug(slug_value),
+            }
+            fallback_tab["media"] = [item for item in media_list if isinstance(item, str)]
+            _append_tab_entry(fallback_tab, tab_url)
+
+        if not profile_tabs:
+            fallback_url = link_profile_url or g["profile_url"]
+            normalized_fallback = _normalize_tab_url(fallback_url or "")
+            slug_value = _tab_slug_from_url(normalized_fallback or fallback_url or "")
+            fallback_entry = {
+                "href": normalized_fallback or (fallback_url or ""),
+                "slug": slug_value,
+                "label": _tab_label_from_slug(slug_value),
+                "media": [img for img in images_ordered if isinstance(img, str) and img],
+            }
+            _append_tab_entry(fallback_entry, fallback_entry["href"])
 
         out.append({
             "username": uname,
@@ -2359,10 +2543,14 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     .profile-actions .follow.disabled {{ pointer-events:none; opacity:0.5; }}
     .profile-actions .open {{ font-size:13px; color:#2563eb; text-decoration:none; font-weight:600; }}
     .profile-actions .open:hover {{ text-decoration:underline; }}
-    .profile-tabs {{ display:flex; flex-wrap:wrap; gap:10px; margin:12px 0 18px; }}
+    .profile-tabs {{ display:flex; flex-wrap:wrap; gap:28px; margin:12px 0 24px; border-bottom:1px solid #e5e7eb; padding-bottom:8px; }}
     .profile-tabs.hidden {{ display:none !important; }}
-    .profile-tab {{ display:inline-flex; align-items:center; padding:6px 14px; border-radius:999px; background:#f3f4f6; color:#1f2937; text-decoration:none; font-weight:600; font-size:12px; letter-spacing:0.02em; transition:background .15s ease,color .15s ease; }}
-    .profile-tab:hover {{ background:#e5e7eb; color:#111827; }}
+    .profile-tab {{ position:relative; display:inline-flex; align-items:center; justify-content:center; padding:8px 0; background:none; border:none; color:#6b7280; text-decoration:none; font-weight:600; font-size:13px; letter-spacing:0.12em; text-transform:uppercase; cursor:pointer; transition:color .15s ease; }}
+    .profile-tab::after {{ content:""; position:absolute; left:0; right:0; bottom:-9px; height:2px; background:transparent; transition:background .15s ease; }}
+    .profile-tab:hover {{ color:#111827; }}
+    .profile-tab:focus-visible {{ outline:none; color:#111827; }}
+    .profile-tab.active {{ color:#111827; }}
+    .profile-tab.active::after {{ background:#111827; }}
     .profile-meta {{ display:flex; gap:16px; flex-wrap:wrap; font-size:13px; color:#4b5563; margin-bottom:10px; }}
     .profile-meta span {{ display:inline-flex; align-items:center; gap:6px; }}
     .profile-tags {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }}
@@ -2487,6 +2675,9 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     const DATA = {data_json};
     const DATA_MAP = new Map();
     DATA.forEach(u => DATA_MAP.set((u.username || '').toLowerCase(), u));
+
+    let currentProfileUsername = '';
+    let currentProfileTabKey = '';
 
     const galleryView = document.getElementById('galleryView');
     const profileView = document.getElementById('profileView');
@@ -2844,7 +3035,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       return '';
     }}
 
-    function renderProfile(user, updateHash=true) {{
+    function renderProfile(user, updateHash=true, preferredTabKey=null) {{
       if (!user) {{
         return;
       }}
@@ -2863,30 +3054,11 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         profileFollow.classList.add('disabled');
       }}
 
-      if (profileTabs) {{
-        const tabs = Array.isArray(user.profile_tabs) ? user.profile_tabs : [];
-        const tabHtml = tabs.map(tab => {{
-          if (!tab || typeof tab !== 'object') return '';
-          const rawHref = tab.href != null ? String(tab.href) : '';
-          const href = rawHref.trim();
-          if (!href) return '';
-          const label = (tab.label || tab.slug || tab.id || href || '').toString();
-          return '<a class=\"profile-tab\" href=\"' + escapeHtml(href) + '\" target=\"_blank\" rel=\"noopener\">' + escapeHtml(label) + '</a>';
-        }}).filter(Boolean).join('');
-        profileTabs.innerHTML = tabHtml;
-        profileTabs.classList.toggle('hidden', tabHtml.length === 0);
-      }}
+      currentProfileUsername = (username || '').toLowerCase();
 
-      const images = Array.isArray(user.images) ? user.images.filter(Boolean) : [];
-      if (images.length) {{
-        profileAvatar.classList.add('has-image');
-        profileAvatar.style.backgroundImage = 'url(' + JSON.stringify(images[0]) + ')';
-        profileAvatar.textContent = '';
-      }} else {{
-        profileAvatar.classList.remove('has-image');
-        profileAvatar.style.backgroundImage = '';
-        profileAvatar.textContent = username ? username[0].toUpperCase() : '@';
-      }}
+      const commentsList = Array.isArray(user.comments) ? user.comments : [];
+      const commentCount = typeof user.comments_count === 'number' ? user.comments_count : commentsList.length;
+      const allImages = Array.isArray(user.images) ? user.images.filter(Boolean) : [];
 
       const metaParts = [];
       if (user.lat != null && user.lon != null) {{
@@ -2906,7 +3078,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       profileMeta.innerHTML = metaParts.join('');
       profileMeta.classList.toggle('hidden', metaParts.length === 0);
 
-      const datasetParts = (user.datasets || []).map(ds => '<span class=\"tag\">' + escapeHtml(ds.label || ds.value || '') + '</span>');
+      const datasetParts = (user.datasets || []).map(ds => '<span class="tag">' + escapeHtml(ds.label || ds.value || '') + '</span>');
       profileDatasets.innerHTML = datasetParts.join('');
       profileDatasets.classList.toggle('hidden', datasetParts.length === 0);
 
@@ -2944,14 +3116,14 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       }}
       const phoneParts = (Array.isArray(phoneList) ? phoneList : []).map(phone => {{
         const label = (phone && (phone.display || phone.label)) ? (phone.display || phone.label) : '';
-        return label ? '<span class=\"tag\">' + escapeHtml(label) + '</span>' : '';
+        return label ? '<span class="tag">' + escapeHtml(label) + '</span>' : '';
       }}).filter(Boolean);
       if (profilePhones) {{
         profilePhones.innerHTML = phoneParts.join('');
         profilePhones.classList.toggle('hidden', phoneParts.length === 0);
       }}
 
-      const cityParts = (user.cities || []).map(city => '<span class=\"chip\">' + escapeHtml(city) + '</span>');
+      const cityParts = (user.cities || []).map(city => '<span class="chip">' + escapeHtml(city) + '</span>');
       profileCities.innerHTML = cityParts.join('');
       profileCities.classList.toggle('hidden', cityParts.length === 0);
 
@@ -2965,11 +3137,6 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       profileInfoExtra.innerHTML = infoExtra.join('');
       profileInfoExtra.classList.toggle('hidden', infoExtra.length === 0);
 
-      profileStats.innerHTML = [
-        '<div class=\"stat\"><span class=\"value\">' + images.length + '</span><span class=\"label\">posts</span></div>',
-        '<div class=\"stat\"><span class=\"value\">' + (user.comments_count || 0) + '</span><span class=\"label\">comments</span></div>'
-      ].join('');
-
       const metaList = Array.isArray(user.images_meta) ? user.images_meta : [];
       const metaByUrl = new Map();
       metaList.forEach(entry => {{
@@ -2981,35 +3148,167 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         if (bare && bare !== rawUrl) metaByUrl.set(bare, data);
       }});
 
-      if (images.length) {{
-        const cells = images.map(src => {{
-          const rawSrc = (src || '').toString();
-          if (!rawSrc) return '';
-          const safeSrc = escapeHtml(rawSrc);
-          const bareSrc = rawSrc.split('?')[0];
-          const meta = metaByUrl.get(rawSrc) || metaByUrl.get(bareSrc);
-          const city = meta ? getEntryCityLabel(meta) : '';
-          const cityHtml = city ? '<div class=\"cell-city\">📍 ' + escapeHtml(city) + '</div>' : '';
-          return '<div class=\"cell\"><div class=\"cell-thumb\"><img src=\"' + safeSrc + '\" loading=\"lazy\" alt=\"\"></div>' + cityHtml + '</div>';
-        }}).join('');
-        profileGrid.innerHTML = cells;
-        profileEmpty.classList.add('hidden');
-      }} else {{
-        profileGrid.innerHTML = '';
-        profileEmpty.classList.remove('hidden');
+      const slugifyTabKey = value => (value || '').toString().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+
+      const tabsRaw = Array.isArray(user.profile_tabs) ? user.profile_tabs : [];
+      const tabList = [];
+      const tabMap = new Map();
+      const tabButtons = new Map();
+      const usedTabKeys = new Set();
+
+      tabsRaw.forEach((tab, index) => {{
+        if (!tab || typeof tab !== 'object') return;
+        let keySeed = '';
+        if (typeof tab.tab_key === 'string' && tab.tab_key.trim()) keySeed = tab.tab_key.trim();
+        else if (typeof tab.slug === 'string' && tab.slug.trim()) keySeed = tab.slug.trim();
+        else if (typeof tab.id === 'string' && tab.id.trim()) keySeed = tab.id.trim();
+        else if (typeof tab.tab_url === 'string' && tab.tab_url.trim()) keySeed = tab.tab_url.trim();
+        else if (typeof tab.href === 'string' && tab.href.trim()) keySeed = tab.href.trim();
+        else keySeed = 'tab-' + (index + 1);
+        let key = slugifyTabKey(keySeed);
+        if (!key) key = 'tab-' + (index + 1);
+        let uniqueKey = key;
+        let counter = 2;
+        while (usedTabKeys.has(uniqueKey)) {{
+          uniqueKey = key + '-' + counter;
+          counter += 1;
+        }}
+        usedTabKeys.add(uniqueKey);
+        const mediaRaw = Array.isArray(tab.media) ? tab.media : [];
+        const media = mediaRaw.map(item => (item || '').toString().trim()).filter(Boolean);
+        const labelRaw = (tab.label || tab.slug || tab.id || '').toString().trim();
+        const label = labelRaw ? labelRaw : uniqueKey.toUpperCase();
+        const entry = {{
+          key: uniqueKey,
+          label,
+          media,
+          remoteHref: typeof tab.remote_href === 'string' ? tab.remote_href : (typeof tab.href === 'string' ? tab.href : ''),
+          tabUrl: typeof tab.tab_url === 'string' ? tab.tab_url : ''
+        }};
+        tabList.push(entry);
+        tabMap.set(uniqueKey, entry);
+      }});
+
+      if (tabList.length === 0) {{
+        const fallbackKey = usedTabKeys.has('recent') ? 'recent-1' : 'recent';
+        const fallbackEntry = {{
+          key: fallbackKey,
+          label: 'RECENT',
+          media: allImages.slice(),
+          remoteHref: profileUrl,
+          tabUrl: profileUrl
+        }};
+        tabList.push(fallbackEntry);
+        tabMap.set(fallbackKey, fallbackEntry);
+        usedTabKeys.add(fallbackKey);
       }}
 
-      galleryView.classList.add('hidden');
-      profileView.classList.remove('hidden');
-      if (updateHash) {{
-        location.hash = '#/profile/' + encodeURIComponent(username || '');
+      if (profileTabs) {{
+        profileTabs.innerHTML = '';
+        profileTabs.classList.toggle('hidden', tabList.length === 0);
+        if (tabList.length) {{
+          tabList.forEach(tab => {{
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'profile-tab';
+            btn.textContent = (tab.label || tab.key || '').toString();
+            if (tab.remoteHref) btn.title = tab.remoteHref;
+            btn.addEventListener('click', ev => {{
+              ev.preventDefault();
+              ev.stopPropagation();
+              activateTab(tab.key, true);
+            }});
+            profileTabs.appendChild(btn);
+            tabButtons.set(tab.key, btn);
+          }});
+        }}
       }}
+
+      function renderImagesGrid(imageList) {{
+        if (!profileGrid) return;
+        if (imageList.length) {{
+          const cells = imageList.map(src => {{
+            const rawSrc = (src || '').toString();
+            if (!rawSrc) return '';
+            const safeSrc = escapeHtml(rawSrc);
+            const bareSrc = rawSrc.split('?')[0];
+            const meta = metaByUrl.get(rawSrc) || metaByUrl.get(bareSrc);
+            const city = meta ? getEntryCityLabel(meta) : '';
+            const cityHtml = city ? '<div class="cell-city">📍 ' + escapeHtml(city) + '</div>' : '';
+            return '<div class="cell"><div class="cell-thumb"><img src="' + safeSrc + '" loading="lazy" alt=""></div>' + cityHtml + '</div>';
+          }}).join('');
+          profileGrid.innerHTML = cells;
+          profileEmpty.classList.add('hidden');
+        }} else {{
+          profileGrid.innerHTML = '';
+          profileEmpty.classList.remove('hidden');
+        }}
+      }}
+
+      function activateTab(key, shouldUpdateHash) {{
+        let entry = null;
+        if (key && tabMap.has(key)) {{
+          entry = tabMap.get(key);
+        }} else if (tabList.length > 0) {{
+          entry = tabList[0];
+          key = entry.key;
+        }}
+        const selectedKey = entry ? entry.key : '';
+        currentProfileTabKey = selectedKey;
+        if (profileTabs && tabButtons.size) {{
+          tabButtons.forEach((btn, btnKey) => {{
+            if (!btn) return;
+            btn.classList.toggle('active', btnKey === selectedKey);
+          }});
+        }}
+        const imagesForTab = entry && Array.isArray(entry.media) ? entry.media : [];
+        const imagesToRender = tabList.length ? imagesForTab : allImages;
+        if (profileAvatar) {{
+          if (imagesToRender.length) {{
+            profileAvatar.classList.add('has-image');
+            profileAvatar.style.backgroundImage = 'url(' + JSON.stringify(imagesToRender[0]) + ')';
+            profileAvatar.textContent = '';
+          }} else {{
+            profileAvatar.classList.remove('has-image');
+            profileAvatar.style.backgroundImage = '';
+            profileAvatar.textContent = username ? username[0].toUpperCase() : '@';
+          }}
+        }}
+        if (profileStats) {{
+          profileStats.innerHTML = [
+            '<div class="stat"><span class="value">' + imagesToRender.length + '</span><span class="label">posts</span></div>',
+            '<div class="stat"><span class="value">' + commentCount + '</span><span class="label">comments</span></div>'
+          ].join('');
+        }}
+        renderImagesGrid(imagesToRender);
+        galleryView.classList.add('hidden');
+        profileView.classList.remove('hidden');
+        if (shouldUpdateHash && updateHash) {{
+          const base = '#/profile/' + encodeURIComponent(username || '');
+          if (selectedKey) {{
+            location.hash = base + '?tab=' + encodeURIComponent(selectedKey);
+          }} else {{
+            location.hash = base;
+          }}
+        }}
+      }}
+
+      const normalizedPreferred = typeof preferredTabKey === 'string' ? slugifyTabKey(preferredTabKey) : '';
+      let initialKey = normalizedPreferred && tabMap.has(normalizedPreferred) ? normalizedPreferred : null;
+      if (!initialKey && tabList.length) {{
+        const withMedia = tabList.find(tab => Array.isArray(tab.media) && tab.media.length > 0);
+        initialKey = withMedia ? withMedia.key : tabList[0].key;
+      }}
+
+      activateTab(initialKey, updateHash);
       window.scrollTo({{ top: 0, behavior: 'smooth' }});
     }}
 
     function showGallery(updateHash=true) {{
       profileView.classList.add('hidden');
       galleryView.classList.remove('hidden');
+      currentProfileUsername = '';
+      currentProfileTabKey = '';
       if (updateHash) {{
         location.hash = '#gallery';
       }}
@@ -3169,13 +3468,39 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
 
     reset();
 
+    function parseProfileHash(hash) {{
+      if (!hash || !hash.startsWith('#/profile/')) return null;
+      let rest = hash.slice('#/profile/'.length);
+      let query = '';
+      const qIndex = rest.indexOf('?');
+      if (qIndex !== -1) {{
+        query = rest.slice(qIndex + 1);
+        rest = rest.slice(0, qIndex);
+      }}
+      const username = decodeURIComponent(rest || '');
+      let tabKey = '';
+      if (query) {{
+        try {{
+          const params = new URLSearchParams(query);
+          tabKey = (params.get('tab') || '').toLowerCase();
+        }} catch (err) {{
+          tabKey = '';
+        }}
+      }}
+      return {{ username, tabKey }};
+    }}
+
     function handleHashNavigation() {{
-      const hash = location.hash || '';
-      if (hash.startsWith('#/profile/')) {{
-        const username = decodeURIComponent(hash.replace('#/profile/', ''));
-        const user = DATA_MAP.get((username || '').toLowerCase());
+      const parsed = parseProfileHash(location.hash || '');
+      if (parsed) {{
+        const usernameKey = (parsed.username || '').toLowerCase();
+        const normalizedTab = (parsed.tabKey || '').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+        const user = DATA_MAP.get(usernameKey);
         if (user) {{
-          renderProfile(user, false);
+          if (usernameKey === currentProfileUsername && normalizedTab === (currentProfileTabKey || '')) {{
+            return;
+          }}
+          renderProfile(user, false, normalizedTab);
           return;
         }}
       }}
