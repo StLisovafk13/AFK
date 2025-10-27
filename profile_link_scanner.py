@@ -18,7 +18,8 @@ import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 
@@ -56,6 +57,7 @@ class ScanResult:
     added_items: int = 0
     link_added: bool = False
     profile_tabs: list[dict[str, str]] = field(default_factory=list)
+    media_by_tab: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -64,6 +66,7 @@ class ProfileMediaCollection:
 
     media_urls: list[str]
     profile_tabs: list[dict[str, str]] = field(default_factory=list)
+    media_by_tab: dict[str, list[str]] = field(default_factory=dict)
 
 
 def utc_now_iso() -> str:
@@ -343,8 +346,16 @@ async def collect_profile_media(
     target_count: int = 0,
     headers: dict[str, str] | None = None,
     include_details: bool = False,
+
 ) -> list[str] | ProfileMediaCollection:
-    """Return the list of direct media URLs for a VSCO profile."""
+    """Return the list of direct media URLs for a VSCO profile.
+
+    When navigation tabs are present on the profile page we fetch media from
+    every tab (e.g. ``/gallery``, ``/galleries``, ``/spaces``) to make sure the
+    database contains the complete set of assets. The combined list is returned
+    in ``media_urls`` while ``ProfileMediaCollection`` additionally carries the
+    per-tab mapping for the caller.
+    """
 
     session_headers = {"User-Agent": DEFAULT_USER_AGENT}
     if headers:
@@ -358,31 +369,71 @@ async def collect_profile_media(
         target_count=target_count,
     )
 
-    if urls:
-        if include_details:
-            tabs = extract_profile_tab_links(html, root=profile_url)
-            return ProfileMediaCollection(media_urls=urls, profile_tabs=tabs)
-        return urls
+    normalized_profile_url = _normalize_tab_url(profile_url)
+    aggregated_urls = dedupe_keep_order(urls)
+    media_by_tab: dict[str, list[str]] = {}
+    if aggregated_urls:
+        media_by_tab[normalized_profile_url] = aggregated_urls
+
+    tabs = extract_profile_tab_links(html, root=profile_url)
 
     async with aiohttp.ClientSession(headers=session_headers) as session:
-        urls, html = await scan_profile_media(
-            session,
-            profile_url,
-            max_width=max_width,
-            logger=LOGGER,
-        )
+        if not aggregated_urls:
+            urls, html = await scan_profile_media(
+                session,
+                profile_url,
+                max_width=max_width,
+                logger=LOGGER,
+            )
+            aggregated_urls = dedupe_keep_order(urls)
+            if aggregated_urls:
+                media_by_tab[normalized_profile_url] = aggregated_urls
+            if not tabs:
+                tabs = extract_profile_tab_links(html, root=profile_url)
 
-    if not urls:
+        # Collect media from secondary tabs (e.g. /galleries, /spaces, ...)
+        tab_urls_to_fetch: list[str] = []
+        seen_tab_urls: set[str] = set(media_by_tab.keys())
+        for tab in tabs:
+            href = tab.get("href") or ""
+            normalized_href = _normalize_tab_url(href)
+            if not normalized_href or normalized_href in seen_tab_urls:
+                continue
+            seen_tab_urls.add(normalized_href)
+            tab_urls_to_fetch.append(normalized_href)
+
+        for tab_url in tab_urls_to_fetch:
+            tab_media, _ = await scan_profile_media(
+                session,
+                tab_url,
+                max_width=max_width,
+                logger=LOGGER,
+            )
+            cleaned = dedupe_keep_order(tab_media)
+            media_by_tab[tab_url] = cleaned
+            if cleaned:
+                aggregated_urls = dedupe_keep_order(aggregated_urls + cleaned)
+
+    if not aggregated_urls:
         LOGGER.warning("Не удалось получить ссылки медиа для %s", profile_url)
         if include_details:
-            return ProfileMediaCollection(media_urls=[], profile_tabs=[])
+            sanitized_tabs = _sanitize_profile_tabs(tabs)
+            return ProfileMediaCollection(
+                media_urls=[],
+                profile_tabs=sanitized_tabs,
+                media_by_tab={},
+            )
         return []
 
     if include_details:
-        tabs = extract_profile_tab_links(html, root=profile_url)
-        return ProfileMediaCollection(media_urls=urls, profile_tabs=tabs)
+        sanitized_tabs = _sanitize_profile_tabs(tabs)
+        return ProfileMediaCollection(
+            media_urls=aggregated_urls,
+            profile_tabs=sanitized_tabs,
+            media_by_tab=media_by_tab.copy(),
+        )
 
-    return urls
+    return aggregated_urls
 
 
 def _prepare_urls(urls: Iterable[str], *, max_width: int) -> list[str]:
@@ -398,6 +449,24 @@ def _prepare_urls(urls: Iterable[str], *, max_width: int) -> list[str]:
     return dedupe_keep_order(prepared)
 
 
+def _normalize_tab_url(url: str) -> str:
+    candidate = (url or "").strip()
+    if not candidate:
+        return ""
+    try:
+        parsed = urlsplit(candidate)
+    except Exception:
+        return candidate
+
+    scheme = parsed.scheme or "https"
+    netloc = parsed.netloc
+    path = parsed.path or ""
+    if path and path != "/":
+        path = path.rstrip("/")
+
+    return urlunsplit((scheme, netloc, path or "/", parsed.query, parsed.fragment))
+
+
 def _sanitize_profile_tabs(
     tabs: Optional[Sequence[Dict[str, Any]]],
 ) -> list[dict[str, str]]:
@@ -411,7 +480,7 @@ def _sanitize_profile_tabs(
         href = str(href_raw).strip() if href_raw is not None else ""
         if not href:
             continue
-        entry: dict[str, str] = {"href": href}
+        entry: dict[str, str] = {"href": _normalize_tab_url(href)}
         for key in ("id", "label", "slug", "active"):
             value = tab.get(key)
             if value is None:
@@ -433,22 +502,32 @@ def store_profile_media(
     source: str = "profile-scan",
     added_by: str = "",
     profile_tabs: Optional[Sequence[Dict[str, Any]]] = None,
+    media_by_tab: Optional[Mapping[str, Sequence[str]]] = None,
     meta_fetcher: Optional[Callable[[str], Dict[str, Any]]] = None,
 ) -> ScanResult:
     """Persist collected media URLs into the bot database."""
 
     sanitized_tabs = _sanitize_profile_tabs(profile_tabs)
+    normalized_media_by_tab: dict[str, list[str]] = {}
+    if media_by_tab:
+        for tab_url, urls_for_tab in media_by_tab.items():
+            normalized_tab_url = _normalize_tab_url(tab_url)
+            if not normalized_tab_url:
+                continue
+            cleaned_urls = dedupe_keep_order(urls_for_tab)
+            normalized_media_by_tab[normalized_tab_url] = cleaned_urls
+
+    if not normalized_media_by_tab and media_urls:
+        normalized_media_by_tab[_normalize_tab_url(profile_url)] = list(media_urls)
+
     result = ScanResult(
         username=username,
         profile_url=profile_url,
         media_urls=list(media_urls),
         profile_tabs=sanitized_tabs,
+        media_by_tab=normalized_media_by_tab.copy(),
     )
-    if not media_urls:
-        return result
-
-    prepared = _prepare_urls(media_urls, max_width=2048)
-    if not prepared:
+    if not normalized_media_by_tab:
         return result
 
     if meta_fetcher is None:
@@ -457,48 +536,52 @@ def store_profile_media(
     conn = connect_db(db_path)
     try:
         added_items = 0
-        for url in prepared:
-            created_at = utc_now_iso()
-            cur = conn.execute(
-                """
-                INSERT OR IGNORE INTO items(
-                    chat_id, username, latitude, longitude, profile_url, image_url,
-                    source, source_file, added_by, meta_json, created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                """,
-                (
-                    chat_id,
-                    username,
-                    None,
-                    None,
-                    profile_url,
-                    url,
-                    source,
-                    "",
-                    added_by,
-                    "",
-                    created_at,
-                ),
-            )
-            if cur.rowcount > 0:
-                added_items += 1
-                if meta_fetcher is not None:
-                    try:
-                        metadata = meta_fetcher(url)
-                    except Exception as exc:  # pragma: no cover - best effort metadata
-                        LOGGER.debug("Не удалось получить EXIF для %s: %s", url, exc)
-                        metadata = None
-                    if metadata:
+        for tab_url, urls_for_tab in normalized_media_by_tab.items():
+            prepared = _prepare_urls(urls_for_tab, max_width=2048)
+            if not prepared:
+                continue
+            for url in prepared:
+                created_at = utc_now_iso()
+                cur = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO items(
+                        chat_id, username, latitude, longitude, profile_url, image_url,
+                        source, source_file, added_by, meta_json, created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        chat_id,
+                        username,
+                        None,
+                        None,
+                        tab_url,
+                        url,
+                        source,
+                        "",
+                        added_by,
+                        "",
+                        created_at,
+                    ),
+                )
+                if cur.rowcount > 0:
+                    added_items += 1
+                    if meta_fetcher is not None:
                         try:
-                            payload = json.dumps(metadata, ensure_ascii=False)
-                        except (TypeError, ValueError):
-                            payload = json.dumps({"raw": str(metadata)}, ensure_ascii=False)
-                        item_id = cur.lastrowid
-                        if item_id:
-                            conn.execute(
-                                "UPDATE items SET meta_json=? WHERE id=?",
-                                (payload, item_id),
-                            )
+                            metadata = meta_fetcher(url)
+                        except Exception as exc:  # pragma: no cover - best effort metadata
+                            LOGGER.debug("Не удалось получить EXIF для %s: %s", url, exc)
+                            metadata = None
+                        if metadata:
+                            try:
+                                payload = json.dumps(metadata, ensure_ascii=False)
+                            except (TypeError, ValueError):
+                                payload = json.dumps({"raw": str(metadata)}, ensure_ascii=False)
+                            item_id = cur.lastrowid
+                            if item_id:
+                                conn.execute(
+                                    "UPDATE items SET meta_json=? WHERE id=?",
+                                    (payload, item_id),
+                                )
         conn.execute(
             "INSERT OR IGNORE INTO links(chat_id,username,url,created_at) VALUES(?,?,?,?)",
             (chat_id, username, profile_url, utc_now_iso()),
@@ -556,9 +639,11 @@ async def _async_main(args: argparse.Namespace) -> ScanResult:
     if isinstance(collected, ProfileMediaCollection):
         media_urls = collected.media_urls
         profile_tabs = collected.profile_tabs
+        media_by_tab = collected.media_by_tab
     else:
         media_urls = collected
         profile_tabs = []
+        media_by_tab = None
 
     result = store_profile_media(
         args.db,
@@ -568,6 +653,7 @@ async def _async_main(args: argparse.Namespace) -> ScanResult:
         media_urls,
         source="profile-scan",
         profile_tabs=profile_tabs,
+        media_by_tab=media_by_tab,
     )
     LOGGER.info(
         "Сканирование завершено: %d новых элементов, ссылка сохранена=%s",

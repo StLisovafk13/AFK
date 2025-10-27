@@ -176,9 +176,11 @@ async def _rescan_single(
     if isinstance(collected, ProfileMediaCollection):
         media_urls = collected.media_urls
         profile_tabs = collected.profile_tabs
+        media_by_tab = collected.media_by_tab
     else:
         media_urls = collected
         profile_tabs = []
+        media_by_tab = None
 
     if not media_urls:
         LOGGER.warning("Нет медиа по ссылке %s", entry.profile_url)
@@ -192,6 +194,7 @@ async def _rescan_single(
         media_urls,
         source="rescan",
         profile_tabs=profile_tabs,
+        media_by_tab=media_by_tab,
     )
 
 
