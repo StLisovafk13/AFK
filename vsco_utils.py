@@ -47,6 +47,12 @@ INLINE_IMG_RE = re.compile(
 )
 
 
+def _normalize_whitespace(text: str) -> str:
+    """Collapse runs of whitespace characters into single spaces."""
+
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def is_vsco_logo_url(url: Optional[str]) -> bool:
     """Return ``True`` when the URL points to a known VSCO logo asset."""
 
@@ -135,6 +141,56 @@ def dedupe_keep_order(items: Iterable[str]) -> list[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+def extract_profile_description(html: Optional[str]) -> str:
+    """Return the profile description text from VSCO profile markup."""
+
+    if not html:
+        return ""
+
+    description = ""
+    soup = None
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:  # pragma: no cover - best effort parsing
+            soup = None
+
+    if soup is not None:
+        selectors = [
+            "div[data-testid='ProfileHeaderDescription']",
+            "div[data-testid='profileDescription']",
+            "div.css-yye9gg",
+            "div[class*='css-yye9gg']",
+        ]
+        for selector in selectors:
+            node = soup.select_one(selector)
+            if node is None:
+                continue
+            text = node.get_text(" ", strip=True)
+            if text:
+                description = _normalize_whitespace(text)
+                break
+
+        if not description:
+            meta = soup.find("meta", attrs={"name": "description"})
+            if meta and meta.get("content"):
+                description = _normalize_whitespace(meta["content"])
+
+    if description:
+        return description
+
+    # Fallback: attempt a simple regex extraction when BeautifulSoup is absent.
+    match = re.search(
+        r"<div[^>]+class=\"[^\"]*css-yye9gg[^>]*>(.*?)</div>",
+        html,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return ""
+    candidate = re.sub(r"<[^>]+>", " ", match.group(1))
+    return _normalize_whitespace(candidate)
 
 
 def generate_media_filename(url: str, idx: int, *, default_ext: str = "jpg") -> str:

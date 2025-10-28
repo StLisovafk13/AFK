@@ -2157,9 +2157,15 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
         link_params.append(chat_id)
     for uname, link_url, extra_json in conn.execute(link_query, tuple(link_params)).fetchall():
         key = uname or ""
-        info = tab_info_by_user.setdefault(key, {"url": "", "tabs": []})
+        info = tab_info_by_user.setdefault(key, {"url": "", "tabs": [], "description": ""})
         if link_url and not info.get("url"):
             info["url"] = link_url
+        payload: Dict[str, Any] | None = None
+        if extra_json:
+            try:
+                payload = json.loads(extra_json)
+            except Exception:
+                payload = None
         tabs = parse_profile_tabs_payload(extra_json or "")
         if tabs:
             existing: List[Dict[str, str]] = info.setdefault("tabs", [])  # type: ignore[assignment]
@@ -2169,6 +2175,12 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
                 if href and href not in seen_hrefs:
                     existing.append(tab)
                     seen_hrefs.add(href)
+        if isinstance(payload, dict):
+            desc_value = payload.get("profile_description")
+            if isinstance(desc_value, str):
+                cleaned_desc = desc_value.strip()
+                if cleaned_desc and not info.get("description"):
+                    info["description"] = cleaned_desc
 
     out = []
     for uname, g in groups.items():
@@ -2389,6 +2401,7 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "first_created": g.get("first_at"),
             "last_created": g.get("last_at"),
             "profile_tabs": profile_tabs,
+            "profile_description": link_info.get("description") if isinstance(link_info, dict) else "",
         })
     conn.close()
     return out
@@ -5255,10 +5268,12 @@ async def _profile_scan_worker() -> None:
                 media_urls = collected.media_urls
                 profile_tabs = collected.profile_tabs
                 media_by_tab = collected.media_by_tab
+                profile_description = collected.profile_description
             else:
                 media_urls = collected
                 profile_tabs = []
                 media_by_tab = None
+                profile_description = ""
             result: ScanResult = store_profile_media(
                 Path(DB_PATH),
                 job.chat_id,
@@ -5269,6 +5284,7 @@ async def _profile_scan_worker() -> None:
                 added_by=job.added_by,
                 profile_tabs=profile_tabs,
                 media_by_tab=media_by_tab,
+                profile_description=profile_description,
             )
             if result.added_items > 0 or not result.media_urls:
                 total = len(result.media_urls)

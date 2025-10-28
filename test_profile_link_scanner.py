@@ -48,6 +48,8 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
         ],
     }
 
+    profile_description = "🥀russia. ivanovo."
+
     result = store_profile_media(
         db_path,
         123,
@@ -57,6 +59,7 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
         profile_tabs=tabs,
         media_by_tab=media_by_tab,
         meta_fetcher=stub_meta,
+        profile_description=profile_description,
     )
     assert result.added_items == 3
     assert result.link_added is True
@@ -65,6 +68,7 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
         "https://images.example.com/media1.jpg",
         "https://images.example.com/media2.jpg",
     ]
+    assert result.profile_description == profile_description
 
     second = store_profile_media(
         db_path,
@@ -86,6 +90,7 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
             ],
         },
         meta_fetcher=stub_meta,
+        profile_description="",
     )
     assert second.added_items == 2
     assert second.link_added is True
@@ -126,5 +131,6 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
         tabs_payload = json.loads(extra_row[0])
         stored_tabs = tabs_payload.get("profile_tabs") or []
         assert stored_tabs and stored_tabs[0]["href"].endswith("/collection/1")
+        assert tabs_payload.get("profile_description") == profile_description
     finally:
         conn.close()

@@ -28,6 +28,7 @@ from exif_fetcher import extract_exif_from_url
 from vsco_utils import (
     dedupe_keep_order,
     extract_media_urls_from_html,
+    extract_profile_description,
     extract_profile_tab_links,
     is_media_url,
     is_vsco_logo_url,
@@ -58,6 +59,7 @@ class ScanResult:
     link_added: bool = False
     profile_tabs: list[dict[str, str]] = field(default_factory=list)
     media_by_tab: dict[str, list[str]] = field(default_factory=dict)
+    profile_description: str = ""
 
 
 @dataclass(slots=True)
@@ -67,6 +69,7 @@ class ProfileMediaCollection:
     media_urls: list[str]
     profile_tabs: list[dict[str, str]] = field(default_factory=list)
     media_by_tab: dict[str, list[str]] = field(default_factory=dict)
+    profile_description: str = ""
 
 
 def utc_now_iso() -> str:
@@ -375,6 +378,7 @@ async def collect_profile_media(
     if aggregated_urls:
         media_by_tab[normalized_profile_url] = aggregated_urls
 
+    profile_description = extract_profile_description(html)
     tabs = extract_profile_tab_links(html, root=profile_url)
 
     async with aiohttp.ClientSession(headers=session_headers) as session:
@@ -390,6 +394,8 @@ async def collect_profile_media(
                 media_by_tab[normalized_profile_url] = aggregated_urls
             if not tabs:
                 tabs = extract_profile_tab_links(html, root=profile_url)
+            if not profile_description:
+                profile_description = extract_profile_description(html)
 
         # Collect media from secondary tabs (e.g. /galleries, /spaces, ...)
         tab_urls_to_fetch: list[str] = []
@@ -422,6 +428,7 @@ async def collect_profile_media(
                 media_urls=[],
                 profile_tabs=sanitized_tabs,
                 media_by_tab={},
+                profile_description=profile_description,
             )
         return []
 
@@ -431,6 +438,7 @@ async def collect_profile_media(
             media_urls=aggregated_urls,
             profile_tabs=sanitized_tabs,
             media_by_tab=media_by_tab.copy(),
+            profile_description=profile_description,
         )
 
     return aggregated_urls
@@ -504,6 +512,7 @@ def store_profile_media(
     profile_tabs: Optional[Sequence[Dict[str, Any]]] = None,
     media_by_tab: Optional[Mapping[str, Sequence[str]]] = None,
     meta_fetcher: Optional[Callable[[str], Dict[str, Any]]] = None,
+    profile_description: str = "",
 ) -> ScanResult:
     """Persist collected media URLs into the bot database."""
 
@@ -520,12 +529,15 @@ def store_profile_media(
     if not normalized_media_by_tab and media_urls:
         normalized_media_by_tab[_normalize_tab_url(profile_url)] = list(media_urls)
 
+    clean_description = (profile_description or "").strip()
+
     result = ScanResult(
         username=username,
         profile_url=profile_url,
         media_urls=list(media_urls),
         profile_tabs=sanitized_tabs,
         media_by_tab=normalized_media_by_tab.copy(),
+        profile_description=clean_description,
     )
     if not normalized_media_by_tab:
         return result
@@ -586,11 +598,16 @@ def store_profile_media(
             "INSERT OR IGNORE INTO links(chat_id,username,url,created_at) VALUES(?,?,?,?)",
             (chat_id, username, profile_url, utc_now_iso()),
         )
+        payload: dict[str, Any] = {}
         if sanitized_tabs:
-            payload = json.dumps({"profile_tabs": sanitized_tabs}, ensure_ascii=False)
+            payload["profile_tabs"] = sanitized_tabs
+        if clean_description:
+            payload["profile_description"] = clean_description
+        if payload:
+            serialized = json.dumps(payload, ensure_ascii=False)
             conn.execute(
                 "UPDATE links SET extra_json=?, url=? WHERE chat_id=? AND username=?",
-                (payload, profile_url, chat_id, username),
+                (serialized, profile_url, chat_id, username),
             )
         elif profile_url:
             conn.execute(
@@ -640,10 +657,12 @@ async def _async_main(args: argparse.Namespace) -> ScanResult:
         media_urls = collected.media_urls
         profile_tabs = collected.profile_tabs
         media_by_tab = collected.media_by_tab
+        profile_description = collected.profile_description
     else:
         media_urls = collected
         profile_tabs = []
         media_by_tab = None
+        profile_description = ""
 
     result = store_profile_media(
         args.db,
@@ -654,6 +673,7 @@ async def _async_main(args: argparse.Namespace) -> ScanResult:
         source="profile-scan",
         profile_tabs=profile_tabs,
         media_by_tab=media_by_tab,
+        profile_description=profile_description,
     )
     LOGGER.info(
         "Сканирование завершено: %d новых элементов, ссылка сохранена=%s",
