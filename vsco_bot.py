@@ -3349,11 +3349,13 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         }}
       }}
 
-      function renderImagesGrid(imageList) {{
+      function renderImagesGrid(imageList, keepGalleriesVisible = false) {{
         if (!profileGrid) return;
         profileGrid.classList.remove('hidden');
-        if (profileGalleries) profileGalleries.classList.add('hidden');
-        if (profileGalleriesEmpty) profileGalleriesEmpty.classList.add('hidden');
+        if (!keepGalleriesVisible) {{
+          if (profileGalleries) profileGalleries.classList.add('hidden');
+          if (profileGalleriesEmpty) profileGalleriesEmpty.classList.add('hidden');
+        }}
         if (imageList.length) {{
           const cells = imageList.map(src => {{
             const rawSrc = (src || '').toString();
@@ -3433,11 +3435,13 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         const hasGalleryEntries = galleryEntriesRaw.length > 0;
         const galleryEntries = hasGalleryEntries ? galleryEntriesRaw : [];
         const galleryImages = hasGalleryEntries ? galleryEntries.map(item => (item && item.image ? item.image.toString() : '')).filter(Boolean) : [];
-        const imagesToRender = hasGalleryEntries ? galleryImages : (tabList.length ? imagesForTab : allImages);
+        const defaultImages = tabList.length ? imagesForTab : allImages;
+        const gridImages = (defaultImages && defaultImages.length ? defaultImages : allImages);
+        const avatarCandidates = galleryImages.length ? galleryImages : (gridImages.length ? gridImages : allImages);
         if (profileAvatar) {{
-          if (imagesToRender.length) {{
+          if (avatarCandidates.length) {{
             profileAvatar.classList.add('has-image');
-            profileAvatar.style.backgroundImage = 'url(' + JSON.stringify(imagesToRender[0]) + ')';
+            profileAvatar.style.backgroundImage = 'url(' + JSON.stringify(avatarCandidates[0]) + ')';
             profileAvatar.textContent = '';
           }} else {{
             profileAvatar.classList.remove('has-image');
@@ -3461,21 +3465,17 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
             ].join('');
           }} else {{
             profileStats.innerHTML = [
-              '<div class="stat"><span class="value">' + imagesToRender.length + '</span><span class="label">posts</span></div>',
+              '<div class="stat"><span class="value">' + gridImages.length + '</span><span class="label">posts</span></div>',
               '<div class="stat"><span class="value">' + commentCount + '</span><span class="label">comments</span></div>'
             ].join('');
           }}
         }}
         if (hasGalleryEntries) {{
-          if (profileGrid) {{
-            profileGrid.innerHTML = '';
-            profileGrid.classList.add('hidden');
-          }}
-          if (profileEmpty) profileEmpty.classList.add('hidden');
           renderGalleryEntries(galleryEntries, true);
+          renderImagesGrid(gridImages, true);
         }} else {{
           renderGalleryEntries([], false);
-          renderImagesGrid(imagesToRender);
+          renderImagesGrid(gridImages);
         }}
         galleryView.classList.add('hidden');
         profileView.classList.remove('hidden');
