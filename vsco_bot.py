@@ -2393,7 +2393,10 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
                         pass
                     if cleaned_entry:
                         sanitized_entries.append(cleaned_entry)
-            entry["entries"] = sanitized_entries
+            if sanitized_entries:
+                entry["entries"] = sanitized_entries
+            else:
+                entry.pop("entries", None)
             entry["entries_count"] = len(sanitized_entries)
             entry["entries_posts_total"] = sum(
                 int(item.get("count") or 0)
@@ -3426,10 +3429,11 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
           }});
         }}
         const imagesForTab = entry && Array.isArray(entry.media) ? entry.media : [];
-        const galleryEntries = entry && Array.isArray(entry.entries) ? entry.entries : [];
-        const isGalleryList = entry && Array.isArray(entry.entries);
-        const galleryImages = isGalleryList ? galleryEntries.map(item => (item && item.image ? item.image.toString() : '')).filter(Boolean) : [];
-        const imagesToRender = isGalleryList ? galleryImages : (tabList.length ? imagesForTab : allImages);
+        const galleryEntriesRaw = entry && Array.isArray(entry.entries) ? entry.entries : [];
+        const hasGalleryEntries = galleryEntriesRaw.length > 0;
+        const galleryEntries = hasGalleryEntries ? galleryEntriesRaw : [];
+        const galleryImages = hasGalleryEntries ? galleryEntries.map(item => (item && item.image ? item.image.toString() : '')).filter(Boolean) : [];
+        const imagesToRender = hasGalleryEntries ? galleryImages : (tabList.length ? imagesForTab : allImages);
         if (profileAvatar) {{
           if (imagesToRender.length) {{
             profileAvatar.classList.add('has-image');
@@ -3442,7 +3446,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
           }}
         }}
         if (profileStats) {{
-          if (isGalleryList) {{
+          if (hasGalleryEntries) {{
             const galleryCount = galleryEntries.length;
             const postsTotal = galleryEntries.reduce((acc, item) => {{
               if (!item) return acc;
@@ -3462,7 +3466,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
             ].join('');
           }}
         }}
-        if (isGalleryList) {{
+        if (hasGalleryEntries) {{
           if (profileGrid) {{
             profileGrid.innerHTML = '';
             profileGrid.classList.add('hidden');
