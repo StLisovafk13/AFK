@@ -12,9 +12,9 @@
    ```bash
    pip install playwright aiohttp
    ```
-2. Один раз установите браузеры Playwright (необходимы для `playwright_scan_profile`):
+2. Один раз установите браузеры Playwright (для скриптов требуется Firefox):
    ```bash
-   playwright install
+   playwright install firefox
    ```
 
 ## 2. Сканирование профиля без скачивания медиа

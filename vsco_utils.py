@@ -476,8 +476,8 @@ async def playwright_scan_profile(
 
     try:
         async with async_playwright() as playwright:
-            _log("debug", "playwright_scan_profile: launching Chromium")
-            browser = await playwright.chromium.launch(headless=True)
+            _log("debug", "playwright_scan_profile: launching Firefox")
+            browser = await playwright.firefox.launch(headless=True)
             _log("debug", "playwright_scan_profile: creating new browser context")
             context = await browser.new_context()
             _log("debug", "playwright_scan_profile: creating new page")

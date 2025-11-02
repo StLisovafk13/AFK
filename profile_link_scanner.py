@@ -307,7 +307,7 @@ async def _collect_with_playwright(
     browser = context = page = None
     try:
         async with async_playwright() as playwright:
-            browser = await playwright.chromium.launch(headless=True)
+            browser = await playwright.firefox.launch(headless=True)
             context = await browser.new_context(extra_http_headers=headers)
             page = await context.new_page()
             try:
