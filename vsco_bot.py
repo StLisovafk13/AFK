@@ -2473,59 +2473,75 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
 # ---------------------- HTML builders (gallery/maps) ----------------------
 def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtitle=""):
     data_json = json.dumps(users, ensure_ascii=False)
+    safe_title = escape(title)
+    display_title = safe_title
+    if "VSCOLeak" in title:
+        display_title = safe_title.replace(
+            "VSCOLeak", 'VSCOLeak<span class="title-accent">💧</span>'
+        )
     html = f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset=\"utf-8\"/>
   <title>{escape(title)}</title>
   <style>
-    body {{ font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; margin:0; background:#f5f6f8; color:#111; }}
-    .wrap {{ max-width: 1400px; margin: 24px auto; padding: 0 16px; }}
-    h1 {{ margin: 0 0 4px 0; }}
-    .sub {{ color:#6b7280; margin-bottom: 16px; }}
+    body {{ font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; margin:0; background:#f5f6f8; color:#0f172a; }}
+    .wrap {{ max-width: 1280px; margin: 32px auto 48px; padding: 0 20px 48px; }}
+    .page-header {{ display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-end; gap:24px; margin-bottom:24px; }}
+    .page-title h1 {{ margin:0; font-size:36px; font-weight:700; letter-spacing:-0.03em; display:flex; align-items:center; gap:12px; color:#0f172a; }}
+    .page-title .title-accent {{ font-size:30px; line-height:1; display:inline-flex; align-items:center; }}
+    .sub {{ color:#6b7280; font-size:15px; margin-top:6px; }}
     .toolbar {{
       display:grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap:12px;
-      margin-bottom:16px;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap:18px 16px;
+      margin-bottom:28px;
       background:#fff;
-      padding:16px;
-      border-radius:16px;
-      box-shadow:0 1px 4px rgba(15,23,42,0.08);
+      padding:24px;
+      border-radius:24px;
+      box-shadow:0 24px 48px rgba(15,23,42,0.1);
     }}
-    .toolbar .field {{ display:flex; flex-direction:column; gap:6px; font-size:12px; color:#6b7280; }}
+    .toolbar .field {{ display:flex; flex-direction:column; gap:8px; font-size:12px; color:#64748b; }}
     .toolbar .field.inline {{ flex-direction:row; align-items:center; gap:8px; }}
-    .toolbar label {{ font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.08em; color:#6b7280; }}
-    .toolbar input,.toolbar select,.toolbar button {{ padding:8px 10px; border:1px solid #e5e7eb; border-radius:8px; background:#fff; font-size:13px; color:#111827; }}
+    .toolbar label {{ font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.12em; color:#94a3b8; }}
+    .toolbar input,.toolbar select,.toolbar button {{ padding:10px 12px; border:1px solid #d1d5db; border-radius:12px; background:#f9fafb; font-size:13px; color:#0f172a; transition:border-color .15s ease, box-shadow .15s ease; }}
+    .toolbar input:focus,.toolbar select:focus {{ border-color:#2563eb; box-shadow:0 0 0 3px rgba(37,99,235,0.15); outline:none; background:#fff; }}
     .toolbar input[type="number"] {{ font-variant-numeric: tabular-nums; }}
-    .toolbar .field--button {{ align-self:flex-end; display:flex; flex-direction:column; justify-content:flex-end; }}
-    .toolbar .field--button button {{ width:100%; font-weight:600; cursor:pointer; transition:background .15s ease, color .15s ease; }}
-    .toolbar .field--button.primary button {{ background:#111827; color:#fff; }}
-    .toolbar .field--button.primary button:hover {{ background:#1f2937; }}
-    .toolbar .field--button.secondary button {{ background:#f3f4f6; color:#111827; }}
-    .toolbar .field--button.secondary button:hover {{ background:#e5e7eb; }}
+    .toolbar .field--button {{ align-self:flex-end; display:flex; flex-direction:column; justify-content:flex-end; gap:8px; }}
+    .toolbar .field--button button {{ width:100%; font-weight:600; cursor:pointer; transition:background .15s ease, color .15s ease, transform .15s ease; border:none; border-radius:12px; padding:12px 14px; }}
+    .toolbar .field--button.primary button {{ background:#0f172a; color:#fff; }}
+    .toolbar .field--button.primary button:hover {{ background:#1f2937; transform:translateY(-1px); }}
+    .toolbar .field--button.secondary button {{ background:#e2e8f0; color:#0f172a; }}
+    .toolbar .field--button.secondary button:hover {{ background:#cbd5f5; transform:translateY(-1px); }}
     .chips {{ display:flex; flex-wrap:wrap; gap:6px; margin:6px 0; }}
     .chip {{ display:inline-flex; align-items:center; padding:4px 8px; border-radius:999px; font-size:11px; background:#f3f4f6; color:#374151; }}
     .chip-city {{ background:#dbeafe; color:#1d4ed8; }}
     .chip-data {{ background:#dcfce7; color:#047857; }}
     .chip-device {{ background:#ede9fe; color:#5b21b6; }}
     .meta.created {{ color:#4b5563; }}
-    .stats {{ color:#6b7280; margin: 6px 0 10px 0; }}
-    .grid {{ display:grid; grid-template-columns: repeat(auto-fill,minmax(300px,1fr)); gap:14px; }}
-    .card {{ background:#fff; border-radius:14px; padding:12px; box-shadow:0 1px 4px rgba(0,0,0,.06); }}
-    .card .head {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }}
-    .card .head .name a {{ font-weight:700; text-decoration:none; color:#111; }}
-    .btn {{ display:inline-block; padding:6px 10px; border-radius:10px; background:#10b981; color:#fff; text-decoration:none; font-weight:600; }}
+    .stats-card {{ min-width:240px; background:#fff; border-radius:20px; padding:16px 20px; box-shadow:0 22px 44px rgba(15,23,42,0.12); color:#0f172a; display:flex; align-items:center; gap:20px; font-variant-numeric:tabular-nums; flex-wrap:wrap; }}
+    .stats-card::before {{ content:\"📊\"; font-size:24px; }}
+    .stats-card span {{ display:flex; flex-direction:column; gap:2px; font-size:11px; letter-spacing:0.08em; text-transform:uppercase; color:#94a3b8; }}
+    .stats-card span .value {{ font-size:20px; font-weight:700; color:#0f172a; letter-spacing:0; text-transform:none; }}
+    .grid {{ display:grid; grid-template-columns: repeat(auto-fill,minmax(300px,1fr)); gap:20px; }}
+    .card {{ background:#fff; border-radius:24px; padding:20px; box-shadow:0 28px 54px rgba(15,23,42,0.12); border:1px solid #e2e8f0; display:flex; flex-direction:column; gap:12px; }}
+    .card .head {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }}
+    .card .head .name a {{ font-weight:700; text-decoration:none; color:#0f172a; font-size:18px; }}
+    .btn {{ display:inline-block; padding:8px 14px; border-radius:999px; background:#14b8a6; color:#fff; text-decoration:none; font-weight:600; letter-spacing:0.02em; box-shadow:0 10px 20px rgba(20,184,166,0.25); transition:transform .15s ease, box-shadow .15s ease; }}
+    .btn:hover {{ transform:translateY(-1px); box-shadow:0 14px 26px rgba(20,184,166,0.3); }}
     .btn:visited {{ color:#fff; }}
-    .btn-secondary {{ display:inline-flex; align-items:center; justify-content:center; padding:6px 12px; border-radius:10px; background:#111827; color:#fff; text-decoration:none; font-weight:600; border:none; cursor:pointer; transition:background .15s ease; }}
-    .btn-secondary:hover {{ background:#374151; }}
-    .card .actions {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }}
-    .meta {{ font-size:12px; color:#6b7280; margin:4px 0 8px 0; }}
-    .meta.added {{ color:#4b5563; margin-top:2px; }}
-    .thumbs {{ display:flex; gap:6px; overflow:hidden; }}
-    .thumbs img {{ width:72px; height:120px; object-fit:cover; border-radius:8px; border:1px solid #eee; }}
-    .cm {{ margin-top:10px; font-size:13px; }}
-    .cm ul {{ margin: 0 0 4px 18px; padding:0; }}
+    .btn-secondary {{ display:inline-flex; align-items:center; justify-content:center; padding:10px 16px; border-radius:12px; background:#0f172a; color:#fff; text-decoration:none; font-weight:600; border:none; cursor:pointer; transition:background .15s ease, transform .15s ease; }}
+    .btn-secondary:hover {{ background:#1f2937; transform:translateY(-1px); }}
+    .card .actions {{ display:flex; flex-wrap:wrap; gap:12px; margin-top:4px; }}
+    .meta {{ font-size:13px; color:#64748b; margin:2px 0; }}
+    .meta.added {{ color:#475569; margin-top:2px; }}
+    .card-stats {{ display:flex; flex-wrap:wrap; gap:10px; margin:2px 0 4px; }}
+    .card-stats span {{ display:inline-flex; align-items:center; gap:6px; font-weight:600; color:#0f172a; background:#e2e8f0; padding:4px 10px; border-radius:999px; font-size:12px; }}
+    .card-stats span:last-child {{ background:#dbeafe; color:#1d4ed8; }}
+    .thumbs {{ display:flex; gap:10px; overflow:hidden; }}
+    .thumbs img {{ width:80px; height:128px; object-fit:cover; border-radius:12px; border:1px solid #e2e8f0; background:#f8fafc; }}
+    .cm {{ margin-top:8px; font-size:13px; color:#475569; }}
+    .cm ul {{ margin: 0 0 6px 18px; padding:0; }}
     .cm .empty {{ color:#9ca3af; font-size:12px; }}
     .cm .more {{ color:#6b7280; font-size:12px; }}
     .hidden {{ display:none !important; }}
@@ -2579,17 +2595,18 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
 </head>
 <body>
   <div class=\"wrap\" id=\"galleryView\">
-    <h1>🎯 {escape(title)}</h1>
-    <div class=\"sub\">{escape(subtitle)}</div>
+    <div class=\"page-header\">
+      <div class=\"page-title\">
+        <h1>{display_title}</h1>
+        <div class=\"sub\">{escape(subtitle)}</div>
+      </div>
+      <div class=\"stats-card\" id=\"stats\"></div>
+    </div>
 
     <div class=\"toolbar\">
       <div class=\"field\">
         <label for=\"q\">Поиск</label>
         <input id=\"q\" placeholder=\"Username, города, комментарии\" />
-      </div>
-      <div class=\"field\">
-        <label for=\"datasetSelect\">Данные</label>
-        <select id=\"datasetSelect\"></select>
       </div>
       <div class=\"field\">
         <label for=\"cityInput\">Город</label>
@@ -2641,7 +2658,6 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       </div>
     </div>
 
-    <div class=\"stats\" id=\"stats\"></div>
     <div class=\"grid\" id=\"grid\"></div>
   </div>
 
@@ -2697,7 +2713,6 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     const profileEmpty = document.getElementById('profileEmpty');
 
     const searchInput = document.getElementById('q');
-    const datasetSelect = document.getElementById('datasetSelect');
     const cityInput = document.getElementById('cityInput');
     const cityDatalist = document.getElementById('cityOptionsList');
     const commentInput = document.getElementById('commentInput');
@@ -2829,7 +2844,6 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       return nameA.localeCompare(nameB, undefined, {{ sensitivity: 'accent' }});
     }}
 
-    const datasetOptions = {{}};
     const cityOptions = {{}};
     const cityLookup = {{}};
     const addedOptions = {{}};
@@ -2842,11 +2856,6 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       u._commentText = comments.map(c => ('' + c).toLowerCase()).join(' ');
       const datasetList = parseDatasetList(u.datasets);
       u._datasetList = datasetList;
-      datasetList.forEach(ds => {{
-        if (ds.value && !datasetOptions[ds.value]) {{
-          datasetOptions[ds.value] = ds.label || ds.value;
-        }}
-      }});
       const citiesRaw = Array.isArray(u.cities) ? u.cities : [];
       const preparedCities = [];
       citiesRaw.forEach(city => {{
@@ -2925,8 +2934,6 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
       }}
       u._createdRangeLabel = rangeLabel;
     }});
-
-    fillSelectOptions(datasetSelect, 'Все данные', datasetOptions);
     fillDatalistOptions(cityDatalist, cityOptions);
     fillSelectOptions(addedSelect, 'Все добавившие', addedOptions);
 
@@ -3360,6 +3367,11 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         }});
         const chipsHtml = chipParts.length ? '<div class="chips">' + chipParts.join('') + '</div>' : '';
         const createdHtml = u._createdRangeLabel ? '<div class="meta created">Добавлено: ' + escapeHtml(u._createdRangeLabel) + '</div>' : '';
+        const metaPieces = [];
+        if (latStr) metaPieces.push('<span>📍 ' + escapeHtml(latStr) + '</span>');
+        metaPieces.push('<span>🖼️ ' + imageCount + '</span>');
+        metaPieces.push('<span>💬 ' + commentCount + '</span>');
+        const statsHtml = '<div class="card-stats">' + metaPieces.join('') + '</div>';
         const card = document.createElement('div');
         card.className = 'card';
         card.dataset.username = u.username || '';
@@ -3371,7 +3383,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
             <div class="name"><a href="${{safeProfileUrl}}" target="_blank">${{displayName}}</a></div>
             <a class="btn" href="${{safeProfileUrl}}" target="_blank">View Profile</a>
           </div>
-          <div class="meta">${{latStr ? latStr + ' • ' : ''}}${{imageCount}} item(s) • ${{commentCount}} comment(s)</div>
+          ${{statsHtml}}
           ${{createdHtml}}
           ${{chipsHtml}}
           <div class="meta added">Добавил: ${{addedBy || '—'}}</div>
@@ -3391,13 +3403,11 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
         }}
         gridEl.appendChild(card);
       }});
-      statsEl.textContent = `Users: ${{list.length}} • Entries: ${{entries}}`;
+      statsEl.innerHTML = `<span><span class=\"value\">${{list.length}}</span><span>Users</span></span><span><span class=\"value\">${{entries}}</span><span>Entries</span></span>`;
     }}
 
     function apply() {{
       const q = searchInput ? searchInput.value.trim().toLowerCase() : '';
-      const datasetValue = datasetSelect ? datasetSelect.value : '';
-      const datasetLower = datasetValue ? datasetValue.toLowerCase() : '';
       const cityRaw = cityInput ? cityInput.value.trim() : '';
       const cityLower = cityRaw.toLowerCase();
       const hasExactCity = cityLower && Object.prototype.hasOwnProperty.call(cityLookup, cityLower);
@@ -3410,11 +3420,6 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
 
       const list = DATA.filter(u => {{
         if (q && (!u._searchText || u._searchText.indexOf(q) === -1)) return false;
-        if (datasetLower) {{
-          const dsList = u._datasetList || [];
-          const datasetMatch = dsList.some(ds => ds.valueLower === datasetLower || ds.labelLower === datasetLower);
-          if (!datasetMatch) return false;
-        }}
         if (cityLower) {{
           if (hasExactCity) {{
             const matchCity = (u._cityList || []).some(entry => entry.lower === cityLower);
@@ -3441,7 +3446,6 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
 
     function reset() {{
       if (searchInput) searchInput.value='';
-      if (datasetSelect) datasetSelect.value='';
       if (cityInput) cityInput.value='';
       if (commentInput) commentInput.value='';
       if (hasCommentsSelect) hasCommentsSelect.value='';
@@ -3460,7 +3464,7 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
     if (cityInput) cityInput.addEventListener('input', debouncedApply);
     if (commentInput) commentInput.addEventListener('input', debouncedApply);
 
-    [datasetSelect, hasCommentsSelect, addedSelect, sortSelect].forEach(el => {{
+    [hasCommentsSelect, addedSelect, sortSelect].forEach(el => {{
       if (el) el.addEventListener('change', apply);
     }});
     if (dateFromInput) dateFromInput.addEventListener('change', apply);
