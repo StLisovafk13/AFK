@@ -239,7 +239,7 @@ class ExportManager:
         await cq.answer("Готовлю экспорт…", cache_time=0)
         html = self._deps.build_rich_gallery(
             users,
-            title="VSCO Gallery",
+            title="VSCOLeak",
             subtitle=("All DB" if session.export_scope == "all" else "Current Chat"),
         )
         output = session.dir / f"export_gallery_{session.export_scope}.html"
