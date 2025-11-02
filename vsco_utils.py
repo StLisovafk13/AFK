@@ -460,6 +460,15 @@ async def playwright_scan_profile(
 
     browser = context = page = None
 
+    def _log(level: str, message: str, *args: object) -> None:
+        if logger is None:
+            return
+        log_method = getattr(logger, level, None)
+        if log_method is not None:
+            log_method(message, *args)
+
+    _log("debug", "playwright_scan_profile: preparing to open %s", gallery_url)
+
     async def _extract_current_urls() -> list[str]:
         html = await page.content()
         root = getattr(page, "url", None) or gallery_url
@@ -467,10 +476,19 @@ async def playwright_scan_profile(
 
     try:
         async with async_playwright() as playwright:
+            _log("debug", "playwright_scan_profile: launching Chromium")
             browser = await playwright.chromium.launch(headless=True)
+            _log("debug", "playwright_scan_profile: creating new browser context")
             context = await browser.new_context()
+            _log("debug", "playwright_scan_profile: creating new page")
             page = await context.new_page()
+            _log("info", "playwright_scan_profile: navigating to %s", gallery_url)
             await page.goto(gallery_url, wait_until="networkidle")
+            _log(
+                "debug",
+                "playwright_scan_profile: navigation finished, current URL %s",
+                getattr(page, "url", None),
+            )
 
             urls = dedupe_keep_order(await _extract_current_urls())
             if logger is not None and urls:
@@ -484,7 +502,7 @@ async def playwright_scan_profile(
             stagnation = 0
             prev_count = len(urls)
 
-            for _ in range(max_scrolls):
+            for scroll_idx in range(max_scrolls):
                 btn = page.locator("#loadMore-Button").first
                 try:
                     btn_count = await btn.count()
@@ -502,6 +520,19 @@ async def playwright_scan_profile(
                     btn_exists = btn_visible = False
                     btn_disabled = True
 
+                _log(
+                    "debug",
+                    (
+                        "playwright_scan_profile: scroll %d - btn_exists=%s "
+                        "btn_visible=%s btn_disabled=%s load_clicks=%d"
+                    ),
+                    scroll_idx,
+                    btn_exists,
+                    btn_visible,
+                    btn_disabled,
+                    load_clicks,
+                )
+
                 clicked = False
                 if (
                     btn_exists
@@ -511,36 +542,76 @@ async def playwright_scan_profile(
                 ):
                     try:
                         await btn.scroll_into_view_if_needed()
+                        _log(
+                            "debug",
+                            "playwright_scan_profile: button scrolled into view",
+                        )
                     except Exception:
                         pass
                     try:
+                        _log(
+                            "debug",
+                            "playwright_scan_profile: attempting to click load more",
+                        )
                         await btn.click()
                         load_clicks += 1
                         clicked = True
+                        _log(
+                            "debug",
+                            "playwright_scan_profile: load more clicked (%d)",
+                            load_clicks,
+                        )
                         try:
                             await page.wait_for_load_state("networkidle", timeout=2000)
+                            _log(
+                                "debug",
+                                "playwright_scan_profile: network idle after click",
+                            )
                         except Exception:
                             await page.wait_for_timeout(int(max(0.1, delay) * 1000))
-                    except Exception as exc:
-                        if logger is not None:
-                            logger.debug(
-                                "playwright_scan_profile: load more click failed: %s",
-                                exc,
+                            _log(
+                                "debug",
+                                "playwright_scan_profile: network idle timeout, "
+                                "waited for %.2f seconds",
+                                max(0.1, delay),
                             )
+                    except Exception as exc:
+                        _log(
+                            "warning",
+                            "playwright_scan_profile: load more click failed: %s",
+                            exc,
+                        )
 
                 await page.evaluate(
                     "() => { window.scrollBy(0, Math.floor(window.innerHeight * 0.9)); }"
                 )
                 await page.wait_for_timeout(int(max(0.1, delay) * 1000))
+                _log(
+                    "debug",
+                    "playwright_scan_profile: performed scroll %d and waited %.2f seconds",
+                    scroll_idx,
+                    max(0.1, delay),
+                )
 
                 extracted = dedupe_keep_order(await _extract_current_urls())
                 combined = dedupe_keep_order(urls + extracted)
                 new_count = len(combined)
                 if logger is not None and new_count > prev_count:
                     logger.info("playwright_scan_profile: progress %d", new_count)
+                elif logger is not None:
+                    logger.debug(
+                        "playwright_scan_profile: no new assets after scroll %d (total %d)",
+                        scroll_idx,
+                        new_count,
+                    )
                 urls = combined
 
                 if target_count and new_count >= target_count:
+                    _log(
+                        "info",
+                        "playwright_scan_profile: reached target %d assets",
+                        target_count,
+                    )
                     break
 
                 if new_count > prev_count:
@@ -552,8 +623,20 @@ async def playwright_scan_profile(
                 if (not btn_exists or not btn_visible or btn_disabled) and stagnation >= stagnation_limit:
                     break
                 if clicked and stagnation >= no_growth_click_limit:
+                    _log(
+                        "debug",
+                        "playwright_scan_profile: stopping after %d scrolls due to "
+                        "no growth post-click",
+                        scroll_idx + 1,
+                    )
                     break
                 if not clicked and stagnation >= stagnation_limit:
+                    _log(
+                        "debug",
+                        "playwright_scan_profile: stopping after %d scrolls due to "
+                        "stagnation",
+                        scroll_idx + 1,
+                    )
                     break
 
             return urls
@@ -567,6 +650,11 @@ async def playwright_scan_profile(
         for handle in (page, context, browser):
             if handle is None:
                 continue
+            _log(
+                "debug",
+                "playwright_scan_profile: closing %s",
+                handle.__class__.__name__,
+            )
             try:
                 await handle.close()  # type: ignore[func-returns-value]
             except Exception:  # pragma: no cover - cleanup best-effort
