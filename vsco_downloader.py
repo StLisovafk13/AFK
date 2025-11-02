@@ -24,7 +24,7 @@ Usage:
 Requirements:
   Python 3.10+
   pip install playwright beautifulsoup4
-  python -m playwright install chromium
+  python -m playwright install firefox
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ def validate_environment(logger: logging.Logger) -> bool:
         import playwright  # noqa
         from playwright.async_api import async_playwright  # noqa
     except Exception as e:
-        ok = False; short_fail(logger, f"Playwright не найден: {e}. Установите: pip install playwright && python -m playwright install chromium")
+        ok = False; short_fail(logger, f"Playwright не найден: {e}. Установите: pip install playwright && python -m playwright install firefox")
     try:
         import bs4  # noqa
     except Exception as e:
@@ -573,7 +573,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
     logger.info("== Этап 2–3: Доступ к профилю, сбор URL, Load More + скролл ==")
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
+        browser = await pw.firefox.launch(headless=True)
         context = await browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
