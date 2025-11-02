@@ -2471,7 +2471,7 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     return out
 
 # ---------------------- HTML builders (gallery/maps) ----------------------
-def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtitle=""):
+def build_rich_gallery(users: List[Dict[str, Any]], title="VSCOLeak", subtitle=""):
     data_json = json.dumps(users, ensure_ascii=False)
     safe_title = escape(title)
     display_title = safe_title
@@ -2487,10 +2487,11 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCO Gallery", subtit
   <style>
     body {{ font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; margin:0; background:#f5f6f8; color:#0f172a; }}
     .wrap {{ max-width: 1280px; margin: 32px auto 48px; padding: 0 20px 48px; }}
-    .page-header {{ display:flex; flex-wrap:wrap; justify-content:space-between; align-items:flex-end; gap:24px; margin-bottom:24px; }}
-    .page-title h1 {{ margin:0; font-size:36px; font-weight:700; letter-spacing:-0.03em; display:flex; align-items:center; gap:12px; color:#0f172a; }}
+    .page-header {{ display:flex; flex-direction:column; align-items:center; gap:20px; margin-bottom:24px; text-align:center; }}
+    .page-title {{ display:flex; flex-direction:column; align-items:center; gap:8px; }}
+    .page-title h1 {{ margin:0; font-size:36px; font-weight:700; letter-spacing:-0.03em; display:flex; align-items:center; justify-content:center; gap:12px; color:#0f172a; }}
     .page-title .title-accent {{ font-size:30px; line-height:1; display:inline-flex; align-items:center; }}
-    .sub {{ color:#6b7280; font-size:15px; margin-top:6px; }}
+    .sub {{ color:#6b7280; font-size:15px; }}
     .toolbar {{
       display:grid;
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
