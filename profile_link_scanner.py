@@ -645,6 +645,9 @@ async def _async_main(args: argparse.Namespace) -> ScanResult:
         profile_tabs = []
         media_by_tab = None
 
+    LOGGER.info(
+        "Начинаем сохранение ссылок профиля: %d элементов", len(media_urls)
+    )
     result = store_profile_media(
         args.db,
         args.chat_id,
