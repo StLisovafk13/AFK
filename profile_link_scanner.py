@@ -750,10 +750,19 @@ def populate_media_metadata(
                 payload = json.dumps(metadata, ensure_ascii=False)
             except (TypeError, ValueError):
                 payload = json.dumps({"raw": str(metadata)}, ensure_ascii=False)
-            conn.execute(
-                "UPDATE items SET meta_json=? WHERE id=?",
-                (payload, item_id),
-            )
-        conn.commit()
+            try:
+                conn.execute(
+                    "UPDATE items SET meta_json=? WHERE id=?",
+                    (payload, item_id),
+                )
+                conn.commit()
+            except sqlite3.OperationalError as exc:
+                conn.rollback()
+                LOGGER.warning(
+                    "Не удалось обновить метаданные для %s (id=%s): %s",
+                    url,
+                    item_id,
+                    exc,
+                )
     finally:
         conn.close()
