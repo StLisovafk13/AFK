@@ -107,6 +107,7 @@ from profile_link_scanner import (
     ProfileMediaCollection,
     ScanResult,
     collect_profile_media,
+    populate_media_metadata,
     store_profile_media,
 )
 
@@ -140,6 +141,14 @@ REQUIRED_GROUP_LABEL = os.getenv("BOT_REQUIRED_GROUP_LABEL", "").strip()
 REQUIRED_CHANNEL_LINK = os.getenv("BOT_REQUIRED_CHANNEL_LINK", "").strip()
 REQUIRED_GROUP_LINK = os.getenv("BOT_REQUIRED_GROUP_LINK", "").strip()
 MEDIA_PAGE_MAX_WIDTH = int(os.getenv("BOT_MEDIA_SCAN_MAX_WIDTH", "2048") or "2048")
+PROFILE_SCAN_WORKERS = max(
+    1,
+    int(os.getenv("BOT_PROFILE_SCAN_WORKERS", "2") or "2"),
+)
+META_FETCH_WORKERS = max(
+    1,
+    int(os.getenv("BOT_META_FETCH_WORKERS", "2") or "2"),
+)
 
 
 def _parse_admin_ids(raw: str) -> set[int]:
@@ -5106,8 +5115,11 @@ _DL_COUNTER = 0  # монотонный ID джоб
 _CURRENT_JOB: Dict[str, Any] | None = None
 
 _PROFILE_SCAN_QUEUE: asyncio.Queue | None = None
-_PROFILE_SCAN_TASK: asyncio.Task | None = None
+_PROFILE_SCAN_TASKS: list[asyncio.Task] = []
 _PROFILE_SCAN_PENDING: set[tuple[int, str]] = set()
+
+_META_UPDATE_QUEUE: asyncio.Queue | None = None
+_META_WORKER_TASKS: list[asyncio.Task] = []
 
 
 async def _enqueue_download_request(
@@ -5203,6 +5215,13 @@ class ProfileScanJob:
     added_by: str = ""
 
 
+@dataclass
+class MetadataJob:
+    items: list[tuple[int, str]]
+    username: str
+    profile_url: str
+
+
 async def _enqueue_profile_scan(job: ProfileScanJob) -> bool:
     normalized_url = normalize_vsco_profile_url(job.profile_url) or job.profile_url
     username = (job.username or "").lstrip("@")
@@ -5236,18 +5255,28 @@ async def _enqueue_profile_scan(job: ProfileScanJob) -> bool:
     return True
 
 
-async def _profile_scan_worker() -> None:
+async def _enqueue_metadata_job(job: MetadataJob) -> None:
+    if not job.items:
+        return
+    global _META_UPDATE_QUEUE
+    if _META_UPDATE_QUEUE is None:
+        _META_UPDATE_QUEUE = asyncio.Queue()
+    await _META_UPDATE_QUEUE.put(job)
+
+
+async def _profile_scan_worker(worker_id: int) -> None:
     global _PROFILE_SCAN_QUEUE
     if _PROFILE_SCAN_QUEUE is None:
         _PROFILE_SCAN_QUEUE = asyncio.Queue()
 
-    log.info("Profile scan worker started")
+    log.info("Profile scan worker #%s started", worker_id)
     while True:
         job: ProfileScanJob = await _PROFILE_SCAN_QUEUE.get()
         key = (job.chat_id, job.profile_url.lower())
         try:
             log.info(
-                "Profile scan worker: start chat_id=%s profile_url=%s",
+                "Profile scan worker #%s: start chat_id=%s profile_url=%s",
+                worker_id,
                 job.chat_id,
                 job.profile_url,
             )
@@ -5275,6 +5304,14 @@ async def _profile_scan_worker() -> None:
                 profile_tabs=profile_tabs,
                 media_by_tab=media_by_tab,
             )
+            if result.metadata_targets:
+                await _enqueue_metadata_job(
+                    MetadataJob(
+                        items=result.metadata_targets,
+                        username=job.username,
+                        profile_url=job.profile_url,
+                    )
+                )
             if result.added_items > 0 or not result.media_urls:
                 total = len(result.media_urls)
                 text = (
@@ -5290,11 +5327,12 @@ async def _profile_scan_worker() -> None:
                         parse_mode="HTML",
                     )
         except asyncio.CancelledError:
-            log.info("Profile scan worker cancelled")
+            log.info("Profile scan worker #%s cancelled", worker_id)
             raise
         except Exception:
             log.exception(
-                "Profile scan worker failed for chat_id=%s profile_url=%s",
+                "Profile scan worker #%s failed for chat_id=%s profile_url=%s",
+                worker_id,
                 job.chat_id,
                 job.profile_url,
             )
@@ -5311,6 +5349,36 @@ async def _profile_scan_worker() -> None:
             _PROFILE_SCAN_PENDING.discard(key)
             if _PROFILE_SCAN_QUEUE is not None:
                 _PROFILE_SCAN_QUEUE.task_done()
+
+
+async def _metadata_worker(worker_id: int) -> None:
+    global _META_UPDATE_QUEUE
+    if _META_UPDATE_QUEUE is None:
+        _META_UPDATE_QUEUE = asyncio.Queue()
+
+    log.info("Metadata worker #%s started", worker_id)
+    while True:
+        job: MetadataJob = await _META_UPDATE_QUEUE.get()
+        try:
+            if job.items:
+                await asyncio.to_thread(
+                    populate_media_metadata,
+                    Path(DB_PATH),
+                    job.items,
+                )
+        except asyncio.CancelledError:
+            log.info("Metadata worker #%s cancelled", worker_id)
+            raise
+        except Exception:
+            log.exception(
+                "Metadata worker #%s failed for profile %s",
+                worker_id,
+                job.profile_url,
+            )
+        finally:
+            if _META_UPDATE_QUEUE is not None:
+                _META_UPDATE_QUEUE.task_done()
+
 
 def _dl_script_path() -> Path:
     # vsco_downloader.py должен лежать рядом с текущим файлом
@@ -6395,23 +6463,38 @@ async def main():
     if _DL_WORKER_TASK is None or _DL_WORKER_TASK.done():
         _DL_WORKER_TASK = asyncio.create_task(_dl_worker())
     # -----------------------------
-    global _PROFILE_SCAN_TASK, _PROFILE_SCAN_QUEUE
+    global _PROFILE_SCAN_TASKS, _PROFILE_SCAN_QUEUE
     if _PROFILE_SCAN_QUEUE is None:
         _PROFILE_SCAN_QUEUE = asyncio.Queue()
-    if _PROFILE_SCAN_TASK is None or _PROFILE_SCAN_TASK.done():
-        _PROFILE_SCAN_TASK = asyncio.create_task(_profile_scan_worker())
+    _PROFILE_SCAN_TASKS = [task for task in _PROFILE_SCAN_TASKS if not task.done()]
+    current_workers = len(_PROFILE_SCAN_TASKS)
+    for idx in range(current_workers, PROFILE_SCAN_WORKERS):
+        task = asyncio.create_task(_profile_scan_worker(idx + 1))
+        _PROFILE_SCAN_TASKS.append(task)
+    global _META_UPDATE_QUEUE, _META_WORKER_TASKS
+    if _META_UPDATE_QUEUE is None:
+        _META_UPDATE_QUEUE = asyncio.Queue()
+    _META_WORKER_TASKS = [task for task in _META_WORKER_TASKS if not task.done()]
+    current_meta = len(_META_WORKER_TASKS)
+    for idx in range(current_meta, META_FETCH_WORKERS):
+        task = asyncio.create_task(_metadata_worker(idx + 1))
+        _META_WORKER_TASKS.append(task)
     log.info("Bot is starting polling…")
     try:
         await _start_polling_with_retries()
     finally:
-        if _PROFILE_SCAN_TASK:
-            _PROFILE_SCAN_TASK.cancel()
+        for task in list(_PROFILE_SCAN_TASKS):
+            task.cancel()
             with contextlib.suppress(Exception):
-                await _PROFILE_SCAN_TASK
+                await task
         if _DL_WORKER_TASK:
             _DL_WORKER_TASK.cancel()
             with contextlib.suppress(Exception):
                 await _DL_WORKER_TASK
+        for task in list(_META_WORKER_TASKS):
+            task.cancel()
+            with contextlib.suppress(Exception):
+                await task
         with contextlib.suppress(Exception):
             await bot.session.close()
 if __name__ == "__main__":
