@@ -58,6 +58,7 @@ class ScanResult:
     link_added: bool = False
     profile_tabs: list[dict[str, str]] = field(default_factory=list)
     media_by_tab: dict[str, list[str]] = field(default_factory=dict)
+    metadata_targets: list[tuple[int, str]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -361,58 +362,98 @@ async def collect_profile_media(
     if headers:
         session_headers.update(headers)
 
-    urls, html = await _collect_with_playwright(
-        profile_url,
-        headers=session_headers,
-        max_width=max_width,
-        delay=delay,
-        target_count=target_count,
-    )
-
     normalized_profile_url = _normalize_tab_url(profile_url)
-    aggregated_urls = dedupe_keep_order(urls)
+    aggregated_urls: list[str] = []
     media_by_tab: dict[str, list[str]] = {}
-    if aggregated_urls:
-        media_by_tab[normalized_profile_url] = aggregated_urls
+    tabs: Sequence[Dict[str, Any]] | None = None
 
-    tabs = extract_profile_tab_links(html, root=profile_url)
+    seen_tab_urls: set[str] = set()
 
-    async with aiohttp.ClientSession(headers=session_headers) as session:
-        if not aggregated_urls:
-            urls, html = await scan_profile_media(
-                session,
-                profile_url,
-                max_width=max_width,
-                logger=LOGGER,
-            )
-            aggregated_urls = dedupe_keep_order(urls)
-            if aggregated_urls:
-                media_by_tab[normalized_profile_url] = aggregated_urls
-            if not tabs:
-                tabs = extract_profile_tab_links(html, root=profile_url)
+    def _store_tab_media(tab_url: str, urls_for_tab: Iterable[str]) -> None:
+        nonlocal aggregated_urls
+        normalized_tab_url = _normalize_tab_url(tab_url)
+        if not normalized_tab_url:
+            return
+        cleaned = dedupe_keep_order(urls_for_tab)
+        media_by_tab[normalized_tab_url] = cleaned
+        if cleaned:
+            seen_tab_urls.add(normalized_tab_url)
+            aggregated_urls = dedupe_keep_order(aggregated_urls + cleaned)
 
-        # Collect media from secondary tabs (e.g. /galleries, /spaces, ...)
-        tab_urls_to_fetch: list[str] = []
-        seen_tab_urls: set[str] = set(media_by_tab.keys())
-        for tab in tabs:
-            href = tab.get("href") or ""
-            normalized_href = _normalize_tab_url(href)
-            if not normalized_href or normalized_href in seen_tab_urls:
-                continue
-            seen_tab_urls.add(normalized_href)
-            tab_urls_to_fetch.append(normalized_href)
+    session: aiohttp.ClientSession | None = None
+    try:
+        session = aiohttp.ClientSession(headers=session_headers)
+        urls, html = await scan_profile_media(
+            session,
+            profile_url,
+            max_width=max_width,
+            logger=LOGGER,
+        )
+        aggregated_urls = dedupe_keep_order(urls)
+        if aggregated_urls:
+            _store_tab_media(normalized_profile_url, aggregated_urls)
+        tabs = extract_profile_tab_links(html, root=profile_url)
 
-        for tab_url in tab_urls_to_fetch:
-            tab_media, _ = await scan_profile_media(
-                session,
-                tab_url,
-                max_width=max_width,
-                logger=LOGGER,
-            )
-            cleaned = dedupe_keep_order(tab_media)
-            media_by_tab[tab_url] = cleaned
-            if cleaned:
-                aggregated_urls = dedupe_keep_order(aggregated_urls + cleaned)
+        if tabs:
+            for tab in tabs:
+                href = tab.get("href") or ""
+                normalized_href = _normalize_tab_url(href)
+                if (
+                    not normalized_href
+                    or normalized_href in seen_tab_urls
+                    or normalized_href == normalized_profile_url
+                ):
+                    continue
+                seen_tab_urls.add(normalized_href)
+                tab_media, _ = await scan_profile_media(
+                    session,
+                    normalized_href,
+                    max_width=max_width,
+                    logger=LOGGER,
+                )
+                cleaned = dedupe_keep_order(tab_media)
+                media_by_tab[normalized_href] = cleaned
+                if cleaned:
+                    aggregated_urls = dedupe_keep_order(aggregated_urls + cleaned)
+    finally:
+        if session is not None:
+            await session.close()
+
+    if not aggregated_urls:
+        urls, html = await _collect_with_playwright(
+            profile_url,
+            headers=session_headers,
+            max_width=max_width,
+            delay=delay,
+            target_count=target_count,
+        )
+        aggregated_urls = dedupe_keep_order(urls)
+        if aggregated_urls:
+            _store_tab_media(normalized_profile_url, aggregated_urls)
+        if not tabs:
+            tabs = extract_profile_tab_links(html, root=profile_url)
+        if tabs:
+            async with aiohttp.ClientSession(headers=session_headers) as session_retry:
+                for tab in tabs:
+                    href = tab.get("href") or ""
+                    normalized_href = _normalize_tab_url(href)
+                    if (
+                        not normalized_href
+                        or normalized_href in seen_tab_urls
+                        or normalized_href == normalized_profile_url
+                    ):
+                        continue
+                    seen_tab_urls.add(normalized_href)
+                    tab_media, _ = await scan_profile_media(
+                        session_retry,
+                        normalized_href,
+                        max_width=max_width,
+                        logger=LOGGER,
+                    )
+                    cleaned = dedupe_keep_order(tab_media)
+                    media_by_tab[normalized_href] = cleaned
+                    if cleaned:
+                        aggregated_urls = dedupe_keep_order(aggregated_urls + cleaned)
 
     if not aggregated_urls:
         LOGGER.warning("Не удалось получить ссылки медиа для %s", profile_url)
@@ -526,16 +567,15 @@ def store_profile_media(
         media_urls=list(media_urls),
         profile_tabs=sanitized_tabs,
         media_by_tab=normalized_media_by_tab.copy(),
+        metadata_targets=[],
     )
     if not normalized_media_by_tab:
         return result
 
-    if meta_fetcher is None:
-        meta_fetcher = extract_exif_from_url
-
     conn = connect_db(db_path)
     try:
         added_items = 0
+        new_items_for_meta: list[tuple[int, str]] = []
         for tab_url, urls_for_tab in normalized_media_by_tab.items():
             prepared = _prepare_urls(urls_for_tab, max_width=2048)
             if not prepared:
@@ -565,23 +605,9 @@ def store_profile_media(
                 )
                 if cur.rowcount > 0:
                     added_items += 1
-                    if meta_fetcher is not None:
-                        try:
-                            metadata = meta_fetcher(url)
-                        except Exception as exc:  # pragma: no cover - best effort metadata
-                            LOGGER.debug("Не удалось получить EXIF для %s: %s", url, exc)
-                            metadata = None
-                        if metadata:
-                            try:
-                                payload = json.dumps(metadata, ensure_ascii=False)
-                            except (TypeError, ValueError):
-                                payload = json.dumps({"raw": str(metadata)}, ensure_ascii=False)
-                            item_id = cur.lastrowid
-                            if item_id:
-                                conn.execute(
-                                    "UPDATE items SET meta_json=? WHERE id=?",
-                                    (payload, item_id),
-                                )
+                    item_id = cur.lastrowid
+                    if item_id:
+                        new_items_for_meta.append((item_id, url))
         conn.execute(
             "INSERT OR IGNORE INTO links(chat_id,username,url,created_at) VALUES(?,?,?,?)",
             (chat_id, username, profile_url, utc_now_iso()),
@@ -601,7 +627,15 @@ def store_profile_media(
     finally:
         result.added_items = added_items
         result.link_added = added_items > 0
+        result.metadata_targets = new_items_for_meta
         conn.close()
+
+    if meta_fetcher is not None and result.metadata_targets:
+        populate_media_metadata(
+            db_path,
+            result.metadata_targets,
+            meta_fetcher=meta_fetcher,
+        )
 
     return result
 
@@ -683,3 +717,52 @@ def main() -> None:
 
 if __name__ == "__main__":  # pragma: no cover - CLI entry point
     main()
+def populate_media_metadata(
+    db_path: Path,
+    items: Sequence[tuple[int, str]],
+    *,
+    meta_fetcher: Callable[[str], Dict[str, Any]] = extract_exif_from_url,
+) -> None:
+    """Populate ``items.meta_json`` for the provided IDs using ``meta_fetcher``.
+
+    This helper is intended to be called after ``store_profile_media`` commits its
+    inserts, so the potentially slow EXIF extraction no longer blocks the main
+    transaction. Callers may run it in a background task or sequentially when
+    operating in a CLI context.
+    """
+
+    if not items:
+        return
+
+    conn = connect_db(db_path)
+    try:
+        for item_id, url in items:
+            if not item_id:
+                continue
+            try:
+                metadata = meta_fetcher(url)
+            except Exception as exc:  # pragma: no cover - best effort metadata
+                LOGGER.debug("Не удалось получить EXIF для %s: %s", url, exc)
+                continue
+            if not metadata:
+                continue
+            try:
+                payload = json.dumps(metadata, ensure_ascii=False)
+            except (TypeError, ValueError):
+                payload = json.dumps({"raw": str(metadata)}, ensure_ascii=False)
+            try:
+                conn.execute(
+                    "UPDATE items SET meta_json=? WHERE id=?",
+                    (payload, item_id),
+                )
+                conn.commit()
+            except sqlite3.OperationalError as exc:
+                conn.rollback()
+                LOGGER.warning(
+                    "Не удалось обновить метаданные для %s (id=%s): %s",
+                    url,
+                    item_id,
+                    exc,
+                )
+    finally:
+        conn.close()

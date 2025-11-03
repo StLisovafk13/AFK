@@ -65,6 +65,7 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
         "https://images.example.com/media1.jpg",
         "https://images.example.com/media2.jpg",
     ]
+    assert len(result.metadata_targets) == 3
 
     second = store_profile_media(
         db_path,
@@ -89,6 +90,7 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
     )
     assert second.added_items == 2
     assert second.link_added is True
+    assert len(second.metadata_targets) == 2
 
     conn = sqlite3.connect(db_path)
     try:
