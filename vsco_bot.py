@@ -4877,27 +4877,112 @@ async def on_text(msg: Message):
     if not pairs:
         await ensure_user_has_access(msg)
         return  # без ответа
-    profile_files = persist_profile_media_urls(pairs, ses.dir)
-    added_by = resolve_added_by(msg.from_user)
-    ai, ac, links = upsert_items_with_comments(
+
+    log.info(
+        "on_text: start processing %d VSCO links for chat_id=%s message_id=%s",
+        len(pairs),
         msg.chat.id,
-        pairs,
-        source="text",
-        source_file="message",
-        added_by=added_by,
+        getattr(msg, "message_id", "?"),
     )
-    await _maybe_schedule_profile_scans(
-        msg.chat.id,
-        pairs,
-        links,
-        added_by=added_by,
-        source="text",
+
+    progress_message: Optional[Message] = None
+    last_status: Optional[str] = None
+    total_stages = 3
+
+    async def update_progress(stage: Optional[int], description: str, *, final: bool = False, error: bool = False) -> None:
+        nonlocal progress_message, last_status
+        prefix = "❌" if error else ("✅" if final else "🔄")
+        if final or error:
+            text = f"{prefix} {description}"
+        elif stage is None:
+            text = f"{prefix} {description}"
+        else:
+            text = (
+                f"{prefix} Обработка ссылок ({len(pairs)}): этап {stage}/{total_stages} — {description}"
+            )
+        if text == last_status:
+            return
+        last_status = text
+        try:
+            if progress_message is None:
+                progress_message = await msg.answer(text)
+            else:
+                progress_message = await progress_message.edit_text(text)
+        except TelegramBadRequest as exc:
+            message = str(getattr(exc, "message", exc))
+            if "message is not modified" in message.lower():
+                log.debug("update_progress: message not modified, skipping")
+                return
+            log.warning("update_progress: failed to update progress message: %s", message)
+        except TelegramNetworkError as exc:
+            log.warning("update_progress: network error during message update: %s", exc)
+
+    await update_progress(
+        None,
+        f"Принято ссылок: {len(pairs)}. Начинаю обработку…",
     )
-    links_block = format_new_links_block(links)
-    notice_block = format_profile_urls_notice(profile_files, ses.dir)
-    await msg.answer(
-        f"Найдено VSCO-ссылок: {len(pairs)}, добавлено записей: {ai}, комментариев: {ac}{links_block}{notice_block}"
-    )
+
+    try:
+        log.info("on_text: stage 1/%d — persisting profile media urls", total_stages)
+        await update_progress(1, "сохранение ссылок")
+        profile_files = persist_profile_media_urls(pairs, ses.dir)
+        log.info(
+            "on_text: stage 1 completed — stored profile files: %s",
+            [p.name for p in profile_files],
+        )
+
+        log.info("on_text: stage 2/%d — inserting records into database", total_stages)
+        await update_progress(2, "сохранение в базе данных")
+        added_by = resolve_added_by(msg.from_user)
+        ai, ac, links = upsert_items_with_comments(
+            msg.chat.id,
+            pairs,
+            source="text",
+            source_file="message",
+            added_by=added_by,
+        )
+        log.info(
+            "on_text: stage 2 completed — added_items=%d added_comments=%d new_links=%d",
+            ai,
+            ac,
+            len(links),
+        )
+
+        log.info("on_text: stage 3/%d — scheduling profile scans", total_stages)
+        await update_progress(3, "постановка на сканирование профиля")
+        await _maybe_schedule_profile_scans(
+            msg.chat.id,
+            pairs,
+            links,
+            added_by=added_by,
+            source="text",
+        )
+        log.info("on_text: stage 3 completed — scan scheduling finished")
+
+        links_block = format_new_links_block(links)
+        notice_block = format_profile_urls_notice(profile_files, ses.dir)
+        summary = (
+            "Обработка завершена.\n"
+            f"Найдено VSCO-ссылок: {len(pairs)}, добавлено записей: {ai}, комментариев: {ac}{links_block}{notice_block}"
+        )
+        await update_progress(None, summary, final=True)
+        log.info(
+            "on_text: processing completed successfully for chat_id=%s message_id=%s",
+            msg.chat.id,
+            getattr(msg, "message_id", "?"),
+        )
+    except Exception:
+        log.exception(
+            "on_text: failed to process VSCO links for chat_id=%s message_id=%s",
+            msg.chat.id,
+            getattr(msg, "message_id", "?"),
+        )
+        await update_progress(
+            None,
+            "Произошла ошибка при обработке ссылок. Попробуйте ещё раз позже.",
+            error=True,
+        )
+        raise
 
 # ---------- stats ----------
 def stats_scope_keyboard(ses: Session) -> InlineKeyboardMarkup:
