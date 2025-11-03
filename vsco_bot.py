@@ -5252,6 +5252,15 @@ async def _enqueue_profile_scan(job: ProfileScanJob) -> bool:
         normalized_url,
         job.added_by,
     )
+    with contextlib.suppress(Exception):
+        await bot.send_message(
+            job.chat_id,
+            (
+                "🧭 Ссылка принята — начинаю навигацию по профилю "
+                f"<code>@{escape(job.username)}</code> (<code>{escape(normalized_url)}</code>)."
+            ),
+            parse_mode="HTML",
+        )
     return True
 
 
