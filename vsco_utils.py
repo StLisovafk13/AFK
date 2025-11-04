@@ -433,6 +433,7 @@ async def playwright_scan_profile(
     logger: Optional[logging.Logger] = None,
     delay: float = 0.4,
     target_count: int = 0,
+    navigation_timeout_ms: Optional[int] = 30000,
 ) -> list[str]:
     """Extract profile media via Playwright with graceful HTTP fallback."""
 
@@ -482,8 +483,13 @@ async def playwright_scan_profile(
             context = await browser.new_context()
             _log("debug", "playwright_scan_profile: creating new page")
             page = await context.new_page()
+            if navigation_timeout_ms is not None:
+                page.set_default_navigation_timeout(navigation_timeout_ms)
             _log("info", "playwright_scan_profile: navigating to %s", gallery_url)
-            await page.goto(gallery_url, wait_until="networkidle")
+            goto_kwargs = {"wait_until": "networkidle"}
+            if navigation_timeout_ms is not None:
+                goto_kwargs["timeout"] = navigation_timeout_ms
+            await page.goto(gallery_url, **goto_kwargs)
             _log(
                 "debug",
                 "playwright_scan_profile: navigation finished, current URL %s",
