@@ -438,6 +438,7 @@ async def playwright_scan_profile(
 
     try:
         from playwright.async_api import async_playwright
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
     except Exception as exc:  # pragma: no cover - optional dependency
         if logger is not None:
             logger.info(
@@ -483,7 +484,26 @@ async def playwright_scan_profile(
             _log("debug", "playwright_scan_profile: creating new page")
             page = await context.new_page()
             _log("info", "playwright_scan_profile: navigating to %s", gallery_url)
-            await page.goto(gallery_url, wait_until="networkidle")
+            try:
+                await page.goto(
+                    gallery_url,
+                    wait_until="networkidle",
+                    timeout=60000,
+                )
+            except PlaywrightTimeoutError as exc:
+                _log(
+                    "warning",
+                    "playwright_scan_profile: networkidle timeout, continuing with DOMContentLoaded: %s",
+                    exc,
+                )
+                try:
+                    await page.wait_for_load_state("domcontentloaded")
+                except Exception as wait_exc:
+                    _log(
+                        "debug",
+                        "playwright_scan_profile: waiting for DOMContentLoaded failed: %s",
+                        wait_exc,
+                    )
             _log(
                 "debug",
                 "playwright_scan_profile: navigation finished, current URL %s",
