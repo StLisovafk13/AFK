@@ -19,6 +19,7 @@ def vsco_module(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_LOGDIR", str(tmp_path / "logs"))
     monkeypatch.setenv("BOT_ADMIN_IDS", "42, 99")
     monkeypatch.setenv("BOT_PROFILE_NORMALIZE_CONCURRENCY", "2")
+    monkeypatch.setenv("BOT_INLINE_PLAYWRIGHT", "0")
 
     sys.modules.pop("vsco_bot", None)
     sys.modules.pop("zip_profile", None)
@@ -120,7 +121,7 @@ def test_profile_link_scans_direct_media(monkeypatch, vsco_module):
     assert set(gallery_users[0]["images"]) == set(assets)
 
 
-def test_profile_link_scans_direct_media_playwright_fallback(monkeypatch, vsco_module):
+def test_profile_link_scans_http_failure_returns_placeholder(monkeypatch, vsco_module):
     assets = [
         "https://cdn.example.com/photo1.jpg?w=800",
         "https://cdn.example.com/photo2.jpg",
@@ -134,8 +135,7 @@ def test_profile_link_scans_direct_media_playwright_fallback(monkeypatch, vsco_m
         return [], ""
 
     async def fake_playwright(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0):  # type: ignore[override]
-        call_order.append(("playwright", profile_url))
-        return assets
+        raise AssertionError("playwright should not be invoked when inline disabled")
 
     monkeypatch.setattr(vsco_module, "scan_profile_media", fake_scan, raising=False)
     monkeypatch.setattr(vsco_module, "playwright_scan_profile", fake_playwright, raising=False)
@@ -144,11 +144,13 @@ def test_profile_link_scans_direct_media_playwright_fallback(monkeypatch, vsco_m
 
     normalized = asyncio.run(vsco_module.normalize_vsco_pairs(pairs))
 
-    assert len(normalized) == len(assets)
-    assert {entry["image_url"] for entry in normalized} == set(assets)
+    assert len(normalized) == 1
+    assert normalized[0]["username"] == "sampleuser"
+    assert normalized[0]["url"] == "https://vsco.co/sampleuser"
+    assert normalized[0]["image_url"] == ""
+    assert normalized[0]["comment"] == "wow"
     assert call_order == [
         ("http", "https://vsco.co/sampleuser/gallery"),
-        ("playwright", "https://vsco.co/sampleuser/gallery"),
     ]
 
 
@@ -203,10 +205,10 @@ def test_on_text_creates_profile_urls_file(monkeypatch, vsco_module):
     ]
 
     async def fake_scan(session, profile_url, **kwargs):  # type: ignore[override]
-        return [], ""
+        return assets, ""
 
     async def fake_playwright(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0):  # type: ignore[override]
-        return assets
+        raise AssertionError("playwright should not be invoked when HTTP succeeds")
 
     monkeypatch.setattr(vsco_module, "scan_profile_media", fake_scan, raising=False)
     monkeypatch.setattr(vsco_module, "playwright_scan_profile", fake_playwright, raising=False)
