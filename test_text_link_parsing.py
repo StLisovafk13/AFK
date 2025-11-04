@@ -33,7 +33,7 @@ def vsco_module(tmp_path, monkeypatch):
         return []
 
     async def _empty_scan(session, profile_url, **kwargs):  # type: ignore[override]
-        return []
+        return [], ""
 
     monkeypatch.setattr(vsco_bot, "playwright_scan_profile", _empty_playwright, raising=False)
     monkeypatch.setattr(vsco_bot, "scan_profile_media", _empty_scan, raising=False)
@@ -80,10 +80,19 @@ def test_profile_link_scans_direct_media(monkeypatch, vsco_module):
         "https://cdn.example.com/video1.mp4",
     ]
 
-    async def fake_scan(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0):  # type: ignore[override]
-        return assets
+    call_order: list[tuple[str, str]] = []
 
-    monkeypatch.setattr(vsco_module, "playwright_scan_profile", fake_scan, raising=False)
+    async def fake_scan(session, profile_url, *, max_width=2048, logger=None, **kwargs):  # type: ignore[override]
+        assert profile_url.endswith("sampleuser/gallery")
+        call_order.append(("http", profile_url))
+        return assets, "<html></html>"
+
+    async def fake_playwright(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0):  # type: ignore[override]
+        call_order.append(("playwright", profile_url))
+        raise AssertionError("playwright should not be invoked when HTTP succeeded")
+
+    monkeypatch.setattr(vsco_module, "scan_profile_media", fake_scan, raising=False)
+    monkeypatch.setattr(vsco_module, "playwright_scan_profile", fake_playwright, raising=False)
 
     pairs = [{"url": "https://vsco.co/sampleuser", "comment": "wow"}]
 
@@ -91,6 +100,7 @@ def test_profile_link_scans_direct_media(monkeypatch, vsco_module):
 
     assert len(normalized) == len(assets)
     assert {entry["image_url"] for entry in normalized} == set(assets)
+    assert call_order == [("http", "https://vsco.co/sampleuser/gallery")]
 
     items_added, comments_added, new_links = vsco_module.upsert_items_with_comments(
         chat_id=200,
@@ -109,6 +119,38 @@ def test_profile_link_scans_direct_media(monkeypatch, vsco_module):
     assert set(gallery_users[0]["images"]) == set(assets)
 
 
+def test_profile_link_scans_direct_media_playwright_fallback(monkeypatch, vsco_module):
+    assets = [
+        "https://cdn.example.com/photo1.jpg?w=800",
+        "https://cdn.example.com/photo2.jpg",
+    ]
+
+    call_order: list[tuple[str, str]] = []
+
+    async def fake_scan(session, profile_url, *, max_width=2048, logger=None, **kwargs):  # type: ignore[override]
+        assert profile_url.endswith("sampleuser/gallery")
+        call_order.append(("http", profile_url))
+        return [], ""
+
+    async def fake_playwright(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0):  # type: ignore[override]
+        call_order.append(("playwright", profile_url))
+        return assets
+
+    monkeypatch.setattr(vsco_module, "scan_profile_media", fake_scan, raising=False)
+    monkeypatch.setattr(vsco_module, "playwright_scan_profile", fake_playwright, raising=False)
+
+    pairs = [{"url": "https://vsco.co/sampleuser", "comment": "wow"}]
+
+    normalized = asyncio.run(vsco_module.normalize_vsco_pairs(pairs))
+
+    assert len(normalized) == len(assets)
+    assert {entry["image_url"] for entry in normalized} == set(assets)
+    assert call_order == [
+        ("http", "https://vsco.co/sampleuser/gallery"),
+        ("playwright", "https://vsco.co/sampleuser/gallery"),
+    ]
+
+
 def test_on_text_creates_profile_urls_file(monkeypatch, vsco_module):
     assets = [
         "https://cdn.example.com/photo1.jpg",
@@ -116,9 +158,13 @@ def test_on_text_creates_profile_urls_file(monkeypatch, vsco_module):
         "https://cdn.example.com/photo2.jpg",
     ]
 
+    async def fake_scan(session, profile_url, **kwargs):  # type: ignore[override]
+        return [], ""
+
     async def fake_playwright(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0):  # type: ignore[override]
         return assets
 
+    monkeypatch.setattr(vsco_module, "scan_profile_media", fake_scan, raising=False)
     monkeypatch.setattr(vsco_module, "playwright_scan_profile", fake_playwright, raising=False)
 
     msg = DummyMessage(chat_id=321, user_id=999)
