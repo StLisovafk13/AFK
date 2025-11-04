@@ -156,6 +156,19 @@ PROFILE_NORMALIZE_CONCURRENCY = max(
 )
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    raw = raw.strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+BOT_INLINE_PLAYWRIGHT = _env_flag("BOT_INLINE_PLAYWRIGHT", False)
+
+
 def _parse_admin_ids(raw: str) -> set[int]:
     ids: set[int] = set()
     for chunk in raw.split(","):
@@ -1326,7 +1339,7 @@ async def _normalize_single_vsco_url(
             log.exception("scan_profile_media failed for profile %s", profile_url)
             assets = []
 
-        if not assets:
+        if not assets and BOT_INLINE_PLAYWRIGHT:
             try:
                 assets = await playwright_scan_profile(
                     gallery_url,
@@ -1339,10 +1352,16 @@ async def _normalize_single_vsco_url(
                 assets = []
 
         if not assets:
-            log.debug(
-                "normalize_vsco_pairs: profile=%s no assets found, added placeholder",
-                profile_url,
-            )
+            if BOT_INLINE_PLAYWRIGHT:
+                log.debug(
+                    "normalize_vsco_pairs: profile=%s no assets found, added placeholder",
+                    profile_url,
+                )
+            else:
+                log.info(
+                    "normalize_vsco_pairs: profile=%s queued for background scan after HTTP attempt",
+                    profile_url,
+                )
             return [{"username": username, "url": profile_url, "image_url": ""}]
 
         log.debug(
@@ -1519,6 +1538,16 @@ def format_new_links_block(links: Sequence[str]) -> str:
         html_links.append(f"<a href=\"{href}\">{text}</a>")
     return "\nНовые ссылки:\n" + "\n".join(html_links)
 
+
+def format_background_scan_notice(scheduled_jobs: int) -> str:
+    if scheduled_jobs <= 0:
+        return ""
+    return (
+        "\nℹ️ Детальный сбор медиа продолжится в фоне "
+        f"(запущено {scheduled_jobs} фоновых сканирований)."
+        " Уведомим, когда появится новое."
+    )
+
 def _get_item_id(conn: sqlite3.Connection, username: str, profile_url: str, image_url: str) -> Optional[int]:
     row = conn.execute(
         """SELECT id FROM items
@@ -1631,9 +1660,9 @@ async def _maybe_schedule_profile_scans(
     *,
     added_by: str,
     source: str,
-) -> None:
+) -> int:
     if not new_links:
-        return
+        return 0
 
     profile_map: Dict[str, Dict[str, Any]] = {}
     for record in records:
@@ -1686,10 +1715,14 @@ async def _maybe_schedule_profile_scans(
 
     if scheduled:
         log.info(
-            "Queued %s background profile scan job(s) for chat_id=%s",
+            "Queued %s background profile scan job(s) for chat_id=%s (source=%s, added_by=%s)",
             scheduled,
             chat_id,
+            source,
+            added_by,
         )
+
+    return scheduled
 
 
 def insert_full_rows_from_html(chat_id: int, rows: List[Dict[str,Any]], source_file: str, added_by: str) -> Tuple[int, List[str]]:
@@ -4728,6 +4761,7 @@ async def on_document(msg: Message):
     new_links: List[str] = []
     added_by = resolve_added_by(msg.from_user)
     caption_profile_files: List[Path] = []
+    background_jobs = 0
 
     if msg.caption:
         pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_message(msg.caption, msg.caption_entities))
@@ -4741,7 +4775,7 @@ async def on_document(msg: Message):
             added_by=added_by,
         )
         added_items += ai; added_comments += ac; new_links.extend(links)
-        await _maybe_schedule_profile_scans(
+        background_jobs += await _maybe_schedule_profile_scans(
             msg.chat.id,
             pairs,
             links,
@@ -4794,7 +4828,7 @@ async def on_document(msg: Message):
             added_items += ai
             added_comments += ac
             new_links.extend(links)
-            await _maybe_schedule_profile_scans(
+            background_jobs += await _maybe_schedule_profile_scans(
                 msg.chat.id,
                 pairs,
                 links,
@@ -4803,15 +4837,17 @@ async def on_document(msg: Message):
             )
             links_block = format_new_links_block(new_links)
             notice_block = format_profile_urls_notice(caption_profile_files, ses.dir)
+            background_notice = format_background_scan_notice(background_jobs)
             await msg.answer(
                 f"CSV загружен: <code>{escape(p.name)}</code>\n"
                 f"Найдено VSCO-ссылок: {found}, добавлено ссылок/медиа: {added_items}, добавлено комментариев: {added_comments}"
-                f"{links_block}{notice_block}"
+                f"{links_block}{notice_block}{background_notice}"
             )
         except Exception as e:
             log.exception("CSV processing failed")
+            background_notice = format_background_scan_notice(background_jobs)
             await msg.answer(
-                f"CSV загружен: <code>{escape(p.name)}</code>, но не удалось обработать: {escape(str(e))}"
+                f"CSV загружен: <code>{escape(p.name)}</code>, но не удалось обработать: {escape(str(e))}{background_notice}"
             )
         return
 
@@ -4825,7 +4861,7 @@ async def on_document(msg: Message):
                 source_file=p.name,
                 added_by=added_by,
             )
-            await _maybe_schedule_profile_scans(
+            background_jobs += await _maybe_schedule_profile_scans(
                 msg.chat.id,
                 rows,
                 html_links,
@@ -4843,22 +4879,27 @@ async def on_document(msg: Message):
                     f"\n+ из подписи: добавлено {added_items} записей, комментариев {added_comments}"
                 )
             notice_block = format_profile_urls_notice(caption_profile_files, ses.dir)
+            background_notice = format_background_scan_notice(background_jobs)
             await msg.answer(
                 f"HTML загружен: <code>{escape(p.name)}</code>\n"
                 f"Сохранено элементов: {added_full}"
                 f"{extra}"
-                f"{links_block}{notice_block}"
+                f"{links_block}{notice_block}{background_notice}"
             )
         except Exception as e:
             log.exception("HTML processing failed")
-            await msg.answer(f"HTML загружен: <code>{escape(p.name)}</code>, но не удалось обработать: {escape(str(e))}")
+            background_notice = format_background_scan_notice(background_jobs)
+            await msg.answer(
+                f"HTML загружен: <code>{escape(p.name)}</code>, но не удалось обработать: {escape(str(e))}{background_notice}"
+            )
         return
 
     links_block = format_new_links_block(new_links) if msg.caption else ""
     notice_block = format_profile_urls_notice(caption_profile_files, ses.dir)
+    background_notice = format_background_scan_notice(background_jobs)
     await msg.answer(
         "Файл сохранён. Нужны .html/.csv. Ссылки из подписи учтены, если были."
-        f"{links_block}{notice_block}"
+        f"{links_block}{notice_block}{background_notice}"
     )
 
 # ---------- plain text ----------
@@ -4945,7 +4986,7 @@ async def on_text(msg: Message):
         source_file="message",
         added_by=added_by,
     )
-    await _maybe_schedule_profile_scans(
+    scheduled_jobs = await _maybe_schedule_profile_scans(
         msg.chat.id,
         pairs,
         links,
@@ -4954,8 +4995,9 @@ async def on_text(msg: Message):
     )
     links_block = format_new_links_block(links)
     notice_block = format_profile_urls_notice(profile_files, ses.dir)
+    background_notice = format_background_scan_notice(scheduled_jobs)
     await msg.answer(
-        f"Найдено VSCO-ссылок: {len(pairs)}, добавлено записей: {ai}, комментариев: {ac}{links_block}{notice_block}"
+        f"Найдено VSCO-ссылок: {len(pairs)}, добавлено записей: {ai}, комментариев: {ac}{links_block}{notice_block}{background_notice}"
     )
 
 # ---------- stats ----------
