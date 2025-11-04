@@ -7,6 +7,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 from typing import Any, Dict, Optional
 
 __all__ = ["extract_exif_from_url"]
@@ -28,7 +30,7 @@ def _build_curl_command(
     url: str,
     *,
     referer: Optional[str],
-    timeout: int,
+    timeout: Optional[int],
     headers: Dict[str, str],
 ) -> list[str]:
     curl = shutil.which("curl") or shutil.which("curl.exe")
@@ -40,10 +42,11 @@ def _build_curl_command(
         "-sS",
         "--fail",
         "--location",
-        "--max-time",
-        str(timeout),
         "--http1.1",
     ]
+
+    if timeout is not None:
+        cmd.extend(["--max-time", str(timeout)])
 
     for header, value in headers.items():
         if header.lower() == "user-agent":
@@ -56,6 +59,30 @@ def _build_curl_command(
 
     cmd.append(url)
     return cmd
+
+
+def _download_with_python(
+    url: str,
+    *,
+    referer: Optional[str],
+    timeout: Optional[int],
+    headers: Dict[str, str],
+    out_path: str,
+) -> None:
+    request_headers = dict(headers)
+    if referer and not any(key.lower() == "referer" for key in request_headers):
+        request_headers["Referer"] = referer
+
+    request = urllib.request.Request(url, headers=request_headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout or None) as response, open(
+            out_path, "wb"
+        ) as file_obj:
+            shutil.copyfileobj(response, file_obj)
+    except urllib.error.HTTPError as exc:  # pragma: no cover - network failure
+        raise ExifExtractionError(f"HTTP error while downloading {url}: {exc.code}") from exc
+    except urllib.error.URLError as exc:  # pragma: no cover - network failure
+        raise ExifExtractionError(f"Failed to download {url}: {exc.reason}") from exc
 
 
 def _call_exiftool(path: str) -> Optional[Dict[str, Any]]:
@@ -92,7 +119,7 @@ def extract_exif_from_url(
     url: str,
     *,
     referer: Optional[str] = "https://vsco.co/",
-    timeout: int = 20,
+    timeout: Optional[int] = 20,
     headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Download an image and extract EXIF metadata.
@@ -104,7 +131,8 @@ def extract_exif_from_url(
     referer:
         Optional HTTP referer to send when downloading the image.
     timeout:
-        Maximum time for the HTTP download, in seconds.
+        Maximum time for the HTTP download, in seconds. Pass ``None`` to disable
+        the limit for the Python fallback downloader.
     headers:
         Extra HTTP headers to merge with the defaults.
 
@@ -124,18 +152,30 @@ def extract_exif_from_url(
     tmp = tempfile.NamedTemporaryFile(delete=False)
     tmp.close()
     temp_path = tmp.name
-    cmd = _build_curl_command(
-        url,
-        referer=referer,
-        timeout=timeout,
-        headers=combined_headers,
-    )
-    cmd.extend(["-o", temp_path])
-
     try:
-        subprocess.check_call(cmd)
-    except subprocess.CalledProcessError as exc:
-        raise ExifExtractionError(f"curl failed for {url}: {exc}") from exc
+        cmd = _build_curl_command(
+            url,
+            referer=referer,
+            timeout=timeout,
+            headers=combined_headers,
+        )
+    except ExifExtractionError:
+        cmd = None
+
+    if cmd:
+        cmd.extend(["-o", temp_path])
+        try:
+            subprocess.check_call(cmd)
+        except subprocess.CalledProcessError as exc:
+            raise ExifExtractionError(f"curl failed for {url}: {exc}") from exc
+    else:
+        _download_with_python(
+            url,
+            referer=referer,
+            timeout=timeout,
+            headers=combined_headers,
+            out_path=temp_path,
+        )
 
     try:
         size_bytes = os.path.getsize(temp_path)
