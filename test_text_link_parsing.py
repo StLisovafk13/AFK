@@ -18,6 +18,7 @@ def vsco_module(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_WORKDIR", str(tmp_path / "work"))
     monkeypatch.setenv("BOT_LOGDIR", str(tmp_path / "logs"))
     monkeypatch.setenv("BOT_ADMIN_IDS", "42, 99")
+    monkeypatch.setenv("BOT_PROFILE_NORMALIZE_CONCURRENCY", "2")
 
     sys.modules.pop("vsco_bot", None)
     sys.modules.pop("zip_profile", None)
@@ -149,6 +150,49 @@ def test_profile_link_scans_direct_media_playwright_fallback(monkeypatch, vsco_m
         ("http", "https://vsco.co/sampleuser/gallery"),
         ("playwright", "https://vsco.co/sampleuser/gallery"),
     ]
+
+
+def test_normalize_pairs_preserves_order_and_dedupes(monkeypatch, vsco_module):
+    assets_map = {
+        "https://vsco.co/user1/gallery": ["https://cdn.example.com/user1_1.jpg"],
+        "https://vsco.co/user2/gallery": ["https://cdn.example.com/user2_1.jpg"],
+    }
+
+    call_log: list[str] = []
+
+    async def fake_scan(session, profile_url, *, max_width=2048, logger=None, **kwargs):  # type: ignore[override]
+        call_log.append(profile_url)
+        await asyncio.sleep(0)
+        return assets_map.get(profile_url, []), "<html></html>"
+
+    async def fake_playwright(profile_url, *, max_width=2048, session=None, logger=None, delay=0.4, target_count=0):  # type: ignore[override]
+        raise AssertionError("playwright should not be invoked when HTTP succeeded")
+
+    monkeypatch.setattr(vsco_module, "scan_profile_media", fake_scan, raising=False)
+    monkeypatch.setattr(vsco_module, "playwright_scan_profile", fake_playwright, raising=False)
+
+    pairs = [
+        {"url": " https://vsco.co/user1 ", "comment": "first"},
+        {"url": "https://vsco.co/user2", "comment": "second"},
+        {"url": "https://vsco.co/user1", "comment": "third"},
+    ]
+
+    normalized = asyncio.run(vsco_module.normalize_vsco_pairs(pairs))
+
+    assert [entry["comment"] for entry in normalized] == ["first", "second", "third"]
+    assert [entry["url"] for entry in normalized] == [
+        "https://vsco.co/user1",
+        "https://vsco.co/user2",
+        "https://vsco.co/user1",
+    ]
+    assert [entry["image_url"] for entry in normalized] == [
+        "https://cdn.example.com/user1_1.jpg",
+        "https://cdn.example.com/user2_1.jpg",
+        "https://cdn.example.com/user1_1.jpg",
+    ]
+
+    assert call_log.count("https://vsco.co/user1/gallery") == 1
+    assert call_log.count("https://vsco.co/user2/gallery") == 1
 
 
 def test_on_text_creates_profile_urls_file(monkeypatch, vsco_module):
