@@ -150,6 +150,10 @@ META_FETCH_WORKERS = max(
     1,
     int(os.getenv("BOT_META_FETCH_WORKERS", "2") or "2"),
 )
+PROFILE_NORMALIZE_CONCURRENCY = max(
+    1,
+    int(os.getenv("BOT_PROFILE_NORMALIZE_CONCURRENCY", "4") or "4"),
+)
 
 
 def _parse_admin_ids(raw: str) -> set[int]:
@@ -1286,6 +1290,99 @@ def parse_vsco_pairs_from_cell(cell: str) -> List[Dict[str, str]]:
     if not isinstance(cell, str): return []
     return _parse_vsco_pairs(cell)
 
+async def _normalize_single_vsco_url(
+    url: str,
+    session: aiohttp.ClientSession,
+) -> List[Dict[str, str]]:
+    p = urlparse(url)
+    host = (p.netloc or "").lower()
+    final = url
+    if host in VSCO_SHORT_HOSTS:
+        final = await resolve_vsco_short(url, session)
+        log.debug("normalize_vsco_pairs: resolved short url %s -> %s", url, final)
+
+    info = classify_vsco_path(final)
+    if not info:
+        usr = username_from_vsco_co(final)
+        if usr:
+            log.debug("normalize_vsco_pairs: fallback username=%s from url=%s", usr, final)
+            return [{"username": usr, "url": f"https://vsco.co/{usr}", "image_url": ""}]
+        return []
+
+    if info["kind"] == "profile":
+        username = info["username"]
+        profile_url = info["final_url"]
+        gallery_url = normalize_vsco_profile_url(profile_url) or f"{profile_url.rstrip('/')}/gallery"
+        assets: List[str] = []
+        try:
+            http_assets, _html = await scan_profile_media(
+                session,
+                gallery_url,
+                max_width=MEDIA_PAGE_MAX_WIDTH,
+                logger=log,
+            )
+            assets = http_assets
+        except Exception:
+            log.exception("scan_profile_media failed for profile %s", profile_url)
+            assets = []
+
+        if not assets:
+            try:
+                assets = await playwright_scan_profile(
+                    gallery_url,
+                    max_width=MEDIA_PAGE_MAX_WIDTH,
+                    session=session,
+                    logger=log,
+                )
+            except Exception:
+                log.exception("playwright_scan_profile failed for profile %s", profile_url)
+                assets = []
+
+        if not assets:
+            log.debug(
+                "normalize_vsco_pairs: profile=%s no assets found, added placeholder",
+                profile_url,
+            )
+            return [{"username": username, "url": profile_url, "image_url": ""}]
+
+        log.debug(
+            "normalize_vsco_pairs: profile=%s appended %d asset(s)",
+            profile_url,
+            len(assets),
+        )
+        return [
+            {"username": username, "url": profile_url, "image_url": asset}
+            for asset in assets
+        ]
+
+    if info["kind"] == "media":
+        usr = info["username"]
+        profile_url = f"https://vsco.co/{usr}"
+        asset_urls = await fetch_media_asset_urls(final, session)
+        if not asset_urls:
+            asset_urls = [final]
+        log.debug(
+            "normalize_vsco_pairs: media url=%s resolved to %d asset(s)",
+            final,
+            len(asset_urls),
+        )
+        return [
+            {"username": usr, "url": profile_url, "image_url": asset}
+            for asset in asset_urls
+        ]
+
+    if info["kind"] == "perception":
+        slug = info["slug"]
+        log.debug(
+            "normalize_vsco_pairs: perception slug=%s final_url=%s",
+            slug,
+            info["final_url"],
+        )
+        return [{"username": slug, "url": info["final_url"], "image_url": ""}]
+
+    return []
+
+
 async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
     Нормализация:
@@ -1299,95 +1396,43 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
         log.debug("normalize_vsco_pairs: no pairs provided")
         return []
     log.debug("normalize_vsco_pairs: start with %d pair(s)", len(pairs))
+
+    semaphore = asyncio.Semaphore(PROFILE_NORMALIZE_CONCURRENCY)
+    url_tasks: Dict[str, asyncio.Task[List[Dict[str, str]]]] = {}
     res: List[Dict[str, str]] = []
-    async with aiohttp.ClientSession() as s:
-        for pair in pairs:
-            u = pair.get("url", ""); c = (pair.get("comment") or "").strip()
-            if not is_vsco_url(u):
-                log.debug("normalize_vsco_pairs: skip non-VSCO url=%s", u)
-                continue
 
-            p = urlparse(u); host = (p.netloc or "").lower()
-            final = u
-            if host in VSCO_SHORT_HOSTS:
-                final = await resolve_vsco_short(u, s)
-                log.debug("normalize_vsco_pairs: resolved short url %s -> %s", u, final)
+    async with aiohttp.ClientSession() as session:
+        async def run_with_limit(url: str) -> List[Dict[str, str]]:
+            async with semaphore:
+                return await _normalize_single_vsco_url(url, session)
 
-            info = classify_vsco_path(final)
-            if not info:
-                usr = username_from_vsco_co(final)
-                if usr:
-                    res.append({"username": usr, "url": f"https://vsco.co/{usr}", "comment": c, "image_url": ""})
-                    log.debug(
-                        "normalize_vsco_pairs: fallback username=%s from url=%s", usr, final
-                    )
-                continue
+        async def process_pair(pair: Dict[str, str]) -> List[Dict[str, str]]:
+            raw_url = pair.get("url", "")
+            comment = (pair.get("comment") or "").strip()
+            url = raw_url.strip()
+            if not is_vsco_url(url):
+                log.debug("normalize_vsco_pairs: skip non-VSCO url=%s", raw_url)
+                return []
 
-            if info["kind"] == "profile":
-                username = info["username"]
-                profile_url = info["final_url"]
-                gallery_url = normalize_vsco_profile_url(profile_url) or f"{profile_url.rstrip('/')}/gallery"
-                assets: List[str] = []
-                try:
-                    http_assets, _html = await scan_profile_media(
-                        s,
-                        gallery_url,
-                        max_width=MEDIA_PAGE_MAX_WIDTH,
-                        logger=log,
-                    )
-                    assets = http_assets
-                except Exception:
-                    log.exception("scan_profile_media failed for profile %s", profile_url)
-                    assets = []
+            key = url
+            task = url_tasks.get(key)
+            if task is None:
+                task = asyncio.create_task(run_with_limit(key))
+                url_tasks[key] = task
 
-                if not assets:
-                    try:
-                        assets = await playwright_scan_profile(
-                            gallery_url,
-                            max_width=MEDIA_PAGE_MAX_WIDTH,
-                            session=s,
-                            logger=log,
-                        )
-                    except Exception:
-                        log.exception("playwright_scan_profile failed for profile %s", profile_url)
-                        assets = []
+            base_entries = await task
+            return [
+                {**entry, "comment": comment, "image_url": entry.get("image_url", "")}
+                for entry in base_entries
+            ]
 
-                if not assets:
-                    res.append({"username": username, "url": profile_url, "comment": c, "image_url": ""})
-                    log.debug(
-                        "normalize_vsco_pairs: profile=%s no assets found, added placeholder",
-                        profile_url,
-                    )
-                else:
-                    for asset in assets:
-                        res.append({"username": username, "url": profile_url, "comment": c, "image_url": asset})
-                    log.debug(
-                        "normalize_vsco_pairs: profile=%s appended %d asset(s)",
-                        profile_url,
-                        len(assets),
-                    )
-            elif info["kind"] == "media":
-                usr = info["username"]
-                profile_url = f"https://vsco.co/{usr}"
-                asset_urls = await fetch_media_asset_urls(final, s)
-                if not asset_urls:
-                    asset_urls = [final]
-                log.debug(
-                    "normalize_vsco_pairs: media url=%s resolved to %d asset(s)",
-                    final,
-                    len(asset_urls),
-                )
-                for asset in asset_urls:
-                    res.append({"username": usr, "url": profile_url, "comment": c, "image_url": asset})
-            elif info["kind"] == "perception":
-                slug = info["slug"]
-                res.append({"username": slug, "url": info["final_url"], "comment": c, "image_url": ""})
-                log.debug(
-                    "normalize_vsco_pairs: perception slug=%s final_url=%s",
-                    slug,
-                    info["final_url"],
-                )
-    uniq = {(r["username"], r["url"], r["comment"], r.get("image_url","")): r for r in res}
+        tasks = [asyncio.create_task(process_pair(pair)) for pair in pairs]
+        nested_results = await asyncio.gather(*tasks)
+
+    for entries in nested_results:
+        res.extend(entries)
+
+    uniq = {(r["username"], r["url"], r["comment"], r.get("image_url", "")): r for r in res}
     log.debug(
         "normalize_vsco_pairs: produced %d unique record(s) from %d input(s)",
         len(uniq),
