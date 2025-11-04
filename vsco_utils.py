@@ -438,6 +438,7 @@ async def playwright_scan_profile(
 
     try:
         from playwright.async_api import async_playwright
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
     except Exception as exc:  # pragma: no cover - optional dependency
         if logger is not None:
             logger.info(
@@ -474,6 +475,10 @@ async def playwright_scan_profile(
         root = getattr(page, "url", None) or gallery_url
         return extract_media_urls_from_html(html, max_width=max_width, root=root)
 
+    playwright_urls: list[str] = []
+    navigation_timed_out = False
+    unexpected_error: Optional[Exception] = None
+
     try:
         async with async_playwright() as playwright:
             _log("debug", "playwright_scan_profile: launching Firefox")
@@ -483,7 +488,27 @@ async def playwright_scan_profile(
             _log("debug", "playwright_scan_profile: creating new page")
             page = await context.new_page()
             _log("info", "playwright_scan_profile: navigating to %s", gallery_url)
-            await page.goto(gallery_url, wait_until="networkidle")
+            try:
+                await page.goto(
+                    gallery_url,
+                    wait_until="networkidle",
+                    timeout=60000,
+                )
+            except PlaywrightTimeoutError as exc:
+                navigation_timed_out = True
+                _log(
+                    "warning",
+                    "playwright_scan_profile: networkidle timeout, continuing with DOMContentLoaded: %s",
+                    exc,
+                )
+                try:
+                    await page.wait_for_load_state("domcontentloaded")
+                except Exception as wait_exc:
+                    _log(
+                        "debug",
+                        "playwright_scan_profile: waiting for DOMContentLoaded failed: %s",
+                        wait_exc,
+                    )
             _log(
                 "debug",
                 "playwright_scan_profile: navigation finished, current URL %s",
@@ -639,8 +664,9 @@ async def playwright_scan_profile(
                     )
                     break
 
-            return urls
+            playwright_urls = urls
     except Exception as exc:
+        unexpected_error = exc
         if logger is not None:
             logger.warning(
                 "playwright_scan_profile: failed to scan via Playwright, falling back: %s",
@@ -660,13 +686,26 @@ async def playwright_scan_profile(
             except Exception:  # pragma: no cover - cleanup best-effort
                 pass
 
-    if session is not None:
-        urls, _html = await scan_profile_media(
-            session,
-            gallery_url,
-            max_width=max_width,
-            logger=logger,
-        )
-        return urls
-    return []
+    if not playwright_urls:
+        if session is not None:
+            reason = ""
+            if navigation_timed_out:
+                reason = " (navigation timeout)"
+            elif unexpected_error is not None:
+                reason = f" ({unexpected_error})"
+            if logger is not None:
+                logger.warning(
+                    "playwright_scan_profile: no media extracted via Playwright%s, falling back to HTTP",
+                    reason,
+                )
+            urls, _html = await scan_profile_media(
+                session,
+                profile_url,
+                max_width=max_width,
+                logger=logger,
+            )
+            return urls
+        return []
+
+    return playwright_urls
 
