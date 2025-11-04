@@ -100,6 +100,7 @@ from vsco_utils import (
     build_perception_gallery_url,
     is_vsco_logo_url,
     normalize_media_url,
+    scan_profile_media,
     playwright_scan_profile,
     upscale_w_param,
 )
@@ -1328,15 +1329,28 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
                 gallery_url = normalize_vsco_profile_url(profile_url) or f"{profile_url.rstrip('/')}/gallery"
                 assets: List[str] = []
                 try:
-                    assets = await playwright_scan_profile(
+                    http_assets, _html = await scan_profile_media(
+                        s,
                         gallery_url,
                         max_width=MEDIA_PAGE_MAX_WIDTH,
-                        session=s,
                         logger=log,
                     )
+                    assets = http_assets
                 except Exception:
-                    log.exception("playwright_scan_profile failed for profile %s", profile_url)
+                    log.exception("scan_profile_media failed for profile %s", profile_url)
                     assets = []
+
+                if not assets:
+                    try:
+                        assets = await playwright_scan_profile(
+                            gallery_url,
+                            max_width=MEDIA_PAGE_MAX_WIDTH,
+                            session=s,
+                            logger=log,
+                        )
+                    except Exception:
+                        log.exception("playwright_scan_profile failed for profile %s", profile_url)
+                        assets = []
 
                 if not assets:
                     res.append({"username": username, "url": profile_url, "comment": c, "image_url": ""})
