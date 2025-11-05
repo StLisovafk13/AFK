@@ -545,7 +545,10 @@ def _sanitize_profile_tabs(
         href = str(href_raw).strip() if href_raw is not None else ""
         if not href:
             continue
-        entry: dict[str, str] = {"href": _normalize_tab_url(href, root=root)}
+        normalized_href = _normalize_tab_url(href, root=root)
+        if not normalized_href:
+            continue
+        entry: dict[str, str] = {"href": normalized_href}
         for key in ("id", "label", "slug", "active"):
             value = tab.get(key)
             if value is None:
