@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import io
 import json
 import logging
@@ -179,33 +180,32 @@ def _export_scope_from_query(params: Dict[str, List[str]]) -> Tuple[str, Optiona
 def _generate_csv(scope: str, chat_id: Optional[int]) -> str:
     """Generate CSV data for the requested scope."""
 
-    users = fetch_gallery_users(scope, chat_id or 0)
-    if not users:
+    users_iter = iter(fetch_gallery_users(scope, chat_id or 0))
+    try:
+        first_user = next(users_iter)
+    except StopIteration:
         return ""
 
-    flat_rows = [
-        {
-            "username": u.get("username", ""),
-            "profile_url": u.get("profile_url", ""),
-            "lat": u.get("lat"),
-            "lon": u.get("lon"),
-            "images_count": u.get("images_count"),
-            "comments_count": u.get("comments_count"),
-            "comments": " | ".join(u.get("comments", [])),
-            "added_by": u.get("added_by_raw", ""),
-            "added_by_display": u.get("added_by", ""),
-            "added_by_link": u.get("added_by_link", ""),
-        }
-        for u in users
-    ]
-
     output = io.StringIO()
-    if flat_rows:
-        fieldnames = list(flat_rows[0].keys())
-        writer = csv.DictWriter(output, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in flat_rows:
-            writer.writerow(row)
+    writer: Optional[csv.DictWriter[str]] = None
+    for user in itertools.chain([first_user], users_iter):
+        row = {
+            "username": user.get("username", ""),
+            "profile_url": user.get("profile_url", ""),
+            "lat": user.get("lat"),
+            "lon": user.get("lon"),
+            "images_count": user.get("images_count"),
+            "comments_count": user.get("comments_count"),
+            "comments": " | ".join(user.get("comments", [])),
+            "added_by": user.get("added_by_raw", ""),
+            "added_by_display": user.get("added_by", ""),
+            "added_by_link": user.get("added_by_link", ""),
+        }
+        if writer is None:
+            fieldnames = list(row.keys())
+            writer = csv.DictWriter(output, fieldnames=fieldnames)
+            writer.writeheader()
+        writer.writerow(row)
     return output.getvalue()
 
 
@@ -271,8 +271,16 @@ class ExportRequestHandler(BaseHTTPRequestHandler):
 
         try:
             if path == "/gallery":
+                iterator = iter(fetch_gallery_users(scope, chat_id or 0))
+                try:
+                    first_user = next(iterator)
+                except StopIteration:
+                    self._send_text("Нет данных для отображения", status=HTTPStatus.NO_CONTENT)
+                    return
+                users = [first_user]
+                users.extend(iterator)
                 html = build_rich_gallery(
-                    fetch_gallery_users(scope, chat_id or 0),
+                    users,
                     title="VSCOLeak",
                     subtitle=("All DB" if scope == "all" else f"Chat {chat_id}"),
                 )
@@ -281,10 +289,14 @@ class ExportRequestHandler(BaseHTTPRequestHandler):
                 return
 
             if path == "/map/users":
-                users = fetch_gallery_users(scope, chat_id or 0)
-                if not users:
+                iterator = iter(fetch_gallery_users(scope, chat_id or 0))
+                try:
+                    first_user = next(iterator)
+                except StopIteration:
                     self._send_text("Нет данных для отображения", status=HTTPStatus.NO_CONTENT)
                     return
+                users = [first_user]
+                users.extend(iterator)
                 html = build_map_users(users, title="VSCO Profiles — Users")
                 html = _inject_auto_refresh(html, self.refresh_interval)
                 self._send_text(html)

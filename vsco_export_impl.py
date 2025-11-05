@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import csv
+import itertools
 import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Protocol, Tuple
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from aiogram import F, Router
@@ -38,7 +39,7 @@ class ExportDependencies:
     ensure_callback_access: Callable[[CallbackQuery], Awaitable[bool]]
     has_daily_data_access: Callable[[int, Optional[int]], Tuple[bool, str]]
     get_session: Callable[[int], SessionLike]
-    fetch_gallery_users: Callable[[str, int], List[Dict[str, Any]]]
+    fetch_gallery_users: Callable[[str, int], Iterable[Dict[str, Any]]]
     fetch_items_for_map: Callable[[str, int], List[Dict[str, Any]]]
     build_rich_gallery: Callable[[List[Dict[str, Any]], str, str], str]
     build_map_users: Callable[[List[Dict[str, Any]], str], str]
@@ -191,33 +192,34 @@ class ExportManager:
         await cq.answer("Неизвестное действие", show_alert=True)
 
     async def _export_csv(self, cq: CallbackQuery, session: SessionLike, chat_id: int) -> None:
-        users = self._deps.fetch_gallery_users(session.export_scope, chat_id)
-        if not users:
+        users_iter = iter(self._deps.fetch_gallery_users(session.export_scope, chat_id))
+        try:
+            first_user = next(users_iter)
+        except StopIteration:
             await cq.answer("Нет данных", show_alert=True)
             return
 
         await cq.answer("Готовлю экспорт…", cache_time=0)
-        flat_rows = [
-            {
-                "username": u["username"],
-                "profile_url": u["profile_url"],
-                "lat": u["lat"],
-                "lon": u["lon"],
-                "images_count": u["images_count"],
-                "comments_count": u["comments_count"],
-                "comments": " | ".join(u["comments"]),
-                "added_by": u.get("added_by_raw", ""),
-                "added_by_display": u.get("added_by", ""),
-                "added_by_link": u.get("added_by_link", ""),
-            }
-            for u in users
-        ]
         output = session.dir / f"export_{session.export_scope}.csv"
-        fieldnames = list(flat_rows[0].keys()) if flat_rows else []
         with output.open("w", encoding="utf-8", newline="") as fh:
-            writer = csv.DictWriter(fh, fieldnames=fieldnames)
-            writer.writeheader()
-            for row in flat_rows:
+            writer: Optional[csv.DictWriter[str]] = None
+            for user in itertools.chain([first_user], users_iter):
+                row = {
+                    "username": user.get("username", ""),
+                    "profile_url": user.get("profile_url", ""),
+                    "lat": user.get("lat"),
+                    "lon": user.get("lon"),
+                    "images_count": user.get("images_count"),
+                    "comments_count": user.get("comments_count"),
+                    "comments": " | ".join(user.get("comments", [])),
+                    "added_by": user.get("added_by_raw", ""),
+                    "added_by_display": user.get("added_by", ""),
+                    "added_by_link": user.get("added_by_link", ""),
+                }
+                if writer is None:
+                    fieldnames = list(row.keys())
+                    writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                    writer.writeheader()
                 writer.writerow(row)
 
         await self._send_path_document(
@@ -231,10 +233,14 @@ class ExportManager:
         )
 
     async def _export_gallery(self, cq: CallbackQuery, session: SessionLike, chat_id: int) -> None:
-        users = self._deps.fetch_gallery_users(session.export_scope, chat_id)
-        if not users:
+        iterator = iter(self._deps.fetch_gallery_users(session.export_scope, chat_id))
+        try:
+            first_user = next(iterator)
+        except StopIteration:
             await cq.answer("Нет данных", show_alert=True)
             return
+        users = [first_user]
+        users.extend(iterator)
 
         await cq.answer("Готовлю экспорт…", cache_time=0)
         html = self._deps.build_rich_gallery(
@@ -256,10 +262,14 @@ class ExportManager:
 
     async def _export_map(self, cq: CallbackQuery, session: SessionLike, chat_id: int, fmt: str) -> None:
         if fmt in ("map", "map_users"):
-            users = self._deps.fetch_gallery_users(session.export_scope, chat_id)
-            if not users:
+            iterator = iter(self._deps.fetch_gallery_users(session.export_scope, chat_id))
+            try:
+                first_user = next(iterator)
+            except StopIteration:
                 await cq.answer("Нет данных", show_alert=True)
                 return
+            users = [first_user]
+            users.extend(iterator)
             await cq.answer("Готовлю экспорт…", cache_time=0)
             html = self._deps.build_map_users(
                 users,

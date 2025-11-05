@@ -33,7 +33,7 @@ from collections import Counter
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, List, Optional, Dict, Any, Tuple, Sequence, Set
+from typing import Iterable, Iterator, List, Optional, Dict, Any, Tuple, Sequence, Set
 from datetime import datetime, timedelta, timezone
 from urllib.parse import (
     urljoin,
@@ -2141,177 +2141,116 @@ def format_stats_text(stats: Dict[str, Dict[str, int]], scope: str) -> str:
     )
 
 # ---------------------- Export / Aggregations ----------------------
-def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
-    conn = db_connect(); conn.execute("PRAGMA read_uncommitted=1;")
+def fetch_gallery_users(scope: str, chat_id: int, *, chunk_size: int = 500) -> Iterator[Dict[str, Any]]:
+    conn = db_connect()
+    conn.execute("PRAGMA read_uncommitted=1;")
+
     if scope == "chat":
-        rows = conn.execute(
+        cursor = conn.execute(
             "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,meta_json,created_at"
-            " FROM items WHERE chat_id=?",
+            " FROM items WHERE chat_id=? ORDER BY COALESCE(username,''), id",
             (chat_id,),
-        ).fetchall()
+        )
     else:
-        rows = conn.execute(
-            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,meta_json,created_at FROM items"
-        ).fetchall()
-    if not rows:
-        conn.close(); return []
-
-    groups: Dict[str, Dict[str, Any]] = {}
-    ids_by_user: Dict[str,List[int]] = {}
-    for iid, uname, purl, lat, lon, img, added_by, source, source_file, meta_json, created_at in rows:
-        uname = uname or ""
-        g = groups.setdefault(
-            uname,
-            {
-                "username": uname,
-                "profile_url": purl or (f"https://vsco.co/{uname}" if uname else ""),
-                "images": [],
-                "image_set": set(),
-                "image_meta": {},
-                "image_coords": {},
-                "added_by": "",
-                "sources": {},
-                "cities": set(),
-                "first_at": None,
-                "last_at": None,
-                "camera_models": Counter(),
-                "camera_model_labels": {},
-                "geo_buckets": {},
-                "tab_media": {},
-                "tab_media_seen": {},
-            },
+        cursor = conn.execute(
+            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,meta_json,created_at"
+            " FROM items ORDER BY COALESCE(username,''), id"
         )
-        if purl and not g["profile_url"]:
-            g["profile_url"] = purl
-        if img and img not in g["image_set"]:
-            g["images"].append(img)
-            g["image_set"].add(img)
 
-        base_profile_url = g.get("profile_url") or purl or ""
-        normalized_tab_url = _normalize_tab_url(
-            purl or base_profile_url,
-            root=base_profile_url,
-        )
-        if normalized_tab_url:
-            tab_media_map: Dict[str, List[str]] = g["tab_media"]  # type: ignore[assignment]
-            tab_media_seen: Dict[str, Set[str]] = g["tab_media_seen"]  # type: ignore[assignment]
-            bucket = tab_media_map.setdefault(normalized_tab_url, [])
-            seen_bucket = tab_media_seen.setdefault(normalized_tab_url, set())
-            if img and img not in seen_bucket:
-                bucket.append(img)
-                seen_bucket.add(img)
+    def _chunked_rows() -> Iterator[Tuple[Any, ...]]:
+        while True:
+            batch = cursor.fetchmany(chunk_size)
+            if not batch:
+                break
+            for row in batch:
+                yield row
 
-        meta_payload: Optional[Dict[str, Any]] = None
-        meta_for_extract: Optional[Dict[str, Any]] = None
-        if meta_json:
-            try:
-                decoded_meta = json.loads(meta_json)
-            except Exception:
-                meta_payload = {"raw": meta_json}
-            else:
-                if isinstance(decoded_meta, dict):
-                    meta_payload = decoded_meta
-                    meta_for_extract = decoded_meta
-                else:
-                    meta_payload = {"raw": decoded_meta}
-        if img and meta_payload:
-            g["image_meta"][img] = meta_payload
-        elif img and meta_json and img not in g["image_meta"]:
-            g["image_meta"][img] = {"raw": meta_json}
+    def _new_group(username: str, profile_url: Optional[str]) -> Dict[str, Any]:
+        return {
+            "username": username,
+            "profile_url": profile_url or (f"https://vsco.co/{username}" if username else ""),
+            "images": [],
+            "image_set": set(),
+            "image_meta": {},
+            "image_coords": {},
+            "added_by": "",
+            "sources": {},
+            "cities": set(),
+            "first_at": None,
+            "last_at": None,
+            "camera_models": Counter(),
+            "camera_model_labels": {},
+            "geo_buckets": {},
+            "tab_media": {},
+            "tab_media_seen": {},
+        }
 
-        if meta_for_extract:
-            camera_counter: Counter[str] = g["camera_models"]  # type: ignore[assignment]
-            labels_map: Dict[str, str] = g["camera_model_labels"]  # type: ignore[assignment]
-            seen_models: set[str] = set()
-            for model in extract_camera_models_from_meta(meta_for_extract):
-                key = model.lower()
-                if not key:
-                    continue
-                if key not in labels_map:
-                    labels_map[key] = model
-                display_label = labels_map[key]
-                if key in seen_models:
-                    continue
-                seen_models.add(key)
-                camera_counter[display_label] += 1
+    def _fetch_comments(ids: List[int]) -> Dict[int, List[str]]:
+        if not ids:
+            return {}
+        out: Dict[int, List[str]] = {}
+        for start in range(0, len(ids), 500):
+            chunk = ids[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            query = f"SELECT item_id,comment FROM comments WHERE item_id IN ({placeholders}) ORDER BY id ASC"
+            for iid, comment in conn.execute(query, chunk):
+                out.setdefault(int(iid), []).append(comment)
+        return out
 
-        coords_from_meta = extract_coordinates_from_meta(meta_for_extract) if meta_for_extract else None
-        db_coords = _safe_coord_pair(lat, lon)
-        resolved_coords = coords_from_meta or db_coords
-        if resolved_coords:
-            lat_val, lon_val = resolved_coords
-            geo_buckets: Dict[Tuple[int, int], Dict[str, float]] = g["geo_buckets"]  # type: ignore[assignment]
-            _update_geo_bucket(geo_buckets, lat_val, lon_val)
-            city_label = resolve_city_label(lat_val, lon_val)
-            if city_label:
-                g["cities"].add(city_label)
-            if img:
-                g["image_coords"][img] = (lat_val, lon_val)
-        if added_by and not g.get("added_by"):
-            g["added_by"] = added_by
-        for token_value, token_label in dataset_token_pairs(source, source_file):
-            if token_value:
-                g["sources"][token_value] = token_label
-        if created_at:
-            try:
-                created_at = str(created_at)
-                if not g["first_at"] or created_at < g["first_at"]:
-                    g["first_at"] = created_at
-                if not g["last_at"] or created_at > g["last_at"]:
-                    g["last_at"] = created_at
-            except Exception:
-                pass
-        ids_by_user.setdefault(uname, []).append(iid)
+    def _link_rows_for_user(username: str) -> List[Tuple[Optional[str], Optional[str]]]:
+        where_parts: List[str] = []
+        params: List[Any] = []
+        if username:
+            where_parts.append("username = ?")
+            params.append(username)
+        else:
+            where_parts.append("(username IS NULL OR username = '')")
+        if scope == "chat":
+            where_parts.append("chat_id = ?")
+            params.append(chat_id)
+        where_sql = " AND ".join(where_parts) or "1"
+        query = f"SELECT url, extra_json FROM links WHERE {where_sql}"
+        return list(conn.execute(query, tuple(params)))
 
-    all_ids = [iid for lst in ids_by_user.values() for iid in lst]
-    comments_map: Dict[int,List[str]] = {}
-    if all_ids:
-        chunk_size = 500
-        for i in range(0, len(all_ids), chunk_size):
-            chunk = all_ids[i : i + chunk_size]
-            q = ",".join("?" for _ in chunk)
-            for iid, c in conn.execute(
-                f"SELECT item_id,comment FROM comments WHERE item_id IN ({q}) ORDER BY id ASC",
-                chunk,
-            ):
-                comments_map.setdefault(iid, []).append(c)
-
-    tab_info_by_user: Dict[str, Dict[str, Any]] = {}
-    link_query = "SELECT username, url, extra_json FROM links"
-    link_params: List[Any] = []
-    if scope == "chat":
-        link_query += " WHERE chat_id = ?"
-        link_params.append(chat_id)
-    for uname, link_url, extra_json in conn.execute(link_query, tuple(link_params)).fetchall():
-        key = uname or ""
-        info = tab_info_by_user.setdefault(key, {"url": "", "tabs": []})
-        if link_url and not info.get("url"):
-            info["url"] = link_url
-        tabs = parse_profile_tabs_payload(extra_json or "")
-        if tabs:
+    def _tab_info_for_user(username: str) -> Dict[str, Any]:
+        info: Dict[str, Any] = {}
+        seen_hrefs: Set[str] = set()
+        for link_url, extra_json in _link_rows_for_user(username):
+            if link_url and not info.get("url"):
+                info["url"] = link_url
+            tabs = parse_profile_tabs_payload(extra_json or "")
+            if not tabs:
+                continue
             existing: List[Dict[str, str]] = info.setdefault("tabs", [])  # type: ignore[assignment]
-            seen_hrefs = {tab.get("href") for tab in existing}
             for tab in tabs:
+                if not isinstance(tab, dict):
+                    continue
                 href = tab.get("href")
                 if href and href not in seen_hrefs:
                     existing.append(tab)
                     seen_hrefs.add(href)
+        return info
 
-    out = []
-    for uname, g in groups.items():
+    def _finalize_user(username: str, g: Dict[str, Any], item_ids: List[int]) -> Dict[str, Any]:
         geo_buckets_raw = g.get("geo_buckets", {})  # type: ignore
         geo_buckets: Dict[Tuple[int, int], Dict[str, float]] = (
             geo_buckets_raw if isinstance(geo_buckets_raw, dict) else {}
         )
         lat, lon, location_count = _select_primary_location(geo_buckets)
-        u_comments: List[str] = []
-        for iid in ids_by_user[uname]:
-            u_comments.extend(comments_map.get(iid, []))
-        if u_comments:
-            seen=set(); ded=[]
-            for c in u_comments:
-                if c not in seen: seen.add(c); ded.append(c)
-            u_comments = ded
+
+        comments_map = _fetch_comments(item_ids)
+        combined_comments: List[str] = []
+        for iid in item_ids:
+            combined_comments.extend(comments_map.get(iid, []))
+        if combined_comments:
+            seen: Set[str] = set()
+            deduped: List[str] = []
+            for comment in combined_comments:
+                if comment not in seen:
+                    deduped.append(comment)
+                    seen.add(comment)
+            combined_comments = deduped
+
         raw_added = g.get("added_by", "")
         display, link = added_by_display_and_link(raw_added)
         sources_dict: Dict[str, str] = g.get("sources", {})  # type: ignore
@@ -2327,8 +2266,8 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
         images_ordered: List[str] = g.get("images", [])  # type: ignore
         meta_entries: List[Dict[str, Any]] = []
         for img_url in images_ordered:
-            payload = image_meta_map.get(img_url)
             entry: Dict[str, Any] = {"url": img_url}
+            payload = image_meta_map.get(img_url)
             if isinstance(payload, dict):
                 size_value = payload.get("size_bytes")
                 if isinstance(size_value, (int, float)):
@@ -2371,12 +2310,12 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             if label and int(count or 0) > 0
         ]
 
-        link_info = tab_info_by_user.get(uname, {})
+        link_info = _tab_info_for_user(username)
         link_profile_url = link_info.get("url") if isinstance(link_info, dict) else None
         base_profile_url = (
             link_profile_url
             or g.get("profile_url")
-            or (f"https://vsco.co/{uname}" if uname else "")
+            or (f"https://vsco.co/{username}" if username else "")
         )
 
         tab_media: Dict[str, List[str]] = {}
@@ -2442,7 +2381,13 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
                 entry["slug"] = slug_value
             label_value = entry.get("label") or _tab_label_from_slug(entry.get("slug") or slug_value or "")
             entry["label"] = label_value
-            key_seed = entry.get("tab_key") or entry.get("slug") or entry.get("id") or entry.get("label") or normalized
+            key_seed = (
+                entry.get("tab_key")
+                or entry.get("slug")
+                or entry.get("id")
+                or entry.get("label")
+                or normalized
+            )
             tab_key = _slugify_tab_key(str(key_seed)) if key_seed is not None else ""
             if not tab_key:
                 tab_key = _allocate_tab_key(entry.get("slug") or normalized)
@@ -2507,15 +2452,16 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             }
             _append_tab_entry(fallback_entry, fallback_entry["href"])
 
-        out.append({
-            "username": uname,
-            "profile_url": link_profile_url or g["profile_url"],
-            "lat": lat, "lon": lon,
+        return {
+            "username": username,
+            "profile_url": link_profile_url or g.get("profile_url"),
+            "lat": lat,
+            "lon": lon,
             "images": images_ordered,
             "images_meta": meta_entries,
-            "comments": u_comments,
+            "comments": combined_comments,
             "images_count": len(images_ordered),
-            "comments_count": len(u_comments),
+            "comments_count": len(combined_comments),
             "added_by": display,
             "added_by_link": link or "",
             "added_by_raw": raw_added,
@@ -2527,9 +2473,130 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             "first_created": g.get("first_at"),
             "last_created": g.get("last_at"),
             "profile_tabs": profile_tabs,
-        })
-    conn.close()
-    return out
+        }
+
+    try:
+        current_username: Optional[str] = None
+        current_group: Optional[Dict[str, Any]] = None
+        current_ids: List[int] = []
+
+        for row in _chunked_rows():
+            (
+                iid,
+                uname_raw,
+                purl,
+                lat,
+                lon,
+                img,
+                added_by,
+                source,
+                source_file,
+                meta_json,
+                created_at,
+            ) = row
+            uname = (uname_raw or "")
+            if current_username is None:
+                current_username = uname
+                current_group = _new_group(uname, purl)
+                current_ids = []
+            elif uname != current_username:
+                if current_group is not None:
+                    yield _finalize_user(current_username, current_group, current_ids)
+                current_username = uname
+                current_group = _new_group(uname, purl)
+                current_ids = []
+
+            assert current_group is not None  # for type checkers
+            current_ids.append(int(iid))
+
+            if purl and not current_group["profile_url"]:
+                current_group["profile_url"] = purl
+            if img and img not in current_group["image_set"]:
+                current_group["images"].append(img)
+                current_group["image_set"].add(img)
+
+            base_profile_url = current_group.get("profile_url") or purl or ""
+            normalized_tab_url = _normalize_tab_url(
+                purl or base_profile_url,
+                root=base_profile_url,
+            )
+            if normalized_tab_url:
+                tab_media_map: Dict[str, List[str]] = current_group["tab_media"]  # type: ignore[assignment]
+                tab_media_seen: Dict[str, Set[str]] = current_group["tab_media_seen"]  # type: ignore[assignment]
+                bucket = tab_media_map.setdefault(normalized_tab_url, [])
+                seen_bucket = tab_media_seen.setdefault(normalized_tab_url, set())
+                if img and img not in seen_bucket:
+                    bucket.append(img)
+                    seen_bucket.add(img)
+
+            meta_payload: Optional[Dict[str, Any]] = None
+            meta_for_extract: Optional[Dict[str, Any]] = None
+            if meta_json:
+                try:
+                    decoded_meta = json.loads(meta_json)
+                except Exception:
+                    meta_payload = {"raw": meta_json}
+                else:
+                    if isinstance(decoded_meta, dict):
+                        meta_payload = decoded_meta
+                        meta_for_extract = decoded_meta
+                    else:
+                        meta_payload = {"raw": decoded_meta}
+            if img and meta_payload:
+                current_group["image_meta"][img] = meta_payload
+            elif img and meta_json and img not in current_group["image_meta"]:
+                current_group["image_meta"][img] = {"raw": meta_json}
+
+            if meta_for_extract:
+                camera_counter: Counter[str] = current_group["camera_models"]  # type: ignore[assignment]
+                labels_map: Dict[str, str] = current_group["camera_model_labels"]  # type: ignore[assignment]
+                seen_models: set[str] = set()
+                for model in extract_camera_models_from_meta(meta_for_extract):
+                    key = model.lower()
+                    if not key:
+                        continue
+                    if key not in labels_map:
+                        labels_map[key] = model
+                    display_label = labels_map[key]
+                    if key in seen_models:
+                        continue
+                    seen_models.add(key)
+                    camera_counter[display_label] += 1
+
+            coords_from_meta = (
+                extract_coordinates_from_meta(meta_for_extract) if meta_for_extract else None
+            )
+            db_coords = _safe_coord_pair(lat, lon)
+            resolved_coords = coords_from_meta or db_coords
+            if resolved_coords:
+                lat_val, lon_val = resolved_coords
+                geo_buckets: Dict[Tuple[int, int], Dict[str, float]] = current_group["geo_buckets"]  # type: ignore[assignment]
+                _update_geo_bucket(geo_buckets, lat_val, lon_val)
+                city_label = resolve_city_label(lat_val, lon_val)
+                if city_label:
+                    current_group["cities"].add(city_label)
+                if img:
+                    current_group["image_coords"][img] = (lat_val, lon_val)
+            if added_by and not current_group.get("added_by"):
+                current_group["added_by"] = added_by
+            for token_value, token_label in dataset_token_pairs(source, source_file):
+                if token_value:
+                    current_group["sources"][token_value] = token_label
+            if created_at:
+                try:
+                    created_at_str = str(created_at)
+                    if not current_group["first_at"] or created_at_str < current_group["first_at"]:
+                        current_group["first_at"] = created_at_str
+                    if not current_group["last_at"] or created_at_str > current_group["last_at"]:
+                        current_group["last_at"] = created_at_str
+                except Exception:
+                    pass
+
+        if current_username is not None and current_group is not None:
+            yield _finalize_user(current_username, current_group, current_ids)
+    finally:
+        cursor.close()
+        conn.close()
 
 def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     conn = db_connect(); conn.execute("PRAGMA read_uncommitted=1;")
