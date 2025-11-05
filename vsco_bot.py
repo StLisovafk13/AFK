@@ -2119,18 +2119,44 @@ def format_stats_text(stats: Dict[str, Dict[str, int]], scope: str) -> str:
     )
 
 # ---------------------- Export / Aggregations ----------------------
-def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
+def fetch_gallery_users(
+    scope: str,
+    chat_id: int,
+    *,
+    limit: Optional[int] = None,
+    offset: int = 0,
+    username: Optional[str] = None,
+    added_by: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     conn = db_connect(); conn.execute("PRAGMA read_uncommitted=1;")
-    if scope == "chat":
-        rows = conn.execute(
-            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,meta_json,created_at"
-            " FROM items WHERE chat_id=?",
-            (chat_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,meta_json,created_at FROM items"
-        ).fetchall()
+    where_sql, params = _items_where_clause(None, chat_id, scope)
+    filters: List[str] = []
+    if username:
+        filters.append("LOWER(username) LIKE ?")
+        params.append(f"%{username.lower()}%")
+    if added_by:
+        filters.append("LOWER(added_by) LIKE ?")
+        params.append(f"%{added_by.lower()}%")
+    if filters:
+        where_sql = f"{where_sql} AND " + " AND ".join(filters)
+
+    query = (
+        "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,meta_json,created_at "
+        f"FROM items WHERE {where_sql} ORDER BY id ASC"
+    )
+    query_params: List[Any] = list(params)
+    normalized_offset = max(int(offset or 0), 0)
+    if limit is not None:
+        limit_value = int(limit)
+        if limit_value <= 0:
+            conn.close(); return []
+        query += " LIMIT ? OFFSET ?"
+        query_params.extend([limit_value, normalized_offset])
+    elif normalized_offset:
+        query += " LIMIT -1 OFFSET ?"
+        query_params.append(normalized_offset)
+
+    rows = conn.execute(query, tuple(query_params)).fetchall()
     if not rows:
         conn.close(); return []
 
@@ -2494,18 +2520,518 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
     conn.close()
     return out
 
-def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
+# ---------------------- HTML builders (gallery/maps) ----------------------
+def build_rich_gallery(
+    users: List[Dict[str, Any]],
+    title: str = "VSCOLeak",
+    subtitle: str = "",
+    *,
+    config: Optional[Dict[str, Any]] = None,
+) -> str:
+    config_payload: Dict[str, Any] = {}
+    if config:
+        config_payload.update(config)
+    if "preloaded" not in config_payload:
+        config_payload["preloaded"] = users
+    config_payload["title"] = title
+    config_payload["subtitle"] = subtitle
+    limit_value = config_payload.get("limit")
+    try:
+        limit_int = int(limit_value)
+    except (TypeError, ValueError):
+        limit_int = 40
+    if limit_int <= 0:
+        limit_int = 40
+    config_payload["limit"] = limit_int
+    initial_offset_value = config_payload.get("initial_offset", config_payload.get("offset", 0))
+    try:
+        initial_offset = int(initial_offset_value)
+    except (TypeError, ValueError):
+        initial_offset = 0
+    if initial_offset < 0:
+        initial_offset = 0
+    config_payload["initial_offset"] = initial_offset
+    config_payload["offset"] = initial_offset
+    chat_id_val = config_payload.get("chat_id")
+    if isinstance(chat_id_val, (int, float)) and not isinstance(chat_id_val, bool):
+        config_payload["chat_id"] = int(chat_id_val)
+    elif chat_id_val is None:
+        config_payload["chat_id"] = None
+    api_base_val = config_payload.get("api_base")
+    if not isinstance(api_base_val, str):
+        config_payload["api_base"] = None
+    scope_val = config_payload.get("scope")
+    if scope_val not in {"chat", "all"}:
+        config_payload["scope"] = "all"
+    safe_title = escape(title)
+    display_title = safe_title
+    if "VSCOLeak" in title:
+        display_title = safe_title.replace(
+            "VSCOLeak", 'VSCOLeak<span class="title-accent">💧</span>'
+        )
+    subtitle_html = f'<div class="sub">{escape(subtitle)}</div>' if subtitle else ""
+    config_json = json.dumps(config_payload, ensure_ascii=False).replace("</", "<\/")
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>{escape(title)}</title>
+  <style>
+    :root {{ color-scheme: light; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin:0; font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:#f5f6f8; color:#0f172a; }}
+    a {{ color: inherit; }}
+    .wrap {{ max-width: 1280px; margin: 32px auto 64px; padding: 0 20px 80px; }}
+    .page-header {{ display:flex; flex-direction:column; align-items:center; gap:12px; text-align:center; margin-bottom:24px; }}
+    .page-title h1 {{ margin:0; font-size:36px; font-weight:700; letter-spacing:-0.03em; display:flex; align-items:center; gap:10px; }}
+    .page-title .title-accent {{ font-size:32px; line-height:1; }}
+    .page-header .sub {{ color:#64748b; font-size:15px; }}
+    .toolbar form {{ display:flex; flex-wrap:wrap; gap:16px; background:#fff; padding:20px 24px; border-radius:24px; box-shadow:0 24px 48px rgba(15,23,42,0.1); }}
+    .field {{ flex:1 1 220px; display:flex; flex-direction:column; gap:8px; font-size:12px; color:#64748b; }}
+    .field label {{ font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.12em; color:#94a3b8; }}
+    .field input {{ padding:10px 12px; border:1px solid #d1d5db; border-radius:12px; background:#f9fafb; font-size:13px; color:#0f172a; transition:border-color .15s ease, box-shadow .15s ease; }}
+    .field input:focus {{ outline:none; border-color:#2563eb; box-shadow:0 0 0 3px rgba(37,99,235,0.15); background:#fff; }}
+    .field--button {{ flex:0 0 auto; justify-content:flex-end; }}
+    .field--button .buttons {{ display:flex; gap:8px; align-items:center; }}
+    .field--button button {{ padding:11px 16px; border-radius:12px; border:none; font-weight:600; cursor:pointer; transition:transform .15s ease, box-shadow .15s ease, background .15s ease; }}
+    .field--button button[type="submit"] {{ background:#0f172a; color:#fff; }}
+    .field--button button[type="submit"]:hover {{ transform:translateY(-1px); box-shadow:0 12px 24px rgba(15,23,42,0.2); }}
+    .field--button button[type="button"] {{ background:#e2e8f0; color:#0f172a; }}
+    .field--button button[type="button"]:hover {{ transform:translateY(-1px); box-shadow:0 12px 24px rgba(148,163,184,0.3); }}
+    .field--button button:disabled {{ opacity:0.5; cursor:not-allowed; box-shadow:none; transform:none; }}
+    .status-bar {{ margin:0 0 16px; font-size:13px; color:#64748b; }}
+    .notice {{ margin:12px 0; padding:12px 16px; border-radius:12px; background:#eef2ff; color:#3730a3; font-size:13px; display:none; }}
+    .notice.visible {{ display:block; }}
+    .error {{ margin:16px 0; padding:12px 16px; border-radius:12px; background:#fee2e2; color:#b91c1c; font-size:13px; display:none; }}
+    .error.visible {{ display:block; }}
+    .gallery-grid {{ display:grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap:22px; }}
+    .card {{ background:#fff; border-radius:24px; box-shadow:0 26px 52px rgba(15,23,42,0.12); overflow:hidden; display:flex; flex-direction:column; transition:transform .2s ease, box-shadow .2s ease; }}
+    .card:hover {{ transform:translateY(-2px); box-shadow:0 32px 60px rgba(15,23,42,0.16); }}
+    .card-thumb {{ position:relative; width:100%; padding-top:66%; background:#e2e8f0; overflow:hidden; }}
+    .card-thumb img {{ position:absolute; inset:0; width:100%; height:100%; object-fit:cover; opacity:0; transition:opacity .3s ease; }}
+    .card-thumb img.loaded {{ opacity:1; }}
+    .card-thumb img.placeholder {{ opacity:0.35; object-fit:contain; }}
+    .card-body {{ padding:18px 20px 22px; display:flex; flex-direction:column; gap:12px; }}
+    .card-title {{ display:flex; justify-content:space-between; align-items:center; gap:12px; }}
+    .card-title a {{ font-size:18px; font-weight:700; color:#0f172a; text-decoration:none; }}
+    .card-title a:hover {{ text-decoration:underline; }}
+    .card-meta {{ font-size:12px; color:#64748b; display:flex; flex-wrap:wrap; gap:10px; }}
+    .chips {{ display:flex; flex-wrap:wrap; gap:6px; }}
+    .chip {{ background:#e2e8f0; color:#334155; font-size:11px; padding:4px 8px; border-radius:999px; }}
+    .chip.city {{ background:#dbeafe; color:#1d4ed8; }}
+    .chip.dataset {{ background:#dcfce7; color:#047857; }}
+    .chip.added {{ background:#ede9fe; color:#5b21b6; }}
+    .loader {{ margin:32px auto 16px; text-align:center; font-size:13px; color:#475569; display:none; }}
+    .loader.visible {{ display:block; }}
+    .sentinel {{ width:100%; height:1px; }}
+    @media (max-width: 760px) {{
+      .page-title h1 {{ font-size:30px; }}
+      .toolbar form {{ padding:16px 18px; }}
+      .field--button {{ width:100%; }}
+      .field--button .buttons {{ width:100%; }}
+      .field--button button {{ flex:1 1 auto; }}
+    }}
+  </style>
+  <script>
+    window.__GALLERY_CONFIG__ = {config_json};
+  </script>
+</head>
+<body>
+  <div class="wrap">
+    <header class="page-header">
+      <div class="page-title">
+        <h1>{display_title}</h1>
+        {subtitle_html}
+      </div>
+    </header>
+    <section class="toolbar">
+      <form id="filters">
+        <div class="field">
+          <label for="filter-search">Юзернейм</label>
+          <input id="filter-search" name="username" type="text" placeholder="@username" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="filter-added">Добавил</label>
+          <input id="filter-added" name="added_by" type="text" placeholder="Имя или примечание" autocomplete="off" />
+        </div>
+        <div class="field field--button">
+          <div class="buttons">
+            <button type="submit">Применить</button>
+            <button type="button" id="reset-filters">Сбросить</button>
+          </div>
+        </div>
+      </form>
+    </section>
+    <p class="notice" id="api-notice" hidden></p>
+    <div class="status-bar" id="status-bar">Загружено 0</div>
+    <div class="error" id="error-box"></div>
+    <section>
+      <div class="gallery-grid" id="gallery-grid"></div>
+      <div class="loader" id="loader">Загрузка…</div>
+      <div class="sentinel" id="scroll-sentinel"></div>
+    </section>
+  </div>
+  <script>
+    (function() {{
+      const config = window.__GALLERY_CONFIG__ || {{}};
+      const apiBaseRaw = typeof config.api_base === 'string' ? config.api_base : '';
+      const apiBase = apiBaseRaw ? apiBaseRaw.replace(/\/+$/, '') : '';
+      const useApi = Boolean(apiBase);
+      const scope = config.scope || 'all';
+      const chatId = config.chat_id;
+      const limitValue = Number(config.limit);
+      const limit = Number.isFinite(limitValue) && limitValue > 0 ? Math.floor(limitValue) : 40;
+      let offsetValue = Number(config.initial_offset);
+      if (!Number.isFinite(offsetValue) || offsetValue < 0) offsetValue = 0;
+      let offset = offsetValue;
+      let loading = false;
+      let done = !useApi;
+      let totalLoaded = 0;
+
+      const grid = document.getElementById('gallery-grid');
+      if (!grid) return;
+      const loader = document.getElementById('loader');
+      const errorBox = document.getElementById('error-box');
+      const statusBar = document.getElementById('status-bar');
+      const sentinel = document.getElementById('scroll-sentinel');
+      const filterForm = document.getElementById('filters');
+      const searchInput = document.getElementById('filter-search');
+      const addedInput = document.getElementById('filter-added');
+      const resetBtn = document.getElementById('reset-filters');
+      const notice = document.getElementById('api-notice');
+
+      function setNotice(text) {{
+        if (!notice) return;
+        notice.textContent = text;
+        const show = Boolean(text);
+        notice.hidden = !show;
+        if (show) {{
+          notice.classList.add('visible');
+        }} else {{
+          notice.classList.remove('visible');
+        }}
+      }}
+
+      if (!useApi) {{
+        setNotice('Данные встроены в HTML. Пагинация и фильтры отключены.');
+        if (filterForm) {{
+          filterForm.querySelectorAll('input,button').forEach(function(el) {{
+            el.disabled = true;
+          }});
+        }}
+      }}
+
+      function updateStatus() {{
+        if (!statusBar) return;
+        statusBar.textContent = 'Загружено ' + totalLoaded;
+      }}
+
+      function clearGrid() {{
+        grid.innerHTML = '';
+        totalLoaded = 0;
+        updateStatus();
+      }}
+
+      const imageObserver = new IntersectionObserver(function(entries) {{
+        entries.forEach(function(entry) {{
+          if (!entry.isIntersecting) return;
+          const img = entry.target;
+          const src = img.getAttribute('data-src');
+          if (src) {{
+            img.setAttribute('src', src);
+            img.onload = function() {{ img.classList.add('loaded'); }};
+            img.removeAttribute('data-src');
+          }} else {{
+            img.classList.add('loaded');
+          }}
+          imageObserver.unobserve(img);
+        }});
+      }}, {{ rootMargin: '260px 0px' }});
+
+      function registerLazy(img) {{
+        if (!img) return;
+        if (img.getAttribute && img.getAttribute('data-src')) {{
+          imageObserver.observe(img);
+        }} else {{
+          img.classList.add('loaded');
+        }}
+      }}
+
+      function createChip(label, cls) {{
+        const chip = document.createElement('span');
+        chip.className = 'chip' + (cls ? ' ' + cls : '');
+        chip.textContent = label;
+        return chip;
+      }}
+
+      function formatDateRange(first, last) {{
+        const f = typeof first === 'string' ? first.split('T')[0] : '';
+        const l = typeof last === 'string' ? last.split('T')[0] : '';
+        if (f && l) return f === l ? f : f + ' → ' + l;
+        return f || l || '';
+      }}
+
+      function appendMeta(meta, text) {{
+        if (!text) return;
+        const span = document.createElement('span');
+        span.textContent = text;
+        meta.appendChild(span);
+      }}
+
+      function renderUser(user) {{
+        const card = document.createElement('article');
+        card.className = 'card';
+
+        const profileUrl = typeof user.profile_url === 'string' && user.profile_url ? user.profile_url : '#';
+        const username = typeof user.username === 'string' ? user.username : '';
+        const images = Array.isArray(user.images) ? user.images : [];
+        const thumbUrl = images.find(function(url) {{ return typeof url === 'string' && url; }}) || '';
+
+        const thumbLink = document.createElement('a');
+        thumbLink.className = 'card-thumb';
+        thumbLink.href = profileUrl;
+        thumbLink.target = '_blank';
+        thumbLink.rel = 'noopener';
+
+        const thumbImg = document.createElement('img');
+        thumbImg.alt = username ? '@' + username : 'VSCO image';
+        if (thumbUrl) {{
+          thumbImg.setAttribute('data-src', thumbUrl);
+          thumbImg.loading = 'lazy';
+        }} else {{
+          thumbImg.classList.add('placeholder');
+        }}
+        thumbLink.appendChild(thumbImg);
+        card.appendChild(thumbLink);
+        registerLazy(thumbImg);
+
+        const body = document.createElement('div');
+        body.className = 'card-body';
+
+        const titleRow = document.createElement('div');
+        titleRow.className = 'card-title';
+        const nameLink = document.createElement('a');
+        nameLink.href = profileUrl;
+        nameLink.target = '_blank';
+        nameLink.rel = 'noopener';
+        nameLink.textContent = username ? '@' + username : 'Безымянный профиль';
+        titleRow.appendChild(nameLink);
+        body.appendChild(titleRow);
+
+        const meta = document.createElement('div');
+        meta.className = 'card-meta';
+        const photoCountValue = Number.isFinite(Number(user.images_count)) ? Number(user.images_count) : images.length;
+        if (photoCountValue > 0) appendMeta(meta, '📸 ' + photoCountValue);
+        const commentsCount = Number.isFinite(Number(user.comments_count)) ? Number(user.comments_count) : 0;
+        if (commentsCount > 0) appendMeta(meta, '💬 ' + commentsCount);
+        const locationCount = Number.isFinite(Number(user.location_photo_count)) ? Number(user.location_photo_count) : 0;
+        if (locationCount > 0) appendMeta(meta, '📍 ' + locationCount);
+        const range = formatDateRange(user.first_created, user.last_created);
+        if (range) appendMeta(meta, '🗓️ ' + range);
+        if (meta.childElementCount) {{
+          body.appendChild(meta);
+        }}
+
+        const chips = document.createElement('div');
+        chips.className = 'chips';
+        const cities = Array.isArray(user.cities) ? user.cities : [];
+        cities.slice(0, 4).forEach(function(city) {{
+          if (!city) return;
+          chips.appendChild(createChip(city, 'city'));
+        }});
+        const datasets = Array.isArray(user.datasets) ? user.datasets : [];
+        datasets.slice(0, 4).forEach(function(ds) {{
+          const label = ds && typeof ds.label === 'string' ? ds.label : (ds && ds.value ? String(ds.value) : '');
+          if (!label) return;
+          chips.appendChild(createChip(label, 'dataset'));
+        }});
+        const added = typeof user.added_by === 'string' ? user.added_by : '';
+        if (added) {{
+          chips.appendChild(createChip(added, 'added'));
+        }}
+        if (chips.childElementCount) {{
+          body.appendChild(chips);
+        }}
+
+        card.appendChild(body);
+        return card;
+      }}
+
+      function appendUsers(list) {{
+        if (!Array.isArray(list)) return;
+        list.forEach(function(user) {{
+          const card = renderUser(user || {{}});
+          grid.appendChild(card);
+          totalLoaded += 1;
+        }});
+        updateStatus();
+      }}
+
+      function buildParams(nextOffset) {{
+        const params = new URLSearchParams();
+        params.set('scope', scope);
+        if (scope === 'chat' && (typeof chatId === 'number' || typeof chatId === 'string')) {{
+          params.set('chat_id', String(chatId));
+        }}
+        params.set('limit', String(limit));
+        params.set('offset', String(nextOffset));
+        if (searchInput && searchInput.value.trim()) {{
+          params.set('username', searchInput.value.trim());
+        }}
+        if (addedInput && addedInput.value.trim()) {{
+          params.set('added_by', addedInput.value.trim());
+        }}
+        return params;
+      }}
+
+      async function fetchBatch(nextOffset) {{
+        if (!useApi) {{
+          done = true;
+          return [];
+        }}
+        const endpoint = apiBase + '/gallery?' + buildParams(nextOffset).toString();
+        const response = await fetch(endpoint, {{ credentials: 'same-origin' }});
+        if (!response.ok) {{
+          throw new Error('HTTP ' + response.status);
+        }}
+        const data = await response.json();
+        const list = Array.isArray(data.users) ? data.users : [];
+        if (typeof data.next_offset === 'number') {{
+          offset = data.next_offset;
+        }} else {{
+          offset = nextOffset + list.length;
+        }}
+        const hasMore = Boolean(data.has_more) && list.length >= limit;
+        if (!hasMore || list.length === 0) {{
+          done = true;
+          if (sentinel) sentinel.classList.add('hidden');
+        }} else if (sentinel) {{
+          sentinel.classList.remove('hidden');
+        }}
+        return list;
+      }}
+
+      async function loadMore() {{
+        if (loading || done) return;
+        loading = true;
+        if (loader) loader.classList.add('visible');
+        if (errorBox) {{
+          errorBox.classList.remove('visible');
+          errorBox.textContent = '';
+        }}
+        try {{
+          const batch = await fetchBatch(offset);
+          if (batch.length) {{
+            appendUsers(batch);
+          }} else if (useApi) {{
+            done = true;
+          }}
+        }} catch (err) {{
+          done = true;
+          if (errorBox) {{
+            errorBox.textContent = err && err.message ? err.message : 'Не удалось загрузить данные';
+            errorBox.classList.add('visible');
+          }}
+        }} finally {{
+          if (loader) loader.classList.remove('visible');
+          loading = false;
+        }}
+      }}
+
+      function resetAndReload() {{
+        if (!useApi) return;
+        offset = 0;
+        done = false;
+        clearGrid();
+        if (sentinel) sentinel.classList.remove('hidden');
+        loadMore();
+      }}
+
+      if (filterForm) {{
+        filterForm.addEventListener('submit', function(event) {{
+          event.preventDefault();
+          resetAndReload();
+        }});
+      }}
+      if (resetBtn) {{
+        resetBtn.addEventListener('click', function() {{
+          if (!useApi) return;
+          if (searchInput) searchInput.value = '';
+          if (addedInput) addedInput.value = '';
+          resetAndReload();
+        }});
+      }}
+
+      const preloaded = Array.isArray(config.preloaded) ? config.preloaded : [];
+      if (preloaded.length) {{
+        appendUsers(preloaded);
+        if (offset === 0) {{
+          offset = preloaded.length;
+        }}
+      }}
+
+      updateStatus();
+
+      if (useApi) {{
+        if (sentinel) {{
+          const observer = new IntersectionObserver(function(entries) {{
+            if (entries.some(function(entry) {{ return entry.isIntersecting; }})) {{
+              loadMore();
+            }}
+          }}, {{ rootMargin: '480px 0px' }});
+          observer.observe(sentinel);
+        }}
+        if (!preloaded.length) {{
+          loadMore();
+        }}
+      }} else if (loader) {{
+        loader.remove();
+      }}
+    }})();
+  </script>
+</body>
+</html>"""
+    return html
+
+def fetch_items_for_map(
+    scope: str,
+    chat_id: int,
+    *,
+    limit: Optional[int] = None,
+    offset: int = 0,
+    username: Optional[str] = None,
+    added_by: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     conn = db_connect(); conn.execute("PRAGMA read_uncommitted=1;")
-    if scope == "chat":
-        rows = conn.execute(
-            "SELECT id,username,profile_url,image_url,latitude,longitude,added_by,source,source_file,meta_json,created_at"
-            " FROM items WHERE chat_id=?",
-            (chat_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT id,username,profile_url,image_url,latitude,longitude,added_by,source,source_file,meta_json,created_at FROM items"
-        ).fetchall()
+    where_sql, params = _items_where_clause(None, chat_id, scope)
+    filters: List[str] = []
+    if username:
+        filters.append("LOWER(username) LIKE ?")
+        params.append(f"%{username.lower()}%")
+    if added_by:
+        filters.append("LOWER(added_by) LIKE ?")
+        params.append(f"%{added_by.lower()}%")
+    if filters:
+        where_sql = f"{where_sql} AND " + " AND ".join(filters)
+
+    query = (
+        "SELECT id,username,profile_url,image_url,latitude,longitude,added_by,source,source_file,meta_json,created_at "
+        f"FROM items WHERE {where_sql} ORDER BY id ASC"
+    )
+    query_params: List[Any] = list(params)
+    normalized_offset = max(int(offset or 0), 0)
+    if limit is not None:
+        limit_value = int(limit)
+        if limit_value <= 0:
+            conn.close(); return []
+        query += " LIMIT ? OFFSET ?"
+        query_params.extend([limit_value, normalized_offset])
+    elif normalized_offset:
+        query += " LIMIT -1 OFFSET ?"
+        query_params.append(normalized_offset)
+
+    rows = conn.execute(query, tuple(query_params)).fetchall()
     if not rows:
         conn.close(); return []
     ids = [r[0] for r in rows]
@@ -2570,1644 +3096,6 @@ def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
         })
     conn.close()
     return out
-
-# ---------------------- HTML builders (gallery/maps) ----------------------
-def build_rich_gallery(users: List[Dict[str, Any]], title="VSCOLeak", subtitle=""):
-    data_json = json.dumps(users, ensure_ascii=False)
-    safe_title = escape(title)
-    display_title = safe_title
-    if "VSCOLeak" in title:
-        display_title = safe_title.replace(
-            "VSCOLeak", 'VSCOLeak<span class="title-accent">💧</span>'
-        )
-    html = f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset=\"utf-8\"/>
-  <title>{escape(title)}</title>
-  <style>
-    body {{ font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; margin:0; background:#f5f6f8; color:#0f172a; }}
-    .wrap {{ max-width: 1280px; margin: 32px auto 48px; padding: 0 20px 48px; }}
-    .page-header {{ display:flex; flex-direction:column; align-items:center; gap:20px; margin-bottom:24px; text-align:center; }}
-    .page-title {{ display:flex; flex-direction:column; align-items:center; gap:8px; }}
-    .page-title h1 {{ margin:0; font-size:36px; font-weight:700; letter-spacing:-0.03em; display:flex; align-items:center; justify-content:center; gap:12px; color:#0f172a; }}
-    .page-title .title-accent {{ font-size:30px; line-height:1; display:inline-flex; align-items:center; }}
-    .sub {{ color:#6b7280; font-size:15px; }}
-    .toolbar {{
-      display:grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap:18px 16px;
-      margin-bottom:28px;
-      background:#fff;
-      padding:24px;
-      border-radius:24px;
-      box-shadow:0 24px 48px rgba(15,23,42,0.1);
-    }}
-    .toolbar .field {{ display:flex; flex-direction:column; gap:8px; font-size:12px; color:#64748b; }}
-    .toolbar .field.inline {{ flex-direction:row; align-items:center; gap:8px; }}
-    .toolbar label {{ font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.12em; color:#94a3b8; }}
-    .toolbar input,.toolbar select,.toolbar button {{ padding:10px 12px; border:1px solid #d1d5db; border-radius:12px; background:#f9fafb; font-size:13px; color:#0f172a; transition:border-color .15s ease, box-shadow .15s ease; }}
-    .toolbar input:focus,.toolbar select:focus {{ border-color:#2563eb; box-shadow:0 0 0 3px rgba(37,99,235,0.15); outline:none; background:#fff; }}
-    .toolbar input[type="number"] {{ font-variant-numeric: tabular-nums; }}
-    .toolbar .field--button {{ align-self:flex-end; display:flex; flex-direction:column; justify-content:flex-end; gap:8px; }}
-    .toolbar .field--button button {{ width:100%; font-weight:600; cursor:pointer; transition:background .15s ease, color .15s ease, transform .15s ease; border:none; border-radius:12px; padding:12px 14px; }}
-    .toolbar .field--button.primary button {{ background:#0f172a; color:#fff; }}
-    .toolbar .field--button.primary button:hover {{ background:#1f2937; transform:translateY(-1px); }}
-    .toolbar .field--button.secondary button {{ background:#e2e8f0; color:#0f172a; }}
-    .toolbar .field--button.secondary button:hover {{ background:#cbd5f5; transform:translateY(-1px); }}
-    .chips {{ display:flex; flex-wrap:wrap; gap:6px; margin:6px 0; }}
-    .chip {{ display:inline-flex; align-items:center; padding:4px 8px; border-radius:999px; font-size:11px; background:#f3f4f6; color:#374151; }}
-    .chip-city {{ background:#dbeafe; color:#1d4ed8; }}
-    .chip-data {{ background:#dcfce7; color:#047857; }}
-    .chip-device {{ background:#ede9fe; color:#5b21b6; }}
-    .meta.created {{ color:#4b5563; }}
-    .stats-card {{ min-width:240px; background:#fff; border-radius:20px; padding:16px 20px; box-shadow:0 22px 44px rgba(15,23,42,0.12); color:#0f172a; display:flex; align-items:center; gap:20px; font-variant-numeric:tabular-nums; flex-wrap:wrap; }}
-    .stats-card::before {{ content:\"📊\"; font-size:24px; }}
-    .stats-card span {{ display:flex; flex-direction:column; gap:2px; font-size:11px; letter-spacing:0.08em; text-transform:uppercase; color:#94a3b8; }}
-    .stats-card span .value {{ font-size:20px; font-weight:700; color:#0f172a; letter-spacing:0; text-transform:none; }}
-    .grid {{ display:grid; grid-template-columns: repeat(auto-fill,minmax(300px,1fr)); gap:20px; }}
-    .card {{ background:#fff; border-radius:24px; padding:20px; box-shadow:0 28px 54px rgba(15,23,42,0.12); border:1px solid #e2e8f0; display:flex; flex-direction:column; gap:12px; }}
-    .card .head {{ display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }}
-    .card .head .name a {{ font-weight:700; text-decoration:none; color:#0f172a; font-size:18px; }}
-    .btn {{ display:inline-block; padding:8px 14px; border-radius:999px; background:#14b8a6; color:#fff; text-decoration:none; font-weight:600; letter-spacing:0.02em; box-shadow:0 10px 20px rgba(20,184,166,0.25); transition:transform .15s ease, box-shadow .15s ease; }}
-    .btn:hover {{ transform:translateY(-1px); box-shadow:0 14px 26px rgba(20,184,166,0.3); }}
-    .btn:visited {{ color:#fff; }}
-    .btn-secondary {{ display:inline-flex; align-items:center; justify-content:center; padding:10px 16px; border-radius:12px; background:#0f172a; color:#fff; text-decoration:none; font-weight:600; border:none; cursor:pointer; transition:background .15s ease, transform .15s ease; }}
-    .btn-secondary:hover {{ background:#1f2937; transform:translateY(-1px); }}
-    .card .actions {{ display:flex; flex-wrap:wrap; gap:12px; margin-top:4px; }}
-    .meta {{ font-size:13px; color:#64748b; margin:2px 0; }}
-    .meta.added {{ color:#475569; margin-top:2px; }}
-    .card-stats {{ display:flex; flex-wrap:wrap; gap:10px; margin:2px 0 4px; }}
-    .card-stats span {{ display:inline-flex; align-items:center; gap:6px; font-weight:600; color:#0f172a; background:#e2e8f0; padding:4px 10px; border-radius:999px; font-size:12px; }}
-    .card-stats span:last-child {{ background:#dbeafe; color:#1d4ed8; }}
-    .thumbs {{ display:flex; gap:10px; overflow:hidden; }}
-    .thumbs img {{ width:80px; height:128px; object-fit:cover; border-radius:12px; border:1px solid #e2e8f0; background:#f8fafc; }}
-    .cm {{ margin-top:8px; font-size:13px; color:#475569; }}
-    .cm ul {{ margin: 0 0 6px 18px; padding:0; }}
-    .cm .empty {{ color:#9ca3af; font-size:12px; }}
-    .cm .more {{ color:#6b7280; font-size:12px; }}
-    .hidden {{ display:none !important; }}
-    .profile-view {{ max-width: 1200px; margin: 0 auto; padding: 32px 16px 60px; }}
-    .profile-wrap {{ background:#fff; border-radius:20px; padding:36px; box-shadow:0 24px 40px rgba(15,23,42,0.08); }}
-    .profile-back {{ background:none; border:none; color:#2563eb; font-size:14px; font-weight:600; cursor:pointer; padding:0; margin-bottom:24px; display:inline-flex; align-items:center; gap:6px; }}
-    .profile-back:hover {{ color:#1d4ed8; }}
-    .profile-head {{ display:flex; gap:32px; align-items:center; margin-bottom:24px; }}
-    .profile-avatar {{ width:144px; height:144px; border-radius:50%; background:linear-gradient(135deg,#e5e7eb,#d1d5db); border:6px solid #f3f4f6; display:flex; align-items:center; justify-content:center; font-size:48px; font-weight:600; color:#9ca3af; overflow:hidden; background-size:cover; background-position:center; }}
-    .profile-avatar.has-image {{ border-color:#fff; color:transparent; }}
-    .profile-info {{ flex:1 1 auto; }}
-    .profile-username {{ font-size:32px; font-weight:300; margin:0 0 14px 0; display:flex; align-items:center; gap:14px; }}
-    .profile-actions {{ display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px; }}
-    .profile-actions .follow {{ background:#111; color:#fff; border-radius:999px; padding:8px 22px; font-size:13px; letter-spacing:0.08em; text-transform:uppercase; text-decoration:none; font-weight:700; }}
-    .profile-actions .follow.disabled {{ pointer-events:none; opacity:0.5; }}
-    .profile-actions .open {{ font-size:13px; color:#2563eb; text-decoration:none; font-weight:600; }}
-    .profile-actions .open:hover {{ text-decoration:underline; }}
-    .profile-tabs {{ display:flex; flex-wrap:wrap; gap:28px; margin:12px 0 24px; border-bottom:1px solid #e5e7eb; padding-bottom:8px; }}
-    .profile-tabs.hidden {{ display:none !important; }}
-    .profile-tab {{ position:relative; display:inline-flex; align-items:center; justify-content:center; padding:8px 0; background:none; border:none; color:#6b7280; text-decoration:none; font-weight:600; font-size:13px; letter-spacing:0.12em; text-transform:uppercase; cursor:pointer; transition:color .15s ease; }}
-    .profile-tab::after {{ content:""; position:absolute; left:0; right:0; bottom:-9px; height:2px; background:transparent; transition:background .15s ease; }}
-    .profile-tab:hover {{ color:#111827; }}
-    .profile-tab:focus-visible {{ outline:none; color:#111827; }}
-    .profile-tab.active {{ color:#111827; }}
-    .profile-tab.active::after {{ background:#111827; }}
-    .profile-meta {{ display:flex; gap:16px; flex-wrap:wrap; font-size:13px; color:#4b5563; margin-bottom:10px; }}
-    .profile-meta span {{ display:inline-flex; align-items:center; gap:6px; }}
-    .profile-tags {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }}
-    .profile-tags .tag {{ background:#f3f4f6; border-radius:999px; padding:4px 10px; font-size:12px; color:#4b5563; }}
-    .profile-phones {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }}
-    .profile-phones .tag {{ background:#ede9fe; color:#4c1d95; border-radius:999px; padding:4px 10px; font-size:12px; display:inline-flex; align-items:center; gap:6px; }}
-    .profile-cities {{ display:flex; gap:8px; flex-wrap:wrap; font-size:12px; color:#1f2937; margin-bottom:18px; }}
-    .profile-cities .chip {{ background:#e0f2fe; color:#1d4ed8; border-radius:999px; padding:4px 12px; }}
-    .profile-stats {{ display:flex; gap:32px; margin-bottom:28px; }}
-    .profile-stats .stat {{ display:flex; flex-direction:column; font-size:14px; color:#6b7280; }}
-    .profile-stats .stat .value {{ font-size:20px; font-weight:600; color:#111827; }}
-    .profile-grid {{ display:grid; grid-template-columns: repeat(auto-fill,minmax(220px,1fr)); gap:16px; }}
-    .profile-grid .cell {{ display:flex; flex-direction:column; border-radius:18px; overflow:hidden; background:#f3f4f6; border:1px solid #e5e7eb; }}
-    .profile-grid .cell-thumb {{ position:relative; width:100%; padding-bottom:100%; background:#e5e7eb; }}
-    .profile-grid .cell-thumb img {{ position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; }}
-    .profile-grid .cell-city {{ font-size:12px; color:#4b5563; padding:6px 8px 10px; background:#fff; text-align:center; line-height:1.4; border-top:1px solid #e5e7eb; }}
-    .profile-empty {{ text-align:center; font-size:15px; color:#6b7280; padding:40px 0; }}
-    @media (max-width: 900px) {{
-      .profile-wrap {{ padding:24px; }}
-      .profile-head {{ flex-direction:column; align-items:flex-start; }}
-      .profile-avatar {{ width:120px; height:120px; }}
-      .profile-username {{ font-size:26px; }}
-      .profile-grid {{ grid-template-columns: repeat(auto-fill,minmax(160px,1fr)); }}
-    }}
-  </style>
-</head>
-<body>
-  <div class=\"wrap\" id=\"galleryView\">
-    <div class=\"page-header\">
-      <div class=\"page-title\">
-        <h1>{display_title}</h1>
-        <div class=\"sub\">{escape(subtitle)}</div>
-      </div>
-      <div class=\"stats-card\" id=\"stats\"></div>
-    </div>
-
-    <div class=\"toolbar\">
-      <div class=\"field\">
-        <label for=\"q\">Поиск</label>
-        <input id=\"q\" placeholder=\"Username, города, комментарии\" />
-      </div>
-      <div class=\"field\">
-        <label for=\"cityInput\">Город</label>
-        <input id=\"cityInput\" list=\"cityOptionsList\" placeholder=\"Начните вводить город или выберите из списка\" />
-        <datalist id=\"cityOptionsList\"></datalist>
-      </div>
-      <div class=\"field\">
-        <label for=\"commentInput\">Комментарий содержит</label>
-        <input id=\"commentInput\" placeholder=\"Текст комментария\" />
-      </div>
-      <div class=\"field\">
-        <label for=\"hasComments\">Комментарии</label>
-        <select id=\"hasComments\">
-          <option value=\"\">Все</option>
-          <option value=\"with\">Есть комментарии</option>
-          <option value=\"without\">Без комментариев</option>
-        </select>
-      </div>
-      <div class=\"field\">
-        <label for=\"addedSelect\">Добавил</label>
-        <select id=\"addedSelect\"></select>
-      </div>
-      <div class=\"field\">
-        <label for=\"dateFrom\">Дата с</label>
-        <input id=\"dateFrom\" type=\"date\" />
-      </div>
-      <div class=\"field\">
-        <label for=\"dateTo\">Дата по</label>
-        <input id=\"dateTo\" type=\"date\" />
-      </div>
-      <div class=\"field\">
-        <label for=\"sort\">Сортировка</label>
-        <select id=\"sort\">
-          <option value=\"date_desc\" selected>Новые сначала</option>
-          <option value=\"date_asc\">Старые сначала</option>
-          <option value=\"img_desc\">Больше медиа</option>
-          <option value=\"img_asc\">Меньше медиа</option>
-          <option value=\"cm_desc\">Больше комментариев</option>
-          <option value=\"cm_asc\">Меньше комментариев</option>
-          <option value=\"name_asc\">Username A–Z</option>
-          <option value=\"name_desc\">Username Z–A</option>
-        </select>
-      </div>
-      <div class=\"field field--button primary\">
-        <button id=\"apply\">Применить</button>
-      </div>
-      <div class=\"field field--button secondary\">
-        <button id=\"reset\" type=\"button\">Сбросить</button>
-      </div>
-    </div>
-
-    <div class=\"grid\" id=\"grid\"></div>
-  </div>
-
-  <div class=\"profile-view hidden\" id=\"profileView\">
-    <div class=\"profile-wrap\">
-      <button class=\"profile-back\" id=\"profileBack\" type=\"button\">← Назад к галерее</button>
-      <div class=\"profile-head\">
-        <div class=\"profile-avatar\" id=\"profileAvatar\">@</div>
-        <div class=\"profile-info\">
-          <div class=\"profile-username\" id=\"profileUsername\">@username</div>
-          <div class=\"profile-actions\">
-            <a class=\"follow\" id=\"profileFollow\" href=\"#\" target=\"_blank\" rel=\"noopener\">FOLLOW</a>
-            <a class=\"open\" id=\"profileOpen\" href=\"#\" target=\"_blank\" rel=\"noopener\">Открыть оригинал</a>
-          </div>
-          <div class=\"profile-tabs hidden\" id=\"profileTabs\"></div>
-          <div class=\"profile-meta\" id=\"profileMeta\"></div>
-          <div class=\"profile-tags\" id=\"profileDatasets\"></div>
-          <div class=\"profile-phones\" id=\"profilePhones\"></div>
-          <div class=\"profile-cities\" id=\"profileCities\"></div>
-          <div class=\"profile-meta\" id=\"profileInfoExtra\"></div>
-        </div>
-      </div>
-      <div class=\"profile-stats\" id=\"profileStats\"></div>
-      <div class=\"profile-grid\" id=\"profileGrid\"></div>
-      <div class=\"profile-empty hidden\" id=\"profileEmpty\">Нет сохранённых фотографий для этого профиля.</div>
-    </div>
-  </div>
-
-  <script>
-
-    const DATA = {data_json};
-    const DATA_MAP = new Map();
-    DATA.forEach(u => DATA_MAP.set((u.username || '').toLowerCase(), u));
-
-    let currentProfileUsername = '';
-    let currentProfileTabKey = '';
-
-    const galleryView = document.getElementById('galleryView');
-    const profileView = document.getElementById('profileView');
-    const profileBack = document.getElementById('profileBack');
-    const profileAvatar = document.getElementById('profileAvatar');
-    const profileUsername = document.getElementById('profileUsername');
-    const profileFollow = document.getElementById('profileFollow');
-    const profileOpen = document.getElementById('profileOpen');
-    const profileTabs = document.getElementById('profileTabs');
-    const profileMeta = document.getElementById('profileMeta');
-    const profileDatasets = document.getElementById('profileDatasets');
-    const profilePhones = document.getElementById('profilePhones');
-    const profileCities = document.getElementById('profileCities');
-    const profileInfoExtra = document.getElementById('profileInfoExtra');
-    const profileStats = document.getElementById('profileStats');
-    const profileGrid = document.getElementById('profileGrid');
-    const profileEmpty = document.getElementById('profileEmpty');
-
-    const searchInput = document.getElementById('q');
-    const cityInput = document.getElementById('cityInput');
-    const cityDatalist = document.getElementById('cityOptionsList');
-    const commentInput = document.getElementById('commentInput');
-    const hasCommentsSelect = document.getElementById('hasComments');
-    const addedSelect = document.getElementById('addedSelect');
-    const dateFromInput = document.getElementById('dateFrom');
-    const dateToInput = document.getElementById('dateTo');
-    const sortSelect = document.getElementById('sort');
-    const applyBtn = document.getElementById('apply');
-    const resetBtn = document.getElementById('reset');
-    const statsEl = document.getElementById('stats');
-    const gridEl = document.getElementById('grid');
-
-    function debounce(fn, delay) {{
-      let timer;
-      return function() {{
-        const ctx = this, args = arguments;
-        clearTimeout(timer);
-        timer = setTimeout(function() {{ fn.apply(ctx, args); }}, delay);
-      }};
-    }}
-
-    function parseDatasetList(rawList) {{
-      const result = [];
-      if (!Array.isArray(rawList)) return result;
-      rawList.forEach(entry => {{
-        if (!entry) return;
-        if (typeof entry === 'object') {{
-          const value = (entry.value || '').toString();
-          const label = (entry.label || value).toString();
-          if (!value && !label) return;
-          result.push({{ value, label, valueLower: value.toLowerCase(), labelLower: label.toLowerCase() }});
-        }} else {{
-          const value = entry.toString();
-          if (!value) return;
-          const lower = value.toLowerCase();
-          result.push({{ value, label: value, valueLower: lower, labelLower: lower }});
-        }}
-      }});
-      return result;
-    }}
-
-    function fillSelectOptions(select, placeholder, options) {{
-      if (!select) return;
-      const frag = document.createDocumentFragment();
-      const optAll = document.createElement('option');
-      optAll.value = '';
-      optAll.textContent = placeholder;
-      frag.appendChild(optAll);
-      Object.keys(options).sort((a,b) => {{
-        const labelA = (options[a] || '').toString();
-        const labelB = (options[b] || '').toString();
-        return labelA.localeCompare(labelB, undefined, {{ sensitivity: 'accent' }});
-      }}).forEach(value => {{
-        const opt = document.createElement('option');
-        opt.value = value;
-        opt.textContent = options[value];
-        frag.appendChild(opt);
-      }});
-      select.innerHTML = '';
-      select.appendChild(frag);
-    }}
-
-    function fillDatalistOptions(datalist, options) {{
-      if (!datalist) return;
-      const frag = document.createDocumentFragment();
-      Object.keys(options).sort((a,b) => {{
-        const labelA = (options[a] || '').toString();
-        const labelB = (options[b] || '').toString();
-        return labelA.localeCompare(labelB, undefined, {{ sensitivity: 'accent' }});
-      }}).forEach(key => {{
-        const opt = document.createElement('option');
-        opt.value = options[key];
-        frag.appendChild(opt);
-      }});
-      datalist.innerHTML = '';
-      datalist.appendChild(frag);
-    }}
-
-    function parseDateValue(raw) {{
-      if (!raw && raw !== 0) return null;
-      const str = ('' + raw).trim();
-      if (!str) return null;
-      const normalized = str.includes('T') ? str : str.replace(' ', 'T');
-      let ts = Date.parse(normalized);
-      if (!Number.isFinite(ts)) {{
-        ts = Date.parse(normalized + 'Z');
-      }}
-      return Number.isFinite(ts) ? ts : null;
-    }}
-
-    function formatDateLabel(ts) {{
-      if (ts == null || !Number.isFinite(ts)) return '';
-      const d = new Date(ts);
-      if (Number.isNaN(d.getTime())) return '';
-      const y = d.getFullYear();
-      const m = String(d.getMonth()+1).padStart(2,'0');
-      const day = String(d.getDate()).padStart(2,'0');
-      return `${{y}}-${{m}}-${{day}}`;
-    }}
-
-    function formatDateInput(ts) {{
-      return formatDateLabel(ts);
-    }}
-
-    function toDateRangeValue(value, endOfDay) {{
-      if (!value) return null;
-      const str = ('' + value).trim();
-      if (!str) return null;
-      const base = str.length > 10 ? str : str + (endOfDay ? 'T23:59:59.999' : 'T00:00:00');
-      return parseDateValue(base);
-    }}
-
-    function getNewestTs(u) {{
-      if (u && u._lastTs != null) return u._lastTs;
-      if (u && u._firstTs != null) return u._firstTs;
-      return -Infinity;
-    }}
-
-    function getOldestTs(u) {{
-      if (u && u._firstTs != null) return u._firstTs;
-      if (u && u._lastTs != null) return u._lastTs;
-      return Infinity;
-    }}
-
-    function compareByName(a, b) {{
-      const nameA = (a && a.username ? a.username : '') || '';
-      const nameB = (b && b.username ? b.username : '') || '';
-      return nameA.localeCompare(nameB, undefined, {{ sensitivity: 'accent' }});
-    }}
-
-    const cityOptions = {{}};
-    const cityLookup = {{}};
-    const addedOptions = {{}};
-
-    let globalFirstTs = null;
-    let globalLastTs = null;
-
-    DATA.forEach(u => {{
-      const comments = Array.isArray(u.comments) ? u.comments.filter(c => c !== null && c !== undefined && c !== '') : [];
-      u._commentText = comments.map(c => ('' + c).toLowerCase()).join(' ');
-      const datasetList = parseDatasetList(u.datasets);
-      u._datasetList = datasetList;
-      const citiesRaw = Array.isArray(u.cities) ? u.cities : [];
-      const preparedCities = [];
-      citiesRaw.forEach(city => {{
-        const label = (city || '').toString().trim();
-        if (!label) return;
-        const lower = label.toLowerCase();
-        preparedCities.push({{ label, lower }});
-        if (!cityOptions[label]) cityOptions[label] = label;
-        if (lower && !cityLookup[lower]) cityLookup[lower] = label;
-      }});
-      u._cityList = preparedCities;
-      u._cityText = preparedCities.map(entry => entry.lower).join(' ');
-      const phoneRaw = Array.isArray(u.phone_models) ? u.phone_models : [];
-      const phoneList = [];
-      const phoneSeen = new Set();
-      phoneRaw.forEach(entry => {{
-        if (!entry) return;
-        let model = '';
-        let count = 0;
-        let rawCount = null;
-        if (typeof entry === 'object') {{
-          model = (entry.model || entry.value || '').toString();
-          rawCount = entry.count;
-          if (rawCount === undefined || rawCount === null) rawCount = entry.cnt;
-          if (rawCount === undefined || rawCount === null) rawCount = entry.total;
-        }} else {{
-          model = entry.toString();
-        }}
-        model = model.trim();
-        if (!model) return;
-        const lower = model.toLowerCase();
-        if (phoneSeen.has(lower)) return;
-        phoneSeen.add(lower);
-        if (rawCount !== null && rawCount !== undefined) {{
-          const num = Number(rawCount);
-          if (Number.isFinite(num) && num > 0) {{
-            count = Math.round(num);
-          }}
-        }}
-        const display = count > 1 ? model + ' ×' + count : model;
-        phoneList.push({{ label: model, lower, display, count }});
-      }});
-      u._phoneList = phoneList;
-      u._phoneText = phoneList.map(entry => entry.lower).join(' ');
-      const addedLabel = (u.added_by || '').toString();
-      const addedKey = (u.added_by_key || addedLabel).toString().trim().toLowerCase();
-      u._addedKey = addedKey;
-      if (addedKey && !addedOptions[addedKey]) {{
-        addedOptions[addedKey] = addedLabel || addedKey;
-      }}
-      const searchParts = [];
-      const username = (u.username || '').toString();
-      if (username) searchParts.push(username.toLowerCase());
-      if (u._commentText) searchParts.push(u._commentText);
-      if (addedLabel) searchParts.push(addedLabel.toLowerCase());
-      datasetList.forEach(ds => {{
-        if (ds.labelLower) searchParts.push(ds.labelLower);
-        if (ds.valueLower) searchParts.push(ds.valueLower);
-      }});
-      preparedCities.forEach(entry => searchParts.push(entry.lower));
-      phoneList.forEach(entry => searchParts.push(entry.lower));
-      u._searchText = searchParts.join(' ');
-      const firstTs = parseDateValue(u.first_created);
-      const lastTs = parseDateValue(u.last_created);
-      u._firstTs = firstTs;
-      u._lastTs = lastTs;
-      if (firstTs != null && (globalFirstTs == null || firstTs < globalFirstTs)) globalFirstTs = firstTs;
-      if (lastTs != null && (globalLastTs == null || lastTs > globalLastTs)) globalLastTs = lastTs;
-      const firstLabel = formatDateLabel(firstTs);
-      const lastLabel = formatDateLabel(lastTs);
-      let rangeLabel = '';
-      if (firstLabel && lastLabel) {{
-        rangeLabel = firstLabel === lastLabel ? firstLabel : firstLabel + ' → ' + lastLabel;
-      }} else {{
-        rangeLabel = firstLabel || lastLabel || '';
-      }}
-      u._createdRangeLabel = rangeLabel;
-    }});
-    fillDatalistOptions(cityDatalist, cityOptions);
-    fillSelectOptions(addedSelect, 'Все добавившие', addedOptions);
-
-    const minDateLabel = formatDateInput(globalFirstTs);
-    const maxDateLabel = formatDateInput(globalLastTs);
-    if (dateFromInput) {{
-      if (minDateLabel) dateFromInput.min = minDateLabel;
-      if (maxDateLabel) dateFromInput.max = maxDateLabel;
-    }}
-    if (dateToInput) {{
-      if (minDateLabel) dateToInput.min = minDateLabel;
-      if (maxDateLabel) dateToInput.max = maxDateLabel;
-    }}
-
-    function sortData(arr, mode) {{
-      switch(mode) {{
-        case 'img_desc':
-          return arr.sort((a,b) => {{
-            const diff = (b.images_count || 0) - (a.images_count || 0);
-            if (diff !== 0) return diff;
-            return compareByName(a,b);
-          }});
-        case 'img_asc':
-          return arr.sort((a,b) => {{
-            const diff = (a.images_count || 0) - (b.images_count || 0);
-            if (diff !== 0) return diff;
-            return compareByName(a,b);
-          }});
-        case 'cm_desc':
-          return arr.sort((a,b) => {{
-            const diff = (b.comments_count || 0) - (a.comments_count || 0);
-            if (diff !== 0) return diff;
-            return compareByName(a,b);
-          }});
-        case 'cm_asc':
-          return arr.sort((a,b) => {{
-            const diff = (a.comments_count || 0) - (b.comments_count || 0);
-            if (diff !== 0) return diff;
-            return compareByName(a,b);
-          }});
-        case 'name_desc':
-          return arr.sort((a,b) => compareByName(b,a));
-        case 'date_desc':
-          return arr.sort((a,b) => {{
-            const aTs = getNewestTs(a);
-            const bTs = getNewestTs(b);
-            if (bTs === aTs) return compareByName(a,b);
-            return bTs - aTs;
-          }});
-        case 'date_asc':
-          return arr.sort((a,b) => {{
-            const aTs = getOldestTs(a);
-            const bTs = getOldestTs(b);
-            if (aTs === bTs) return compareByName(a,b);
-            return aTs - bTs;
-          }});
-        case 'name_asc':
-        default:
-          return arr.sort((a,b) => compareByName(a,b));
-      }}
-    }}
-
-    function escapeHtml(s) {{
-      return (''+s).replace(/[&<>"']/g, function(m) {{ return {{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[m]; }});
-    }}
-
-    function formatBytes(bytes) {{
-      if (typeof bytes !== 'number' || !isFinite(bytes) || bytes < 0) return '';
-      if (bytes === 0) return '0 B';
-      const units = ['B','KB','MB','GB','TB'];
-      const power = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
-      const value = bytes / Math.pow(1024, power);
-      const fixed = value >= 100 || power === 0 ? value.toFixed(0) : value.toFixed(1);
-      return fixed.replace(/\\.0$/, '') + ' ' + units[power];
-    }}
-
-    function normalizeExifEntry(entry) {{
-      if (!entry || typeof entry !== 'object') return {{}};
-      return entry;
-    }}
-
-    function getEntryCityLabel(entry) {{
-      const data = normalizeExifEntry(entry);
-      const hasLat = typeof data.lat === 'number' && isFinite(data.lat);
-      const hasLon = typeof data.lon === 'number' && isFinite(data.lon);
-      if (!hasLat || !hasLon) return '';
-      const candidates = [];
-      if (data.city !== undefined && data.city !== null) candidates.push(data.city);
-      const extra = data.extra && typeof data.extra === 'object' ? data.extra : null;
-      if (extra) {{
-        ['city', 'City', 'town', 'Town', 'location', 'Location'].forEach(key => {{
-          if (extra[key] !== undefined && extra[key] !== null) candidates.push(extra[key]);
-        }});
-      }}
-      const exif = data.exiftool && typeof data.exiftool === 'object' ? data.exiftool : null;
-      if (exif) {{
-        ['City', 'Sub-location', 'Location'].forEach(key => {{
-          if (exif[key] !== undefined && exif[key] !== null) candidates.push(exif[key]);
-        }});
-      }}
-      for (const candidate of candidates) {{
-        if (candidate === undefined || candidate === null) continue;
-        const label = ('' + candidate).trim();
-        if (label) return label;
-      }}
-      return '';
-    }}
-
-    function renderProfile(user, updateHash=true, preferredTabKey=null) {{
-      if (!user) {{
-        return;
-      }}
-      const username = user.username || '';
-      const safeUsername = username ? '@' + username : 'Без username';
-      profileUsername.textContent = safeUsername;
-
-      const profileUrl = user.profile_url || '';
-      if (profileUrl) {{
-        profileFollow.href = profileUrl;
-        profileOpen.href = profileUrl;
-        profileFollow.classList.remove('disabled');
-      }} else {{
-        profileFollow.href = '#';
-        profileOpen.href = '#';
-        profileFollow.classList.add('disabled');
-      }}
-
-      currentProfileUsername = (username || '').toLowerCase();
-
-      const commentsList = Array.isArray(user.comments) ? user.comments : [];
-      const commentCount = typeof user.comments_count === 'number' ? user.comments_count : commentsList.length;
-      const allImages = Array.isArray(user.images) ? user.images.filter(Boolean) : [];
-
-      const metaParts = [];
-      if (user.lat != null && user.lon != null) {{
-        let coordLabel = user.lat.toFixed(5) + ', ' + user.lon.toFixed(5);
-        if (typeof user.location_photo_count === 'number' && user.location_photo_count > 0) {{
-          coordLabel += ' • ' + user.location_photo_count + ' фото';
-        }}
-        metaParts.push('<span>📍 ' + coordLabel + '</span>');
-      }}
-      if (user.added_by) {{
-        if (user.added_by_link) {{
-          metaParts.push('<span>👤 <a href="' + escapeHtml(user.added_by_link) + '" target="_blank" rel="noopener">' + escapeHtml(user.added_by) + '</a></span>');
-        }} else {{
-          metaParts.push('<span>👤 ' + escapeHtml(user.added_by) + '</span>');
-        }}
-      }}
-      profileMeta.innerHTML = metaParts.join('');
-      profileMeta.classList.toggle('hidden', metaParts.length === 0);
-
-      const datasetParts = (user.datasets || []).map(ds => '<span class="tag">' + escapeHtml(ds.label || ds.value || '') + '</span>');
-      profileDatasets.innerHTML = datasetParts.join('');
-      profileDatasets.classList.toggle('hidden', datasetParts.length === 0);
-
-      let phoneList = Array.isArray(user._phoneList) ? user._phoneList : [];
-      if ((!phoneList || phoneList.length === 0) && Array.isArray(user.phone_models)) {{
-        const fallback = [];
-        const seen = new Set();
-        user.phone_models.forEach(entry => {{
-          if (!entry) return;
-          let model = '';
-          let count = 0;
-          let rawCount = null;
-          if (typeof entry === 'object') {{
-            model = (entry.model || entry.value || '').toString();
-            rawCount = entry.count;
-            if (rawCount === undefined || rawCount === null) rawCount = entry.cnt;
-            if (rawCount === undefined || rawCount === null) rawCount = entry.total;
-          }} else {{
-            model = entry.toString();
-          }}
-          model = model.trim();
-          if (!model) return;
-          const lower = model.toLowerCase();
-          if (seen.has(lower)) return;
-          seen.add(lower);
-          if (rawCount !== null && rawCount !== undefined) {{
-            const num = Number(rawCount);
-            if (Number.isFinite(num) && num > 0) {{
-              count = Math.round(num);
-            }}
-          }}
-          fallback.push({{ label: model, display: count > 1 ? model + ' ×' + count : model }});
-        }});
-        phoneList = fallback;
-      }}
-      const phoneParts = (Array.isArray(phoneList) ? phoneList : []).map(phone => {{
-        const label = (phone && (phone.display || phone.label)) ? (phone.display || phone.label) : '';
-        return label ? '<span class="tag">' + escapeHtml(label) + '</span>' : '';
-      }}).filter(Boolean);
-      if (profilePhones) {{
-        profilePhones.innerHTML = phoneParts.join('');
-        profilePhones.classList.toggle('hidden', phoneParts.length === 0);
-      }}
-
-      const cityParts = (user.cities || []).map(city => '<span class="chip">' + escapeHtml(city) + '</span>');
-      profileCities.innerHTML = cityParts.join('');
-      profileCities.classList.toggle('hidden', cityParts.length === 0);
-
-      const infoExtra = [];
-      if (user.first_created) {{
-        infoExtra.push('<span>🕓 Первое: ' + escapeHtml(user.first_created) + '</span>');
-      }}
-      if (user.last_created && user.last_created !== user.first_created) {{
-        infoExtra.push('<span>🕒 Последнее: ' + escapeHtml(user.last_created) + '</span>');
-      }}
-      profileInfoExtra.innerHTML = infoExtra.join('');
-      profileInfoExtra.classList.toggle('hidden', infoExtra.length === 0);
-
-      const metaList = Array.isArray(user.images_meta) ? user.images_meta : [];
-      const metaByUrl = new Map();
-      metaList.forEach(entry => {{
-        const data = normalizeExifEntry(entry);
-        const rawUrl = (data.url || entry.url || '').toString();
-        if (!rawUrl) return;
-        metaByUrl.set(rawUrl, data);
-        const bare = rawUrl.split('?')[0];
-        if (bare && bare !== rawUrl) metaByUrl.set(bare, data);
-      }});
-
-      const slugifyTabKey = value => (value || '').toString().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-
-      const tabsRaw = Array.isArray(user.profile_tabs) ? user.profile_tabs : [];
-      const tabList = [];
-      const tabMap = new Map();
-      const tabButtons = new Map();
-      const usedTabKeys = new Set();
-
-      tabsRaw.forEach((tab, index) => {{
-        if (!tab || typeof tab !== 'object') return;
-        let keySeed = '';
-        if (typeof tab.tab_key === 'string' && tab.tab_key.trim()) keySeed = tab.tab_key.trim();
-        else if (typeof tab.slug === 'string' && tab.slug.trim()) keySeed = tab.slug.trim();
-        else if (typeof tab.id === 'string' && tab.id.trim()) keySeed = tab.id.trim();
-        else if (typeof tab.tab_url === 'string' && tab.tab_url.trim()) keySeed = tab.tab_url.trim();
-        else if (typeof tab.href === 'string' && tab.href.trim()) keySeed = tab.href.trim();
-        else keySeed = 'tab-' + (index + 1);
-        let key = slugifyTabKey(keySeed);
-        if (!key) key = 'tab-' + (index + 1);
-        let uniqueKey = key;
-        let counter = 2;
-        while (usedTabKeys.has(uniqueKey)) {{
-          uniqueKey = key + '-' + counter;
-          counter += 1;
-        }}
-        usedTabKeys.add(uniqueKey);
-        const mediaRaw = Array.isArray(tab.media) ? tab.media : [];
-        const media = mediaRaw.map(item => (item || '').toString().trim()).filter(Boolean);
-        const labelRaw = (tab.label || tab.slug || tab.id || '').toString().trim();
-        const label = labelRaw ? labelRaw : uniqueKey.toUpperCase();
-        const entry = {{
-          key: uniqueKey,
-          label,
-          media,
-          remoteHref: typeof tab.remote_href === 'string' ? tab.remote_href : (typeof tab.href === 'string' ? tab.href : ''),
-          tabUrl: typeof tab.tab_url === 'string' ? tab.tab_url : ''
-        }};
-        tabList.push(entry);
-        tabMap.set(uniqueKey, entry);
-      }});
-
-      if (tabList.length === 0) {{
-        const fallbackKey = usedTabKeys.has('recent') ? 'recent-1' : 'recent';
-        const fallbackEntry = {{
-          key: fallbackKey,
-          label: 'RECENT',
-          media: allImages.slice(),
-          remoteHref: profileUrl,
-          tabUrl: profileUrl
-        }};
-        tabList.push(fallbackEntry);
-        tabMap.set(fallbackKey, fallbackEntry);
-        usedTabKeys.add(fallbackKey);
-      }}
-
-      if (profileTabs) {{
-        profileTabs.innerHTML = '';
-        profileTabs.classList.toggle('hidden', tabList.length === 0);
-        if (tabList.length) {{
-          tabList.forEach(tab => {{
-            const btn = document.createElement('button');
-            btn.type = 'button';
-            btn.className = 'profile-tab';
-            btn.textContent = (tab.label || tab.key || '').toString();
-            if (tab.remoteHref) btn.title = tab.remoteHref;
-            btn.addEventListener('click', ev => {{
-              ev.preventDefault();
-              ev.stopPropagation();
-              activateTab(tab.key, true);
-            }});
-            profileTabs.appendChild(btn);
-            tabButtons.set(tab.key, btn);
-          }});
-        }}
-      }}
-
-      function renderImagesGrid(imageList) {{
-        if (!profileGrid) return;
-        if (imageList.length) {{
-          const cells = imageList.map(src => {{
-            const rawSrc = (src || '').toString();
-            if (!rawSrc) return '';
-            const safeSrc = escapeHtml(rawSrc);
-            const bareSrc = rawSrc.split('?')[0];
-            const meta = metaByUrl.get(rawSrc) || metaByUrl.get(bareSrc);
-            const city = meta ? getEntryCityLabel(meta) : '';
-            const cityHtml = city ? '<div class="cell-city">📍 ' + escapeHtml(city) + '</div>' : '';
-            return '<div class="cell"><div class="cell-thumb"><img src="' + safeSrc + '" loading="lazy" alt=""></div>' + cityHtml + '</div>';
-          }}).join('');
-          profileGrid.innerHTML = cells;
-          profileEmpty.classList.add('hidden');
-        }} else {{
-          profileGrid.innerHTML = '';
-          profileEmpty.classList.remove('hidden');
-        }}
-      }}
-
-      function activateTab(key, shouldUpdateHash) {{
-        let entry = null;
-        if (key && tabMap.has(key)) {{
-          entry = tabMap.get(key);
-        }} else if (tabList.length > 0) {{
-          entry = tabList[0];
-          key = entry.key;
-        }}
-        const selectedKey = entry ? entry.key : '';
-        currentProfileTabKey = selectedKey;
-        if (profileTabs && tabButtons.size) {{
-          tabButtons.forEach((btn, btnKey) => {{
-            if (!btn) return;
-            btn.classList.toggle('active', btnKey === selectedKey);
-          }});
-        }}
-        const imagesForTab = entry && Array.isArray(entry.media) ? entry.media : [];
-        const imagesToRender = tabList.length ? imagesForTab : allImages;
-        if (profileAvatar) {{
-          if (imagesToRender.length) {{
-            profileAvatar.classList.add('has-image');
-            profileAvatar.style.backgroundImage = 'url(' + JSON.stringify(imagesToRender[0]) + ')';
-            profileAvatar.textContent = '';
-          }} else {{
-            profileAvatar.classList.remove('has-image');
-            profileAvatar.style.backgroundImage = '';
-            profileAvatar.textContent = username ? username[0].toUpperCase() : '@';
-          }}
-        }}
-        if (profileStats) {{
-          profileStats.innerHTML = [
-            '<div class="stat"><span class="value">' + imagesToRender.length + '</span><span class="label">posts</span></div>',
-            '<div class="stat"><span class="value">' + commentCount + '</span><span class="label">comments</span></div>'
-          ].join('');
-        }}
-        renderImagesGrid(imagesToRender);
-        galleryView.classList.add('hidden');
-        profileView.classList.remove('hidden');
-        if (shouldUpdateHash && updateHash) {{
-          const base = '#/profile/' + encodeURIComponent(username || '');
-          if (selectedKey) {{
-            location.hash = base + '?tab=' + encodeURIComponent(selectedKey);
-          }} else {{
-            location.hash = base;
-          }}
-        }}
-      }}
-
-      const normalizedPreferred = typeof preferredTabKey === 'string' ? slugifyTabKey(preferredTabKey) : '';
-      let initialKey = normalizedPreferred && tabMap.has(normalizedPreferred) ? normalizedPreferred : null;
-      if (!initialKey && tabList.length) {{
-        const withMedia = tabList.find(tab => Array.isArray(tab.media) && tab.media.length > 0);
-        initialKey = withMedia ? withMedia.key : tabList[0].key;
-      }}
-
-      activateTab(initialKey, updateHash);
-      window.scrollTo({{ top: 0, behavior: 'smooth' }});
-    }}
-
-    function showGallery(updateHash=true) {{
-      profileView.classList.add('hidden');
-      galleryView.classList.remove('hidden');
-      currentProfileUsername = '';
-      currentProfileTabKey = '';
-      if (updateHash) {{
-        location.hash = '#gallery';
-      }}
-    }}
-
-    profileBack.addEventListener('click', () => showGallery(true));
-
-
-    function render(list) {{
-      if (!gridEl || !statsEl) return;
-      gridEl.innerHTML='';
-      let entries=0;
-      list.forEach(u=>{{
-        const allImages = Array.isArray(u.images) ? u.images.filter(Boolean) : [];
-        const imageCount = typeof u.images_count === 'number' ? u.images_count : allImages.length;
-        const previews = allImages.slice(0,4);
-        const cm = Array.isArray(u.comments) ? u.comments : [];
-        const commentCount = typeof u.comments_count === 'number' ? u.comments_count : cm.length;
-        entries += imageCount;
-        let cmHtml='';
-        if (cm.length===0) cmHtml = '<div class="empty">нет комментариев</div>';
-        else {{
-          const head = cm.slice(0,3).map(c=>'<li>' + escapeHtml(c) + '</li>').join('');
-          const more = cm.length>3 ? '<div class="more">и ещё ' + (cm.length-3) + '…</div>' : '';
-          cmHtml = '<ul>' + head + '</ul>' + more;
-        }}
-        const thumbs = previews.map(src=>'<img src="' + escapeHtml(src) + '" loading="lazy">').join('');
-        const latStr = (u.lat!=null && u.lon!=null) ? u.lat.toFixed(6) + ', ' + u.lon.toFixed(6) : '';
-        const addedBy = (()=>{{
-          if (!u.added_by) return '';
-          const label = escapeHtml(u.added_by);
-          if (u.added_by_link) {{
-            return '<a href="' + escapeHtml(u.added_by_link) + '" target="_blank">' + label + '</a>';
-          }}
-          return label;
-        }})();
-        const chipParts=[];
-        (u._cityList || []).slice(0,3).forEach(entry=>{{
-          chipParts.push('<span class="chip chip-city">' + escapeHtml(entry.label) + '</span>');
-        }});
-        (u._datasetList || []).slice(0,3).forEach(ds=>{{
-          const label = ds.label || ds.value;
-          if (label) chipParts.push('<span class="chip chip-data">' + escapeHtml(label) + '</span>');
-        }});
-        (u._phoneList || []).slice(0,3).forEach(phone=>{{
-          if (!phone) return;
-          const label = phone.display || phone.label || '';
-          if (label) chipParts.push('<span class="chip chip-device">' + escapeHtml(label) + '</span>');
-        }});
-        const chipsHtml = chipParts.length ? '<div class="chips">' + chipParts.join('') + '</div>' : '';
-        const createdHtml = u._createdRangeLabel ? '<div class="meta created">Добавлено: ' + escapeHtml(u._createdRangeLabel) + '</div>' : '';
-        const metaPieces = [];
-        if (latStr) metaPieces.push('<span>📍 ' + escapeHtml(latStr) + '</span>');
-        metaPieces.push('<span>🖼️ ' + imageCount + '</span>');
-        metaPieces.push('<span>💬 ' + commentCount + '</span>');
-        const statsHtml = '<div class="card-stats">' + metaPieces.join('') + '</div>';
-        const card = document.createElement('div');
-        card.className = 'card';
-        card.dataset.username = u.username || '';
-        const profileUrl = u.profile_url || '';
-        const safeProfileUrl = escapeHtml(profileUrl);
-        const displayName = u.username ? '@' + escapeHtml(u.username) : 'Без username';
-        card.innerHTML = `
-          <div class="head">
-            <div class="name"><a href="${{safeProfileUrl}}" target="_blank">${{displayName}}</a></div>
-            <a class="btn" href="${{safeProfileUrl}}" target="_blank">View Profile</a>
-          </div>
-          ${{statsHtml}}
-          ${{createdHtml}}
-          ${{chipsHtml}}
-          <div class="meta added">Добавил: ${{addedBy || '—'}}</div>
-          <div class="thumbs">${{thumbs}}</div>
-          <div class="cm">${{cmHtml}}</div>
-          <div class="actions">
-            <button class="btn-secondary profile-btn" type="button">Открыть галерею</button>
-          </div>
-        `;
-        const openBtn = card.querySelector('.profile-btn');
-        if (openBtn) {{
-          openBtn.addEventListener('click', (ev) => {{
-            ev.preventDefault();
-            ev.stopPropagation();
-            renderProfile(u);
-          }});
-        }}
-        gridEl.appendChild(card);
-      }});
-      statsEl.innerHTML = `<span><span class=\"value\">${{list.length}}</span><span>Users</span></span><span><span class=\"value\">${{entries}}</span><span>Entries</span></span>`;
-    }}
-
-    function apply() {{
-      const q = searchInput ? searchInput.value.trim().toLowerCase() : '';
-      const cityRaw = cityInput ? cityInput.value.trim() : '';
-      const cityLower = cityRaw.toLowerCase();
-      const hasExactCity = cityLower && Object.prototype.hasOwnProperty.call(cityLookup, cityLower);
-      const commentValue = commentInput ? commentInput.value.trim().toLowerCase() : '';
-      const hasCommentsValue = hasCommentsSelect ? hasCommentsSelect.value : '';
-      const addedValue = addedSelect ? addedSelect.value : '';
-      const fromTs = dateFromInput ? toDateRangeValue(dateFromInput.value, false) : null;
-      const toTs = dateToInput ? toDateRangeValue(dateToInput.value, true) : null;
-      const sortMode = sortSelect ? (sortSelect.value || 'date_desc') : 'date_desc';
-
-      const list = DATA.filter(u => {{
-        if (q && (!u._searchText || u._searchText.indexOf(q) === -1)) return false;
-        if (cityLower) {{
-          if (hasExactCity) {{
-            const matchCity = (u._cityList || []).some(entry => entry.lower === cityLower);
-            if (!matchCity) return false;
-          }} else {{
-            if (!u._cityText || u._cityText.indexOf(cityLower) === -1) return false;
-          }}
-        }}
-        if (commentValue) {{
-          if (!u._commentText || u._commentText.indexOf(commentValue) === -1) return false;
-        }}
-        const commentCount = typeof u.comments_count === 'number' ? u.comments_count : (Array.isArray(u.comments) ? u.comments.length : 0);
-        if (hasCommentsValue === 'with' && commentCount === 0) return false;
-        if (hasCommentsValue === 'without' && commentCount > 0) return false;
-        if (addedValue && u._addedKey !== addedValue) return false;
-        if (fromTs != null && getNewestTs(u) < fromTs) return false;
-        if (toTs != null && getOldestTs(u) > toTs) return false;
-        return true;
-      }});
-      sortData(list, sortMode);
-      render(list);
-      return list;
-    }}
-
-    function reset() {{
-      if (searchInput) searchInput.value='';
-      if (cityInput) cityInput.value='';
-      if (commentInput) commentInput.value='';
-      if (hasCommentsSelect) hasCommentsSelect.value='';
-      if (addedSelect) addedSelect.value='';
-      if (dateFromInput) dateFromInput.value='';
-      if (dateToInput) dateToInput.value='';
-      if (sortSelect) sortSelect.value='date_desc';
-      apply();
-    }}
-
-    if (applyBtn) applyBtn.addEventListener('click', apply);
-    if (resetBtn) resetBtn.addEventListener('click', reset);
-
-    const debouncedApply = debounce(apply, 200);
-    if (searchInput) searchInput.addEventListener('input', debouncedApply);
-    if (cityInput) cityInput.addEventListener('input', debouncedApply);
-    if (commentInput) commentInput.addEventListener('input', debouncedApply);
-
-    [hasCommentsSelect, addedSelect, sortSelect].forEach(el => {{
-      if (el) el.addEventListener('change', apply);
-    }});
-    if (dateFromInput) dateFromInput.addEventListener('change', apply);
-    if (dateToInput) dateToInput.addEventListener('change', apply);
-
-    reset();
-
-    function parseProfileHash(hash) {{
-      if (!hash || !hash.startsWith('#/profile/')) return null;
-      let rest = hash.slice('#/profile/'.length);
-      let query = '';
-      const qIndex = rest.indexOf('?');
-      if (qIndex !== -1) {{
-        query = rest.slice(qIndex + 1);
-        rest = rest.slice(0, qIndex);
-      }}
-      const username = decodeURIComponent(rest || '');
-      let tabKey = '';
-      if (query) {{
-        try {{
-          const params = new URLSearchParams(query);
-          tabKey = (params.get('tab') || '').toLowerCase();
-        }} catch (err) {{
-          tabKey = '';
-        }}
-      }}
-      return {{ username, tabKey }};
-    }}
-
-    function handleHashNavigation() {{
-      const parsed = parseProfileHash(location.hash || '');
-      if (parsed) {{
-        const usernameKey = (parsed.username || '').toLowerCase();
-        const normalizedTab = (parsed.tabKey || '').toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
-        const user = DATA_MAP.get(usernameKey);
-        if (user) {{
-          if (usernameKey === currentProfileUsername && normalizedTab === (currentProfileTabKey || '')) {{
-            return;
-          }}
-          renderProfile(user, false, normalizedTab);
-          return;
-        }}
-      }}
-      showGallery(false);
-    }}
-
-    window.addEventListener('hashchange', handleHashNavigation);
-    handleHashNavigation();
-  </script>
-</body>
-</html>"""
-    return html
-
-
-def _map_html(
-    title: str,
-    list_html: str,
-    marker_js: List[str],
-    stats: Optional[Dict[str, Any]] = None,
-) -> str:
-    # Надёжная загрузка Leaflet + MarkerCluster с fallback и инициализацией после DOMContentLoaded
-    stats = stats or {}
-    summary_text = stats.get("summary_text", "")
-    total = int(stats.get("total", 0) or 0)
-    with_coords = int(stats.get("with_coords", 0) or 0)
-    without_coords = int(stats.get("without_coords", max(total - with_coords, 0)))
-    summary_attrs = (
-        f" data-total=\"{total}\" data-withcoords=\"{with_coords}\""
-        f" data-withoutcoords=\"{without_coords}\" data-text=\"{escape(summary_text)}\""
-    )
-    return f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
-  <title>{escape(title)}</title>
-  <link rel="dns-prefetch" href="https://unpkg.com"/>
-  <link rel="preconnect" href="https://unpkg.com" crossorigin/>
-  <link rel="dns-prefetch" href="https://a.tile.openstreetmap.org"/>
-  <link rel="dns-prefetch" href="https://b.tile.openstreetmap.org"/>
-  <link rel="dns-prefetch" href="https://c.tile.openstreetmap.org"/>
-  <link rel="preconnect" href="https://a.tile.openstreetmap.org" crossorigin/>
-  <link rel="preconnect" href="https://b.tile.openstreetmap.org" crossorigin/>
-  <link rel="preconnect" href="https://c.tile.openstreetmap.org" crossorigin/>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
-  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
-  <style>
-    html, body {{ height:100%; margin:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif; }}
-    .layout {{ display:flex; height:100vh; }}
-    #map {{ flex: 1 1 auto; min-height: 320px; }}
-    .panel {{ width: 420px; max-width: 48vw; border-left:1px solid #e5e7eb; background:#fafafa; overflow:auto; display:flex; flex-direction:column; }}
-    .panel .head {{ position: sticky; top:0; background:#fff; border-bottom:1px solid #e5e7eb; padding:12px 14px 10px; z-index:1; }}
-    .panel .title {{ font-weight:600; margin-bottom:6px; }}
-    .panel .summary {{ font-size:12px; color:#4b5563; margin-bottom:10px; }}
-    .panel .loading {{ font-size:12px; color:#1f2937; background:#ffffff; border:1px solid #e5e7eb; border-radius:8px; padding:10px 12px; margin-bottom:12px; box-shadow:0 1px 2px rgba(15,23,42,0.08); display:flex; flex-direction:column; gap:6px; }}
-    .panel .loading[hidden] {{ display:none !important; }}
-    .panel .loading__label {{ font-weight:600; display:flex; align-items:center; gap:6px; }}
-    .panel .loading__label::before {{ content:"⏳"; }}
-    .panel .loading__bar {{ display:flex; align-items:center; gap:8px; }}
-    .panel .loading progress {{ flex:1 1 auto; width:100%; height:8px; accent-color:#2563eb; }}
-    .panel .loading__details {{ min-width:80px; text-align:right; font-variant-numeric:tabular-nums; color:#4b5563; font-size:11px; }}
-    .panel .search label {{ display:block; font-size:11px; color:#6b7280; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px; }}
-    .panel .search input {{ width:100%; padding:6px 8px; border:1px solid #d1d5db; border-radius:6px; font-size:14px; }}
-    .panel .filters {{ display:grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr)); gap:8px; margin-top:12px; }}
-    .panel .filters .field {{ display:flex; flex-direction:column; gap:4px; font-size:12px; }}
-    .panel .filters .field label {{ color:#6b7280; text-transform:uppercase; letter-spacing:0.05em; font-size:11px; }}
-    .panel .filters .field input,
-    .panel .filters .field select {{ padding:6px 8px; border:1px solid #d1d5db; border-radius:6px; font-size:13px; background:#fff; }}
-    .panel .filters .field--button {{ align-self:end; }}
-    .panel .filters .field--button button {{ padding:6px 8px; border:1px solid #bfdbfe; background:#e0f2fe; color:#1d4ed8; border-radius:6px; font-size:13px; cursor:pointer; }}
-    .panel .filters .field--button button:hover {{ background:#bfdbfe; }}
-    .panel .rows {{ flex:1 1 auto; }}
-    .panel .row {{ padding:10px 14px; border-bottom:1px dashed #e5e7eb; display:grid; grid-template-columns:auto 80px 1fr; gap:8px; align-items:center; transition:background 0.2s ease; }}
-    .panel .row.row-user {{ grid-template-columns: 1fr; }}
-    .panel .row[data-key] {{ cursor:pointer; }}
-    .panel .row:hover {{ background:#f3f4f6; }}
-    .panel .row.active {{ background:#e0f2fe; box-shadow:inset 0 0 0 1px #bae6fd; }}
-    .panel .row .u a {{ font-weight:600; color:#111; text-decoration:none; }}
-    .panel .row .c {{ font-size: 13px; color:#111; grid-column:1 / -1; }}
-    .panel .row .meta {{ grid-column:1 / -1; font-size:11px; color:#4b5563; display:flex; flex-wrap:wrap; gap:6px; margin-top:4px; }}
-    .panel .row .meta .chip {{ display:inline-flex; align-items:center; gap:4px; padding:2px 8px; border-radius:999px; background:#e5e7eb; color:#374151; font-size:11px; font-weight:500; }}
-    .panel .row .meta .chip-city {{ background:#dbeafe; color:#1d4ed8; }}
-    .panel .row .meta .chip-city::before {{ content:"📍"; }}
-    .panel .row .meta .chip-data {{ background:#fef3c7; color:#92400e; }}
-    .panel .row .meta .chip-data::before {{ content:"💾"; }}
-    .panel .row .meta .chip-device {{ background:#ede9fe; color:#5b21b6; }}
-    .panel .row .meta .chip-device::before {{ content:"📱"; }}
-    .panel .row .ab {{ grid-column:1 / -1; font-size:12px; color:#4b5563; }}
-    .panel .row.row-user .u {{ grid-column:1 / -1; }}
-    @media (max-width: 900px) {{
-      .layout {{ flex-direction: column; }}
-      .panel {{ width: 100%; max-width: 100%; height: 46vh; }}
-      #map {{ height: 54vh; }}
-    }}
-  </style>
-</head>
-<body>
-  <div class="layout">
-    <div id="map"></div>
-    <div class="panel">
-      <div class="head">
-        <div class="title">Список / превью</div>
-        <div class="summary" id="summary"{summary_attrs}>{escape(summary_text)}</div>
-        <div class="loading" id="loadingIndicator" hidden>
-          <div class="loading__label">Загрузка карты…</div>
-          <div class="loading__bar">
-            <progress id="loadingProgress" max="100" value="0"></progress>
-            <span class="loading__details" id="loadingDetails">0%</span>
-          </div>
-        </div>
-        <div class="search">
-          <label for="filter">Поиск</label>
-          <input id="filter" type="search" placeholder="Поиск по нику, комментариям или добавившему" autocomplete="off"/>
-        </div>
-        <div class="filters">
-          <div class="field">
-            <label for="filterData">Данные</label>
-            <select id="filterData">
-              <option value="">Все данные</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="filterCity">Город</label>
-            <input id="filterCity" type="search" list="filterCityOptions" placeholder="Начните вводить город или выберите из списка" autocomplete="off"/>
-            <datalist id="filterCityOptions"></datalist>
-          </div>
-          <div class="field">
-            <label for="filterComment">Комментарий</label>
-            <input id="filterComment" type="search" placeholder="Фильтр по тексту комментария" autocomplete="off"/>
-          </div>
-          <div class="field">
-            <label for="filterHasComments">Наличие комментариев</label>
-            <select id="filterHasComments">
-              <option value="">Все</option>
-              <option value="with">Только с комментариями</option>
-              <option value="without">Без комментариев</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="filterAdded">Добавивший</label>
-            <select id="filterAdded">
-              <option value="">Все добавившие</option>
-            </select>
-          </div>
-          <div class="field field--button">
-            <label>&nbsp;</label>
-            <button id="filtersReset" type="button">Сбросить</button>
-          </div>
-        </div>
-      </div>
-      <div class="rows" id="list">{list_html}</div>
-    </div>
-  </div>
-  <script>
-    function loadScript(src, onload) {{
-      var s=document.createElement('script'); s.src=src; s.onload=onload; s.async=true; document.head.appendChild(s);
-    }}
-    function ensureLeaflet(next) {{
-      if (window.L) return next();
-      loadScript("https://unpkg.com/leaflet@1.9.4/dist/leaflet.js", function() {{
-        if (window.L) return next();
-        loadScript("https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js", next);
-      }});
-    }}
-    function ensureCluster(next) {{
-      if (window.L && L.MarkerClusterGroup) return next();
-      loadScript("https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js", function() {{
-        if (window.L && L.MarkerClusterGroup) return next();
-        loadScript("https://cdn.jsdelivr.net/npm/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js", next);
-      }});
-    }}
-    function debounce(fn, delay) {{
-      var timer; return function() {{
-        var ctx=this, args=arguments; clearTimeout(timer);
-        timer=setTimeout(function() {{ fn.apply(ctx,args); }}, delay);
-      }};
-    }}
-    function parseJsonArray(raw) {{
-      if (!raw) return [];
-      try {{
-        var parsed = JSON.parse(raw);
-        return Array.isArray(parsed) ? parsed : [];
-      }} catch (e) {{
-        return [];
-      }}
-    }}
-    function parseDatasetList(raw) {{
-      var result = [];
-      var arr = parseJsonArray(raw);
-      arr.forEach(function(entry) {{
-        if (!entry) return;
-        if (typeof entry === 'string') {{
-          result.push({{ value: entry, label: entry }});
-        }} else if (typeof entry === 'object') {{
-          var value = (entry.value || entry.label || '').toString();
-          if (!value) return;
-          result.push({{ value: value, label: (entry.label || value).toString() }});
-        }}
-      }});
-      return result;
-    }}
-    function fillSelectOptions(select, options, placeholder) {{
-      if (!select) return;
-      var frag=document.createDocumentFragment();
-      var optAll=document.createElement('option');
-      optAll.value='';
-      optAll.textContent=placeholder || 'Все';
-      frag.appendChild(optAll);
-      Object.keys(options).sort(function(a,b) {{
-        var labelA=(options[a]||'').toString();
-        var labelB=(options[b]||'').toString();
-        return labelA.localeCompare(labelB, undefined, {{ sensitivity:'accent' }});
-      }}).forEach(function(value) {{
-        var opt=document.createElement('option');
-        opt.value=value;
-        opt.textContent=options[value];
-        frag.appendChild(opt);
-      }});
-      select.innerHTML='';
-      select.appendChild(frag);
-    }}
-    function fillDatalistOptions(datalist, options) {{
-      if (!datalist) return;
-      var frag=document.createDocumentFragment();
-      Object.keys(options).sort(function(a,b) {{
-        var labelA=(options[a]||'').toString();
-        var labelB=(options[b]||'').toString();
-        return labelA.localeCompare(labelB, undefined, {{ sensitivity:'accent' }});
-      }}).forEach(function(value) {{
-        var opt=document.createElement('option');
-        opt.value=options[value] || value;
-        frag.appendChild(opt);
-      }});
-      datalist.innerHTML='';
-      datalist.appendChild(frag);
-    }}
-    var filteringReady=false;
-    var filteringStateValue=null;
-    var filteringCallbacks=[];
-    function withFiltering(callback) {{
-      if (typeof callback !== 'function') return;
-      if (filteringReady) {{
-        try {{ callback(filteringStateValue); }} catch (err) {{ if (typeof console !== 'undefined' && console.error) console.error(err); }}
-      }} else {{
-        filteringCallbacks.push(callback);
-      }}
-    }}
-    function resolveFilteringState(state) {{
-      if (filteringReady) return;
-      filteringReady=true;
-      filteringStateValue=state;
-      while (filteringCallbacks.length) {{
-        var cb=filteringCallbacks.shift();
-        try {{ cb && cb(state); }} catch (err) {{ if (typeof console !== 'undefined' && console.error) console.error(err); }}
-      }}
-    }}
-    function initFilteringAsync() {{
-      var run=function() {{
-        try {{
-          resolveFilteringState(setupFiltering());
-        }} catch (err) {{
-          if (typeof console !== 'undefined' && console.error) console.error(err);
-          resolveFilteringState({{ onChange:function() {{}}, refresh:function() {{}} }});
-        }}
-      }};
-      if (typeof window !== 'undefined' && window.requestIdleCallback) {{
-        window.requestIdleCallback(run, {{ timeout: 500 }});
-      }} else {{
-        setTimeout(run, 0);
-      }}
-    }}
-    function createLoadingController() {{
-      var indicator=document.getElementById('loadingIndicator');
-      var bar=document.getElementById('loadingProgress');
-      var details=document.getElementById('loadingDetails');
-      var summary=document.getElementById('summary');
-      var totalMarkers=summary ? parseInt(summary.dataset.withcoords || '0', 10) || 0 : 0;
-      var displayThreshold=150;
-      var active=false;
-      var lastUpdate=0;
-      function hideIndicator() {{
-        if (!indicator) return;
-        indicator.hidden=true;
-        indicator.setAttribute('aria-hidden','true');
-      }}
-      function showIndicator() {{
-        if (!indicator) return;
-        indicator.hidden=false;
-        indicator.setAttribute('aria-hidden','false');
-      }}
-      function formatDetails(processed, total) {{
-        if (!details) return;
-        if (!total) {{
-          details.textContent=processed ? processed.toString() : '…';
-          return;
-        }}
-        var percent=Math.min(100, Math.max(0, Math.round((processed/total)*100)));
-        details.textContent=processed + ' / ' + total + ' (' + percent + '%)';
-      }}
-      if (!indicator || totalMarkers <= displayThreshold) {{
-        hideIndicator();
-        return {{
-          start:function() {{}},
-          update:function() {{}},
-          finish:function() {{ hideIndicator(); }}
-        }};
-      }}
-      hideIndicator();
-      return {{
-        start:function(total) {{
-          var target=total && total>0 ? total : totalMarkers;
-          active=true;
-          showIndicator();
-          if (bar) {{
-            bar.max=100;
-            bar.value=0;
-          }}
-          formatDetails(0, target);
-          lastUpdate=Date.now();
-        }},
-        update:function(processed, total) {{
-          if (!active) this.start(total);
-          var target=total && total>0 ? total : totalMarkers;
-          var percent=target ? Math.min(100, Math.max(0, Math.round((processed/target)*100))) : 0;
-          if (bar) {{
-            bar.max=100;
-            bar.value=percent;
-          }}
-          formatDetails(processed, target || 0);
-          lastUpdate=Date.now();
-        }},
-        finish:function() {{
-          if (!indicator) return;
-          if (bar) {{
-            bar.max=100;
-            bar.value=100;
-          }}
-          if (totalMarkers) {{
-            formatDetails(totalMarkers, totalMarkers);
-          }} else if (details) {{
-            details.textContent='Готово';
-          }}
-          var delay=Math.max(0, 400 - (Date.now()-lastUpdate));
-          setTimeout(hideIndicator, delay);
-        }}
-      }};
-    }}
-    function setupFiltering() {{
-      var rows=Array.prototype.slice.call(document.querySelectorAll('.panel .row'));
-      var summary=document.getElementById('summary');
-      var input=document.getElementById('filter');
-      var datasetSelect=document.getElementById('filterData');
-      var cityInput=document.getElementById('filterCity');
-      var cityDatalist=document.getElementById('filterCityOptions');
-      var commentInput=document.getElementById('filterComment');
-      var hasCommentsSelect=document.getElementById('filterHasComments');
-      var addedSelect=document.getElementById('filterAdded');
-      var resetBtn=document.getElementById('filtersReset');
-      var baseText = summary ? (summary.dataset.text || summary.textContent || '') : '';
-      var totals = summary ? {{
-        total: parseInt(summary.dataset.total || rows.length, 10) || rows.length,
-        withCoords: parseInt(summary.dataset.withcoords || 0, 10) || 0
-      }} : {{ total: rows.length, withCoords: rows.filter(function(r) {{ return r.dataset.hasCoords==='1'; }}).length }};
-      var datasetOptions={{}};
-      var cityOptions={{}};
-      var cityLookup={{}};
-      var addedOptions={{}};
-      var changeHandlers=[];
-      var lastKeys=[];
-      rows.forEach(function(row) {{
-        row._searchText=(row.dataset.search || '').toString();
-        row._hasCoords=row.dataset.hasCoords==='1';
-        row._commentsText=(row.dataset.comments || '').toString();
-        row._addedText=(row.dataset.added || '').toString();
-        row._addedKey=(row.dataset.addedKey || '').toString();
-        row._addedLabel=(row.dataset.addedLabel || '').toString();
-        row._commentsCount=parseInt(row.dataset.commentsCount || '0', 10) || 0;
-        row._datasets=parseDatasetList(row.dataset.datasets);
-        row._cities=parseJsonArray(row.dataset.cities).map(function(city) {{ return city ? city.toString() : ''; }}).filter(function(city) {{ return !!city; }});
-        row._datasets.forEach(function(ds) {{
-          var value=(ds.value || '').toString();
-          if (!value) return;
-          var label=(ds.label || value).toString();
-          if (!datasetOptions[value]) datasetOptions[value]=label;
-        }});
-        row._cities.forEach(function(city) {{
-          if (!cityOptions[city]) cityOptions[city]=city;
-          var lowerCity=city.toLowerCase();
-          if (lowerCity && !cityLookup[lowerCity]) cityLookup[lowerCity]=city;
-        }});
-        if (row._addedKey && !addedOptions[row._addedKey]) {{
-          addedOptions[row._addedKey]=row._addedLabel || row._addedKey;
-        }}
-      }});
-      fillSelectOptions(datasetSelect, datasetOptions, 'Все данные');
-      fillDatalistOptions(cityDatalist, cityOptions);
-      fillSelectOptions(addedSelect, addedOptions, 'Все добавившие');
-      function notify(keys) {{
-        lastKeys=keys.slice();
-        changeHandlers.forEach(function(fn) {{
-          try {{ fn(keys.slice()); }} catch (e) {{}}
-        }});
-      }}
-      function applyFilter() {{
-        var q=(input && input.value ? input.value : '').trim().toLowerCase();
-        var dsValue=datasetSelect ? datasetSelect.value : '';
-        var dsValueLower=dsValue ? dsValue.toLowerCase() : '';
-        var cityRaw=cityInput && cityInput.value ? cityInput.value.trim() : '';
-        var cityValueLower=cityRaw.toLowerCase();
-        var hasExactCity = cityValueLower && Object.prototype.hasOwnProperty.call(cityLookup, cityValueLower);
-        var commentValue=(commentInput && commentInput.value ? commentInput.value : '').trim().toLowerCase();
-        var hasCommentsValue=hasCommentsSelect ? hasCommentsSelect.value : '';
-        var addedKey=(addedSelect && addedSelect.value ? addedSelect.value : '');
-        var visible=[];
-        var visibleKeys=[];
-        rows.forEach(function(row) {{
-          var match=true;
-          if (match && q && row._searchText.indexOf(q)===-1) match=false;
-          if (match && dsValue) {{
-            match=row._datasets && row._datasets.some(function(ds) {{
-              var val=(ds.value || '').toString().toLowerCase();
-              var label=(ds.label || '').toString().toLowerCase();
-              return val===dsValueLower || label===dsValueLower;
-            }});
-          }}
-          if (match && cityValueLower) {{
-            if (hasExactCity) {{
-              match=row._cities && row._cities.some(function(city) {{
-                return city.toLowerCase()===cityValueLower;
-              }});
-            }} else {{
-              match=row._cities && row._cities.some(function(city) {{
-                return city.toLowerCase().indexOf(cityValueLower)!==-1;
-              }});
-            }}
-          }}
-          if (match && commentValue) {{
-            match=row._commentsText.indexOf(commentValue)!==-1;
-          }}
-          if (match && hasCommentsValue==='with') {{
-            match=row._commentsCount>0;
-          }} else if (match && hasCommentsValue==='without') {{
-            match=row._commentsCount===0;
-          }}
-          if (match && addedKey) {{
-            match=row._addedKey===addedKey;
-          }}
-          row.style.display = match ? '' : 'none';
-          if (match) {{
-            visible.push(row);
-            if (row.dataset.key) visibleKeys.push(row.dataset.key);
-          }}
-        }});
-        if (summary) {{
-          if (!q && !dsValue && !cityValueLower && !commentValue && !addedKey && !hasCommentsValue) {{
-            summary.textContent = baseText;
-          }} else {{
-            var coordsShown = visible.filter(function(row) {{ return row._hasCoords; }}).length;
-            summary.textContent = visible.length + ' из ' + totals.total + ' записей' + ' • С координатами: ' + coordsShown;
-          }}
-        }}
-        notify(visibleKeys);
-      }}
-      var debouncedApply=debounce(applyFilter, 150);
-      if (input) input.addEventListener('input', debouncedApply);
-      if (cityInput) cityInput.addEventListener('input', debouncedApply);
-      if (commentInput) commentInput.addEventListener('input', debouncedApply);
-      if (datasetSelect) datasetSelect.addEventListener('change', applyFilter);
-      if (cityInput) cityInput.addEventListener('change', applyFilter);
-      if (addedSelect) addedSelect.addEventListener('change', applyFilter);
-      if (hasCommentsSelect) hasCommentsSelect.addEventListener('change', applyFilter);
-      if (resetBtn) resetBtn.addEventListener('click', function() {{
-        if (input) input.value='';
-        if (datasetSelect) datasetSelect.value='';
-        if (cityInput) cityInput.value='';
-        if (commentInput) commentInput.value='';
-        if (addedSelect) addedSelect.value='';
-        if (hasCommentsSelect) hasCommentsSelect.value='';
-        applyFilter();
-      }});
-      applyFilter();
-      return {{
-        onChange: function(handler) {{
-          if (typeof handler === 'function') {{
-            changeHandlers.push(handler);
-            handler(lastKeys.slice());
-          }}
-        }},
-        refresh: applyFilter
-      }};
-    }}
-    function setupListInteractions(map, markerByKey, clusterGroup, filteringState) {{
-      var rows=Array.prototype.slice.call(document.querySelectorAll('.panel .row'));
-      var activeRow=null;
-      var TARGET_ZOOM=15;
-      function activate(row) {{
-        if (activeRow && activeRow!==row) activeRow.classList.remove('active');
-        if (row) {{
-          row.classList.add('active');
-          activeRow = row;
-          try {{ row.scrollIntoView({{ behavior:'smooth', block:'center', inline:'nearest' }}); }} catch (e) {{ row.scrollIntoView({{ block:'center' }}); }}
-        }}
-      }}
-      function focusMarker(marker) {{
-        if (!map || !marker) return;
-        var finalize=function() {{
-          var latlng = marker.getLatLng && marker.getLatLng();
-          if (latlng) {{
-            var zoom = map.getZoom ? map.getZoom() : TARGET_ZOOM;
-            if (typeof zoom !== 'number' || zoom < TARGET_ZOOM) zoom = TARGET_ZOOM;
-            if (map.flyTo) map.flyTo(latlng, zoom); else map.setView(latlng, zoom);
-          }}
-          if (marker.openPopup) marker.openPopup();
-        }};
-        if (clusterGroup && clusterGroup.hasLayer && !clusterGroup.hasLayer(marker)) {{
-          clusterGroup.addLayer(marker);
-        }}
-        if (clusterGroup && clusterGroup.zoomToShowLayer) {{
-          clusterGroup.zoomToShowLayer(marker, finalize);
-        }} else {{
-          finalize();
-        }}
-      }}
-      rows.forEach(function(row) {{
-        var key=row.dataset.key;
-        if (!key || !markerByKey || !markerByKey[key]) return;
-        row.addEventListener('click', function() {{
-          focusMarker(markerByKey[key]);
-          activate(row);
-        }});
-      }});
-      if (markerByKey) {{
-        Object.keys(markerByKey).forEach(function(key) {{
-          var marker=markerByKey[key];
-          if (!marker || !marker.on) return;
-          marker.on('click', function() {{
-            focusMarker(marker);
-            var row=document.querySelector('.panel .row[data-key="'+key+'"]');
-            if (row) activate(row);
-          }});
-        }});
-      }}
-      if (filteringState && filteringState.onChange) {{
-        filteringState.onChange(function() {{
-          if (activeRow && activeRow.style.display==='none') {{
-            activeRow.classList.remove('active');
-            activeRow=null;
-          }}
-        }});
-      }}
-    }}
-    function bindFilteringToMarkers(filteringState, map, clusterGroup, markerByKey) {{
-      if (!filteringState || !filteringState.onChange) return;
-      filteringState.onChange(function(visibleKeys) {{
-        if (!markerByKey) return;
-        var visibleSet={{}};
-        (visibleKeys || []).forEach(function(key) {{
-          if (key) visibleSet[key]=true;
-        }});
-        if (clusterGroup && clusterGroup.hasLayer) {{
-          Object.keys(markerByKey).forEach(function(key) {{
-            var marker=markerByKey[key];
-            if (!marker) return;
-            var shouldShow=!!visibleSet[key];
-            var hasLayer=clusterGroup.hasLayer(marker);
-            if (shouldShow && !hasLayer) {{
-              clusterGroup.addLayer(marker);
-            }} else if (!shouldShow && hasLayer) {{
-              clusterGroup.removeLayer(marker);
-            }}
-          }});
-        }} else if (map && map.addLayer && map.removeLayer) {{
-          Object.keys(markerByKey).forEach(function(key) {{
-            var marker=markerByKey[key];
-            if (!marker) return;
-            var shouldShow=!!visibleSet[key];
-            var onMap=map.hasLayer ? map.hasLayer(marker) : false;
-            if (shouldShow && !onMap) {{
-              map.addLayer(marker);
-            }} else if (!shouldShow && onMap) {{
-              map.removeLayer(marker);
-            }}
-          }});
-        }}
-      }});
-    }}
-    document.addEventListener('DOMContentLoaded', function() {{
-      initFilteringAsync();
-      var loadingController=createLoadingController();
-      ensureLeaflet(function() {{
-        ensureCluster(function() {{
-          var map=L.map('map', {{ preferCanvas:true }});
-          L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{attribution:'&copy; OpenStreetMap contributors', maxZoom:19, minZoom:1, updateWhenIdle:true, keepBuffer:4, reuseTiles:true, detectRetina:true}}).addTo(map);
-          {chr(10).join(marker_js)}
-        }});
-      }});
-    }});
-  </script>
-</body>
-</html>"""
 def build_map_users(users: List[Dict[str, Any]], title="VSCO Profiles (Users)"):
     def _prepare_phone_labels(value: Any) -> Tuple[List[str], List[str]]:
         raw: List[str] = []

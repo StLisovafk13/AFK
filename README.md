@@ -135,6 +135,7 @@ CLI-загрузчик медиа с Playwright, логированием и ZIP
 - `_render_index(refresh_interval)` — формирует главную страницу со статистикой по чатам и ссылками на галереи/карты/CSV. Использует `_list_chat_stats()` для подсчётов.【F:local_export_server.py†L58-L157】
 - `_export_scope_from_query(params)` — определяет область (`chat`/`all`) и конкретный чат из query-параметров. Возвращает `(scope, chat_id, error)`.【F:local_export_server.py†L158-L178】
 - `_generate_csv(scope, chat_id)` — собирает данные через `vsco_bot.fetch_gallery_users`, конвертирует в CSV-строку и возвращает bytes. Ошибки отображаются как HTTP 500.【F:local_export_server.py†L179-L337】
+- `/api/gallery`, `/api/map/users`, `/api/map/images` — JSON-эндпоинты с пагинацией и фильтрами (`limit`, `offset`, `username`, `added_by`), выдающие батчи для HTML-клиента и сторонних интеграций.【F:local_export_server.py†L188-L336】
 - `serve(host, port, refresh)` — запускает `http.server.ThreadingHTTPServer` с кастомным обработчиком, обновляющим HTML и CSV на лету.【F:local_export_server.py†L338-L351】
 - `main(argv)` — парсит CLI (`--host`, `--port`, `--refresh`, `--db`) и вызывает `serve`. По умолчанию слушает `127.0.0.1:8765` и обновляет страницы каждые 60 секунд.【F:local_export_server.py†L352-L419】
 
@@ -164,9 +165,9 @@ CLI-загрузчик медиа с Playwright, логированием и ZIP
 ### Управление источниками данных и статистикой
 
 - `dataset_token_pairs(source, source_file)` — формирует пары `(значение, метка)` для отображения набора данных (файл/источник) в отчётах и картах.【F:vsco_bot.py†L398-L461】
-- `fetch_gallery_users(scope, chat_id)` — агрегирует данные по пользователям: медиа по вкладкам, метаданные, города, камеры, вкладки профиля. Используется экспортом и локальным сервером.【F:vsco_bot.py†L2030-L2120】
-- `fetch_items_for_map(scope, chat_id)` — готовит список отдельных медиа с координатами, комментариями, источниками и подсказками для карты.【F:vsco_bot.py†L2405-L2480】
-- `build_rich_gallery(users, title, subtitle)` — генерирует HTML-галерею с панелью фильтров, стилями и встроенными данными; результат используется экспортом и локальным сервером.【F:vsco_bot.py†L2483-L2520】
+- `fetch_gallery_users(scope, chat_id, *, limit, offset, username, added_by)` — агрегирует данные по пользователям, поддерживает постраничную выдачу и фильтрацию по добавившему/юзернейму; используется экспортом и локальным сервером.【F:vsco_bot.py†L2126-L2482】
+- `fetch_items_for_map(scope, chat_id, *, limit, offset, username, added_by)` — готовит список отдельных медиа с координатами и комментариями, учитывая пагинацию и фильтры, для карт и API.【F:vsco_bot.py†L2997-L3076】
+- `build_rich_gallery(users, title, subtitle, *, config)` — генерирует каркас страницы с JS-инфинит-скроллом и lazy-loading миниатюр; при наличии `config['api_base']` подтягивает данные пачками через JSON-эндпоинты, иначе использует встроенный список `users`.【F:vsco_bot.py†L2541-L2995】
 - `build_map_users` / `build_map_images` — создают HTML-карты Leaflet для пользователей и изображений соответственно, с кластеризацией и всплывающими окнами (см. файл для деталей и кастомизаций).【F:vsco_bot.py†L4119-L4150】
 
 ### Работа с сообщениями и сохранением данных

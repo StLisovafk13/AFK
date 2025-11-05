@@ -41,6 +41,11 @@ from vsco_bot import (
 
 log = logging.getLogger(__name__)
 
+DEFAULT_GALLERY_LIMIT = 60
+MAX_GALLERY_LIMIT = 200
+DEFAULT_MAP_LIMIT = 300
+MAX_MAP_LIMIT = 1000
+
 
 def _inject_auto_refresh(html: str, interval: int) -> str:
     """Insert a ``<meta refresh>`` tag if *interval* is positive."""
@@ -248,6 +253,50 @@ class ExportRequestHandler(BaseHTTPRequestHandler):
     ) -> None:
         self._send_bytes(text.encode("utf-8"), status=status, content_type=content_type, filename=filename)
 
+    def _send_json(self, payload: Dict[str, object], *, status: HTTPStatus = HTTPStatus.OK) -> None:
+        self._send_text(
+            json.dumps(payload, ensure_ascii=False),
+            status=status,
+            content_type="application/json; charset=utf-8",
+        )
+
+    @staticmethod
+    def _first_param(params: Dict[str, List[str]], key: str) -> Optional[str]:
+        values = params.get(key)
+        if not values:
+            return None
+        value = values[0]
+        return value if value != "" else None
+
+    @staticmethod
+    def _parse_limit_offset(
+        params: Dict[str, List[str]],
+        *,
+        default_limit: int,
+        max_limit: int,
+    ) -> Tuple[int, int]:
+        limit_raw = params.get("limit", [None])[0]
+        offset_raw = params.get("offset", [None])[0]
+        limit = default_limit
+        offset = 0
+        if limit_raw not in (None, ""):
+            try:
+                limit = int(limit_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Invalid limit") from exc
+            if limit <= 0:
+                raise ValueError("Limit must be positive")
+            if limit > max_limit:
+                limit = max_limit
+        if offset_raw not in (None, ""):
+            try:
+                offset = int(offset_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Invalid offset") from exc
+            if offset < 0:
+                raise ValueError("Offset must be non-negative")
+        return limit, offset
+
     def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
@@ -262,22 +311,58 @@ class ExportRequestHandler(BaseHTTPRequestHandler):
 
         scope, chat_id, error = _export_scope_from_query(params)
         if error:
-            self._send_text(
-                json.dumps({"error": error}, ensure_ascii=False),
-                status=HTTPStatus.BAD_REQUEST,
-                content_type="application/json; charset=utf-8",
-            )
+            self._send_json({"error": error}, status=HTTPStatus.BAD_REQUEST)
             return
 
         try:
             if path == "/gallery":
+                subtitle = "All DB" if scope == "all" else f"Chat {chat_id}"
                 html = build_rich_gallery(
-                    fetch_gallery_users(scope, chat_id or 0),
+                    [],
                     title="VSCOLeak",
-                    subtitle=("All DB" if scope == "all" else f"Chat {chat_id}"),
+                    subtitle=subtitle,
+                    config={
+                        "scope": scope,
+                        "chat_id": chat_id if scope == "chat" else None,
+                        "api_base": "/api",
+                        "limit": DEFAULT_GALLERY_LIMIT,
+                        "subtitle": subtitle,
+                    },
                 )
                 html = _inject_auto_refresh(html, self.refresh_interval)
                 self._send_text(html)
+                return
+
+            if path == "/api/gallery":
+                try:
+                    limit, offset = self._parse_limit_offset(
+                        params,
+                        default_limit=DEFAULT_GALLERY_LIMIT,
+                        max_limit=MAX_GALLERY_LIMIT,
+                    )
+                except ValueError as err:
+                    self._send_json({"error": str(err)}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                username_filter = self._first_param(params, "username")
+                added_filter = self._first_param(params, "added_by")
+                users = fetch_gallery_users(
+                    scope,
+                    chat_id or 0,
+                    limit=limit,
+                    offset=offset,
+                    username=username_filter,
+                    added_by=added_filter,
+                )
+                payload = {
+                    "scope": scope,
+                    "chat_id": chat_id,
+                    "limit": limit,
+                    "offset": offset,
+                    "users": users,
+                    "next_offset": offset + len(users),
+                    "has_more": len(users) == limit,
+                }
+                self._send_json(payload)
                 return
 
             if path == "/map/users":
@@ -290,6 +375,38 @@ class ExportRequestHandler(BaseHTTPRequestHandler):
                 self._send_text(html)
                 return
 
+            if path == "/api/map/users":
+                try:
+                    limit, offset = self._parse_limit_offset(
+                        params,
+                        default_limit=DEFAULT_MAP_LIMIT,
+                        max_limit=MAX_MAP_LIMIT,
+                    )
+                except ValueError as err:
+                    self._send_json({"error": str(err)}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                username_filter = self._first_param(params, "username")
+                added_filter = self._first_param(params, "added_by")
+                users = fetch_gallery_users(
+                    scope,
+                    chat_id or 0,
+                    limit=limit,
+                    offset=offset,
+                    username=username_filter,
+                    added_by=added_filter,
+                )
+                payload = {
+                    "scope": scope,
+                    "chat_id": chat_id,
+                    "limit": limit,
+                    "offset": offset,
+                    "users": users,
+                    "next_offset": offset + len(users),
+                    "has_more": len(users) == limit,
+                }
+                self._send_json(payload)
+                return
+
             if path == "/map/images":
                 items = fetch_items_for_map(scope, chat_id or 0)
                 if not items:
@@ -298,6 +415,38 @@ class ExportRequestHandler(BaseHTTPRequestHandler):
                 html = build_map_images(items, title="VSCO Profiles — Images")
                 html = _inject_auto_refresh(html, self.refresh_interval)
                 self._send_text(html)
+                return
+
+            if path == "/api/map/images":
+                try:
+                    limit, offset = self._parse_limit_offset(
+                        params,
+                        default_limit=DEFAULT_MAP_LIMIT,
+                        max_limit=MAX_MAP_LIMIT,
+                    )
+                except ValueError as err:
+                    self._send_json({"error": str(err)}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                username_filter = self._first_param(params, "username")
+                added_filter = self._first_param(params, "added_by")
+                items = fetch_items_for_map(
+                    scope,
+                    chat_id or 0,
+                    limit=limit,
+                    offset=offset,
+                    username=username_filter,
+                    added_by=added_filter,
+                )
+                payload = {
+                    "scope": scope,
+                    "chat_id": chat_id,
+                    "limit": limit,
+                    "offset": offset,
+                    "items": items,
+                    "next_offset": offset + len(items),
+                    "has_more": len(items) == limit,
+                }
+                self._send_json(payload)
                 return
 
             if path == "/csv":
@@ -316,18 +465,13 @@ class ExportRequestHandler(BaseHTTPRequestHandler):
 
         except sqlite3.Error as err:
             log.exception("Database error during %s", path)
-            self._send_text(
-                json.dumps({"error": "DB error", "details": str(err)}, ensure_ascii=False),
+            self._send_json(
+                {"error": "DB error", "details": str(err)},
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
-                content_type="application/json; charset=utf-8",
             )
             return
 
-        self._send_text(
-            json.dumps({"error": "Not found"}, ensure_ascii=False),
-            status=HTTPStatus.NOT_FOUND,
-            content_type="application/json; charset=utf-8",
-        )
+        self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: D401, A003 - standard hook
         """Route HTTP server logs through the module logger."""
