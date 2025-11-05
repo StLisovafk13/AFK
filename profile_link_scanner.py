@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import aiohttp
 
@@ -371,7 +371,7 @@ async def collect_profile_media(
 
     def _store_tab_media(tab_url: str, urls_for_tab: Iterable[str]) -> None:
         nonlocal aggregated_urls
-        normalized_tab_url = _normalize_tab_url(tab_url)
+        normalized_tab_url = _normalize_tab_url(tab_url, root=profile_url)
         if not normalized_tab_url:
             return
         cleaned = dedupe_keep_order(urls_for_tab)
@@ -397,7 +397,7 @@ async def collect_profile_media(
         if tabs:
             for tab in tabs:
                 href = tab.get("href") or ""
-                normalized_href = _normalize_tab_url(href)
+                normalized_href = _normalize_tab_url(href, root=profile_url)
                 if (
                     not normalized_href
                     or normalized_href in seen_tab_urls
@@ -436,7 +436,7 @@ async def collect_profile_media(
             async with aiohttp.ClientSession(headers=session_headers) as session_retry:
                 for tab in tabs:
                     href = tab.get("href") or ""
-                    normalized_href = _normalize_tab_url(href)
+                    normalized_href = _normalize_tab_url(href, root=profile_url)
                     if (
                         not normalized_href
                         or normalized_href in seen_tab_urls
@@ -458,7 +458,7 @@ async def collect_profile_media(
     if not aggregated_urls:
         LOGGER.warning("Не удалось получить ссылки медиа для %s", profile_url)
         if include_details:
-            sanitized_tabs = _sanitize_profile_tabs(tabs)
+            sanitized_tabs = _sanitize_profile_tabs(tabs, root=profile_url)
             return ProfileMediaCollection(
                 media_urls=[],
                 profile_tabs=sanitized_tabs,
@@ -467,7 +467,7 @@ async def collect_profile_media(
         return []
 
     if include_details:
-        sanitized_tabs = _sanitize_profile_tabs(tabs)
+        sanitized_tabs = _sanitize_profile_tabs(tabs, root=profile_url)
         return ProfileMediaCollection(
             media_urls=aggregated_urls,
             profile_tabs=sanitized_tabs,
@@ -490,26 +490,50 @@ def _prepare_urls(urls: Iterable[str], *, max_width: int) -> list[str]:
     return dedupe_keep_order(prepared)
 
 
-def _normalize_tab_url(url: str) -> str:
+def _normalize_tab_url(url: str, *, root: Optional[str] = None) -> str:
     candidate = (url or "").strip()
     if not candidate:
         return ""
+
+    base = (root or "").strip()
+    if base:
+        candidate = urljoin(base, candidate)
+
     try:
         parsed = urlsplit(candidate)
     except Exception:
         return candidate
 
-    scheme = parsed.scheme or "https"
-    netloc = parsed.netloc
+    scheme = parsed.scheme or ""
+    netloc = parsed.netloc or ""
+
+    if not netloc and base:
+        try:
+            base_parts = urlsplit(base)
+        except Exception:
+            base_parts = None
+        else:
+            netloc = base_parts.netloc or netloc
+            if not scheme:
+                scheme = base_parts.scheme or "https"
+
+    if not scheme:
+        scheme = "https"
+
     path = parsed.path or ""
     if path and path != "/":
         path = path.rstrip("/")
+
+    if not netloc:
+        return candidate if candidate else ""
 
     return urlunsplit((scheme, netloc, path or "/", parsed.query, parsed.fragment))
 
 
 def _sanitize_profile_tabs(
     tabs: Optional[Sequence[Dict[str, Any]]],
+    *,
+    root: Optional[str] = None,
 ) -> list[dict[str, str]]:
     sanitized: list[dict[str, str]] = []
     if not tabs:
@@ -521,7 +545,7 @@ def _sanitize_profile_tabs(
         href = str(href_raw).strip() if href_raw is not None else ""
         if not href:
             continue
-        entry: dict[str, str] = {"href": _normalize_tab_url(href)}
+        entry: dict[str, str] = {"href": _normalize_tab_url(href, root=root)}
         for key in ("id", "label", "slug", "active"):
             value = tab.get(key)
             if value is None:
@@ -548,11 +572,11 @@ def store_profile_media(
 ) -> ScanResult:
     """Persist collected media URLs into the bot database."""
 
-    sanitized_tabs = _sanitize_profile_tabs(profile_tabs)
+    sanitized_tabs = _sanitize_profile_tabs(profile_tabs, root=profile_url)
     normalized_media_by_tab: dict[str, list[str]] = {}
     if media_by_tab:
         for tab_url, urls_for_tab in media_by_tab.items():
-            normalized_tab_url = _normalize_tab_url(tab_url)
+            normalized_tab_url = _normalize_tab_url(tab_url, root=profile_url)
             if not normalized_tab_url:
                 continue
             cleaned_urls = dedupe_keep_order(urls_for_tab)

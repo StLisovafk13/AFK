@@ -227,20 +227,42 @@ def _safe_float(value: Any) -> Optional[float]:
         return None
 
 
-def _normalize_tab_url(url: str) -> str:
+def _normalize_tab_url(url: str, *, root: Optional[str] = None) -> str:
     candidate = (url or "").strip()
     if not candidate:
         return ""
+
+    base = (root or "").strip()
+    if base:
+        candidate = urljoin(base, candidate)
+
     try:
         parsed = urlsplit(candidate)
     except Exception:
         return candidate
 
-    scheme = parsed.scheme or "https"
-    netloc = parsed.netloc
+    scheme = parsed.scheme or ""
+    netloc = parsed.netloc or ""
+
+    if not netloc and base:
+        try:
+            base_parts = urlsplit(base)
+        except Exception:
+            base_parts = None
+        else:
+            netloc = base_parts.netloc or netloc
+            if not scheme:
+                scheme = base_parts.scheme or "https"
+
+    if not scheme:
+        scheme = "https"
+
     path = parsed.path or ""
     if path and path != "/":
         path = path.rstrip("/")
+
+    if not netloc:
+        return candidate if candidate else ""
 
     return urlunsplit((scheme, netloc, path or "/", parsed.query, parsed.fragment))
 
@@ -2165,7 +2187,11 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             g["images"].append(img)
             g["image_set"].add(img)
 
-        normalized_tab_url = _normalize_tab_url(purl or g.get("profile_url") or "")
+        base_profile_url = g.get("profile_url") or purl or ""
+        normalized_tab_url = _normalize_tab_url(
+            purl or base_profile_url,
+            root=base_profile_url,
+        )
         if normalized_tab_url:
             tab_media_map: Dict[str, List[str]] = g["tab_media"]  # type: ignore[assignment]
             tab_media_seen: Dict[str, Set[str]] = g["tab_media_seen"]  # type: ignore[assignment]
@@ -2347,6 +2373,11 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
 
         link_info = tab_info_by_user.get(uname, {})
         link_profile_url = link_info.get("url") if isinstance(link_info, dict) else None
+        base_profile_url = (
+            link_profile_url
+            or g.get("profile_url")
+            or (f"https://vsco.co/{uname}" if uname else "")
+        )
 
         tab_media: Dict[str, List[str]] = {}
         raw_tab_media = g.get("tab_media")  # type: ignore[var-annotated]
@@ -2354,7 +2385,10 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             for tab_url_raw, media_list in raw_tab_media.items():
                 if not isinstance(tab_url_raw, str):
                     continue
-                normalized_tab_url = _normalize_tab_url(tab_url_raw)
+                normalized_tab_url = _normalize_tab_url(
+                    tab_url_raw,
+                    root=base_profile_url,
+                )
                 if not normalized_tab_url:
                     continue
                 cleaned_media: List[str] = []
@@ -2382,7 +2416,7 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
             return candidate
 
         def _append_tab_entry(source: Optional[Dict[str, Any]], tab_url: str) -> None:
-            normalized = _normalize_tab_url(tab_url)
+            normalized = _normalize_tab_url(tab_url, root=base_profile_url)
             if not normalized:
                 return
             entry: Dict[str, Any] = {}
@@ -2460,7 +2494,10 @@ def fetch_gallery_users(scope: str, chat_id: int) -> List[Dict[str, Any]]:
 
         if not profile_tabs:
             fallback_url = link_profile_url or g["profile_url"]
-            normalized_fallback = _normalize_tab_url(fallback_url or "")
+            normalized_fallback = _normalize_tab_url(
+                fallback_url or "",
+                root=base_profile_url,
+            )
             slug_value = _tab_slug_from_url(normalized_fallback or fallback_url or "")
             fallback_entry = {
                 "href": normalized_fallback or (fallback_url or ""),
