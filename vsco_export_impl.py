@@ -44,6 +44,7 @@ class ExportDependencies:
     build_rich_gallery: Callable[[List[Dict[str, Any]], str, str], str]
     build_map_users: Callable[[List[Dict[str, Any]], str], str]
     build_map_images: Callable[[List[Dict[str, Any]], str], str]
+    build_map_gallery: Callable[[List[Dict[str, Any]], str], str]
     mirror_export: Optional[
         Callable[
             [
@@ -109,6 +110,7 @@ class ExportManager:
         maps_row = [
             InlineKeyboardButton(text="🗺️ Карта (польз.)", callback_data="export:format:map_users"),
             InlineKeyboardButton(text="🗺️ Карта (фото)", callback_data="export:format:map_images"),
+            InlineKeyboardButton(text="🧭 Карта-галерея", callback_data="export:format:map_gallery"),
         ]
         return InlineKeyboardMarkup(inline_keyboard=[scope_row, types_row, maps_row])
 
@@ -183,7 +185,7 @@ class ExportManager:
             if fmt == "gallery":
                 await self._export_gallery(cq, session, chat_id)
                 return
-            if fmt in ("map_users", "map", "map_images"):
+            if fmt in ("map_users", "map", "map_images", "map_gallery"):
                 await self._export_map(cq, session, chat_id, fmt)
                 return
             await cq.answer("Неизвестный формат", show_alert=True)
@@ -277,6 +279,15 @@ class ExportManager:
             )
             output = session.dir / f"export_map_users_{session.export_scope}.html"
             export_format = "map_users"
+        elif fmt == "map_gallery":
+            items = self._deps.fetch_items_for_map(session.export_scope, chat_id)
+            if not items:
+                await cq.answer("Нет данных", show_alert=True)
+                return
+            await cq.answer("Готовлю экспорт…", cache_time=0)
+            html = self._deps.build_map_gallery(items, title="VSCO Gallery Map")
+            output = session.dir / f"export_map_gallery_{session.export_scope}.html"
+            export_format = "map_gallery"
         else:
             items = self._deps.fetch_items_for_map(session.export_scope, chat_id)
             if not items:
@@ -292,7 +303,7 @@ class ExportManager:
             cq,
             output,
             base_caption=f"Карта ({'вся база' if session.export_scope == 'all' else 'текущий чат'})",
-            allow_zip=(export_format == "map_images"),
+            allow_zip=(export_format in {"map_images", "map_gallery"}),
             chat_id=chat_id,
             export_format=export_format,
             scope=session.export_scope,

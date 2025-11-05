@@ -27,7 +27,7 @@
 | `vsco_parser.py` | Разбор HTML/Excel выгрузок Visual Search, построение галерей и карт. |
 | `vsco_rescan.py` | Массовое пересканирование уже сохранённых профилей с трекингом состояния. |
 | `local_export_server.py` | Локальный HTTP-сервер для просмотра галерей/карт/CSV по базе. |
-| `vsco_export.py` / `vsco_export_impl.py` | Хендлеры экспорта бота (CSV, галереи, карты) и инфраструктура для отправки файлов. |
+| `vsco_export.py` / `vsco_export_impl.py` | Хендлеры экспорта бота (CSV, галереи, карты, включая карту-галерею) и инфраструктура для отправки файлов. |
 | `vsco_bot.py` | Основная логика Telegram-бота: парсинг сообщений, хранение данных, построение экспорта и статистики. |
 | `test_*.py` | Наборы автоматических тестов для критичных компонентов. |
 
@@ -132,7 +132,7 @@ CLI-загрузчик медиа с Playwright, логированием и ZIP
 
 Локальный HTTP-сервер для просмотра экспорта:
 
-- `_render_index(refresh_interval)` — формирует главную страницу со статистикой по чатам и ссылками на галереи/карты/CSV. Использует `_list_chat_stats()` для подсчётов.【F:local_export_server.py†L58-L157】
+- `_render_index(refresh_interval)` — формирует главную страницу со статистикой по чатам и ссылками на галереи/карты/CSV (включая карту-галерею). Использует `_list_chat_stats()` для подсчётов.【F:local_export_server.py†L58-L164】
 - `_export_scope_from_query(params)` — определяет область (`chat`/`all`) и конкретный чат из query-параметров. Возвращает `(scope, chat_id, error)`.【F:local_export_server.py†L158-L178】
 - `_generate_csv(scope, chat_id)` — собирает данные через `vsco_bot.fetch_gallery_users`, конвертирует в CSV-строку и возвращает bytes. Ошибки отображаются как HTTP 500.【F:local_export_server.py†L179-L337】
 - `serve(host, port, refresh)` — запускает `http.server.ThreadingHTTPServer` с кастомным обработчиком, обновляющим HTML и CSV на лету.【F:local_export_server.py†L338-L351】
@@ -145,10 +145,10 @@ CLI-загрузчик медиа с Playwright, логированием и ZIP
 ### ExportManager
 
 - При инициализации регистрирует обработчики `/export` и `callback_query` с префиксом `export:` и читает лимиты из `VSCO_EXPORT_ZIP_THRESHOLD` (по умолчанию 45 МБ) и 50 МБ лимит Telegram.【F:vsco_export_impl.py†L81-L112】
-- `build_scope_keyboard(session)` — формирует inline-клавиатуру выбора области (текущий чат/вся база) и формата (CSV/галерея/карты).【F:vsco_export_impl.py†L93-L112】
+- `build_scope_keyboard(session)` — формирует inline-клавиатуру выбора области (текущий чат/вся база) и формата (CSV/галерея/карты, включая карту-галерею).【F:vsco_export_impl.py†L93-L116】
 - `open_menu(msg, user_id)` и `_cmd_export_handler` — проверяют права доступа, лимиты выгрузки и отображают меню экспорта в личных сообщениях.【F:vsco_export_impl.py†L114-L135】
 - `on_export_click(cq)` — обрабатывает нажатия, переключает область/форматы и вызывает соответствующие методы отправки файлов.【F:vsco_export_impl.py†L136-L192】
-- `_export_csv/_export_gallery/_export_map` — собирают данные через переданные зависимости (`fetch_gallery_users`, `build_rich_gallery`, `build_map_*`) и сохраняют файлы в директории сессии перед отправкой пользователю.【F:vsco_export_impl.py†L193-L290】
+- `_export_csv/_export_gallery/_export_map` — собирают данные через переданные зависимости (`fetch_gallery_users`, `build_rich_gallery`, `build_map_*`) и сохраняют файлы в директории сессии перед отправкой пользователю (поддерживается карта-галерея).【F:vsco_export_impl.py†L193-L314】
 - `_send_path_document` и `_prepare_document_for_sending` — автоматически зипуют файлы при превышении порога и отправляют документ в Telegram, затем вызывают `mirror_export`, если он настроен (например, для отдельного архива/канала).【F:vsco_export_impl.py†L291-L392】
 
 ## `vsco_bot.py`
@@ -167,7 +167,7 @@ CLI-загрузчик медиа с Playwright, логированием и ZIP
 - `fetch_gallery_users(scope, chat_id)` — агрегирует данные по пользователям: медиа по вкладкам, метаданные, города, камеры, вкладки профиля. Используется экспортом и локальным сервером.【F:vsco_bot.py†L2030-L2120】
 - `fetch_items_for_map(scope, chat_id)` — готовит список отдельных медиа с координатами, комментариями, источниками и подсказками для карты.【F:vsco_bot.py†L2405-L2480】
 - `build_rich_gallery(users, title, subtitle)` — генерирует HTML-галерею с панелью фильтров, стилями и встроенными данными; результат используется экспортом и локальным сервером.【F:vsco_bot.py†L2483-L2520】
-- `build_map_users` / `build_map_images` — создают HTML-карты Leaflet для пользователей и изображений соответственно, с кластеризацией и всплывающими окнами (см. файл для деталей и кастомизаций).【F:vsco_bot.py†L4119-L4150】
+- `build_map_users` / `build_map_images` / `build_map_gallery` — создают HTML-карты Leaflet для пользователей, отдельных изображений и фотокарты в стиле PhotoPrism соответственно, с кластеризацией и всплывающими окнами (см. файл для деталей и кастомизаций).【F:vsco_bot.py†L4321-L5046】
 
 ### Работа с сообщениями и сохранением данных
 
@@ -175,7 +175,7 @@ CLI-загрузчик медиа с Playwright, логированием и ZIP
 
 - `persist_profile_media_urls` / `upsert_items_with_comments` — взаимодействуют с таблицами `items`, `links`, `comments` при добавлении ссылок из сканера или ручных сообщений (см. соответствующие участки файла).
 - `get_session(chat_id)` — возвращает объект сеанса с настройками экспорта (используется `ExportManager`).【F:vsco_bot.py†L4557-L4563】
-- `fetch_gallery_users`, `fetch_items_for_map`, `build_rich_gallery`, `build_map_users`, `build_map_images` — экспортные точки, описанные выше.
+- `fetch_gallery_users`, `fetch_items_for_map`, `build_rich_gallery`, `build_map_users`, `build_map_images`, `build_map_gallery` — экспортные точки, описанные выше.
 
 Из-за объёма файла рекомендуется искать нужную функцию через `rg "def <name>" vsco_bot.py`.
 

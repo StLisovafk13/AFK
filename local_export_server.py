@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from vsco_bot import (
     DB_PATH,
     build_map_images,
+    build_map_gallery,
     build_map_users,
     build_rich_gallery,
     db_connect,
@@ -122,6 +123,10 @@ def _render_index(refresh_interval: int) -> str:
           <div class=\"count\">Каждое фото с координатами</div>
         </li>
         <li>
+          <a href=\"/map/gallery?scope=all\">🧭 Карта-галерея</a>
+          <div class=\"count\">Фотографии в стиле PhotoPrism</div>
+        </li>
+        <li>
           <a href=\"/csv?scope=all\">📄 CSV</a>
           <div class=\"count\">Полный список профилей</div>
         </li>
@@ -144,6 +149,7 @@ def _render_index(refresh_interval: int) -> str:
                 f'          <div><a href="/gallery?scope=chat&chat_id={chat_id}">📷 Галерея</a></div>\n'
                 f'          <div><a href="/map/users?scope=chat&chat_id={chat_id}">🗺️ Карта пользователей</a></div>\n'
                 f'          <div><a href="/map/images?scope=chat&chat_id={chat_id}">🗺️ Карта фото</a></div>\n'
+                f'          <div><a href="/map/gallery?scope=chat&chat_id={chat_id}">🧭 Карта-галерея</a></div>\n'
                 f'          <div><a href="/csv?scope=chat&chat_id={chat_id}">📄 CSV</a></div>\n'
                 "        </li>\n"
             )
@@ -308,6 +314,16 @@ class ExportRequestHandler(BaseHTTPRequestHandler):
                     self._send_text("Нет данных для отображения", status=HTTPStatus.NO_CONTENT)
                     return
                 html = build_map_images(items, title="VSCO Profiles — Images")
+                html = _inject_auto_refresh(html, self.refresh_interval)
+                self._send_text(html)
+                return
+
+            if path == "/map/gallery":
+                items = fetch_items_for_map(scope, chat_id or 0)
+                if not items:
+                    self._send_text("Нет данных для отображения", status=HTTPStatus.NO_CONTENT)
+                    return
+                html = build_map_gallery(items, title="VSCO Gallery Map")
                 html = _inject_auto_refresh(html, self.refresh_interval)
                 self._send_text(html)
                 return
