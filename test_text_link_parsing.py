@@ -116,7 +116,7 @@ def test_profile_link_scans_direct_media(monkeypatch, vsco_module):
     assert comments_added == len(assets)
     assert new_links == ["https://vsco.co/sampleuser"]
 
-    gallery_users = vsco_module.fetch_gallery_users("chat", 200)
+    gallery_users = list(vsco_module.fetch_gallery_users("chat", 200))
     assert gallery_users and gallery_users[0]["username"] == "sampleuser"
     assert set(gallery_users[0]["images"]) == set(assets)
 
