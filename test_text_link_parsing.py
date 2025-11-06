@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 
 import pytest
+
+aiogram = pytest.importorskip("aiogram")
 from aiogram.types import MessageEntity
 
 

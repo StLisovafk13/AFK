@@ -5494,10 +5494,12 @@ async def _profile_scan_worker(worker_id: int) -> None:
                 media_urls = collected.media_urls
                 profile_tabs = collected.profile_tabs
                 media_by_tab = collected.media_by_tab
+                warnings = collected.warnings
             else:
                 media_urls = collected
                 profile_tabs = []
                 media_by_tab = None
+                warnings = []
             result: ScanResult = store_profile_media(
                 Path(DB_PATH),
                 job.chat_id,
@@ -5508,6 +5510,7 @@ async def _profile_scan_worker(worker_id: int) -> None:
                 added_by=job.added_by,
                 profile_tabs=profile_tabs,
                 media_by_tab=media_by_tab,
+                warnings=warnings,
             )
             if result.metadata_targets:
                 await _enqueue_metadata_job(
@@ -5525,6 +5528,8 @@ async def _profile_scan_worker(worker_id: int) -> None:
                 )
                 if not result.media_urls:
                     text += "\n⚠️ Не удалось обнаружить медиа у этого профиля."
+                elif result.warnings:
+                    text += "\n⚠️ Профиль загружен не полностью, данные могут быть неполными."
                 with contextlib.suppress(Exception):
                     await bot.send_message(
                         job.chat_id,

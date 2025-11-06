@@ -45,6 +45,10 @@ DEFAULT_USER_AGENT = (
 )
 DEFAULT_DB = Path("vsco_links.db")
 LOCAL_TZ = timezone(timedelta(hours=3))
+PARTIAL_LOAD_MARKER = "Error Loading Content"
+PARTIAL_LOAD_WARNING = (
+    "Профиль загружен не полностью: на странице найдено сообщение «Error Loading Content»."
+)
 
 
 @dataclass(slots=True)
@@ -59,6 +63,7 @@ class ScanResult:
     profile_tabs: list[dict[str, str]] = field(default_factory=list)
     media_by_tab: dict[str, list[str]] = field(default_factory=dict)
     metadata_targets: list[tuple[int, str]] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -68,6 +73,7 @@ class ProfileMediaCollection:
     media_urls: list[str]
     profile_tabs: list[dict[str, str]] = field(default_factory=list)
     media_by_tab: dict[str, list[str]] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
 
 
 def utc_now_iso() -> str:
@@ -368,6 +374,20 @@ async def collect_profile_media(
     tabs: Sequence[Dict[str, Any]] | None = None
 
     seen_tab_urls: set[str] = set()
+    warnings: list[str] = []
+
+    def _record_warning(source: str, html: str) -> None:
+        if not html or PARTIAL_LOAD_MARKER not in html:
+            return
+        first_detected = PARTIAL_LOAD_WARNING not in warnings
+        if first_detected:
+            warnings.append(PARTIAL_LOAD_WARNING)
+        if first_detected or not include_details:
+            LOGGER.warning(
+                "Неполная загрузка содержимого профиля %s (source=%s)",
+                profile_url,
+                source,
+            )
 
     def _store_tab_media(tab_url: str, urls_for_tab: Iterable[str]) -> None:
         nonlocal aggregated_urls
@@ -389,6 +409,7 @@ async def collect_profile_media(
             max_width=max_width,
             logger=LOGGER,
         )
+        _record_warning("http", html)
         aggregated_urls = dedupe_keep_order(urls)
         if aggregated_urls:
             _store_tab_media(normalized_profile_url, aggregated_urls)
@@ -405,12 +426,13 @@ async def collect_profile_media(
                 ):
                     continue
                 seen_tab_urls.add(normalized_href)
-                tab_media, _ = await scan_profile_media(
+                tab_media, tab_html = await scan_profile_media(
                     session,
                     normalized_href,
                     max_width=max_width,
                     logger=LOGGER,
                 )
+                _record_warning(normalized_href, tab_html)
                 cleaned = dedupe_keep_order(tab_media)
                 media_by_tab[normalized_href] = cleaned
                 if cleaned:
@@ -427,6 +449,7 @@ async def collect_profile_media(
             delay=delay,
             target_count=target_count,
         )
+        _record_warning("playwright", html)
         aggregated_urls = dedupe_keep_order(urls)
         if aggregated_urls:
             _store_tab_media(normalized_profile_url, aggregated_urls)
@@ -444,12 +467,13 @@ async def collect_profile_media(
                     ):
                         continue
                     seen_tab_urls.add(normalized_href)
-                    tab_media, _ = await scan_profile_media(
+                    tab_media, tab_html = await scan_profile_media(
                         session_retry,
                         normalized_href,
                         max_width=max_width,
                         logger=LOGGER,
                     )
+                    _record_warning(normalized_href, tab_html)
                     cleaned = dedupe_keep_order(tab_media)
                     media_by_tab[normalized_href] = cleaned
                     if cleaned:
@@ -463,6 +487,7 @@ async def collect_profile_media(
                 media_urls=[],
                 profile_tabs=sanitized_tabs,
                 media_by_tab={},
+                warnings=warnings.copy(),
             )
         return []
 
@@ -472,6 +497,7 @@ async def collect_profile_media(
             media_urls=aggregated_urls,
             profile_tabs=sanitized_tabs,
             media_by_tab=media_by_tab.copy(),
+            warnings=warnings.copy(),
         )
 
     return aggregated_urls
@@ -572,6 +598,7 @@ def store_profile_media(
     profile_tabs: Optional[Sequence[Dict[str, Any]]] = None,
     media_by_tab: Optional[Mapping[str, Sequence[str]]] = None,
     meta_fetcher: Optional[Callable[[str], Dict[str, Any]]] = None,
+    warnings: Optional[Sequence[str]] = None,
 ) -> ScanResult:
     """Persist collected media URLs into the bot database."""
 
@@ -595,6 +622,7 @@ def store_profile_media(
         profile_tabs=sanitized_tabs,
         media_by_tab=normalized_media_by_tab.copy(),
         metadata_targets=[],
+        warnings=list(warnings) if warnings else [],
     )
     if not normalized_media_by_tab:
         return result
@@ -701,10 +729,12 @@ async def _async_main(args: argparse.Namespace) -> ScanResult:
         media_urls = collected.media_urls
         profile_tabs = collected.profile_tabs
         media_by_tab = collected.media_by_tab
+        warnings = collected.warnings
     else:
         media_urls = collected
         profile_tabs = []
         media_by_tab = None
+        warnings = []
 
     result = store_profile_media(
         args.db,
@@ -715,12 +745,17 @@ async def _async_main(args: argparse.Namespace) -> ScanResult:
         source="profile-scan",
         profile_tabs=profile_tabs,
         media_by_tab=media_by_tab,
+        warnings=warnings,
     )
     LOGGER.info(
         "Сканирование завершено: %d новых элементов, ссылка сохранена=%s",
         result.added_items,
         result.link_added,
     )
+    if result.warnings:
+        LOGGER.warning(
+            "⚠️ Профиль загружен не полностью, данные могут быть неполными."
+        )
     return result
 
 
