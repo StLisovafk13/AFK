@@ -177,10 +177,12 @@ async def _rescan_single(
         media_urls = collected.media_urls
         profile_tabs = collected.profile_tabs
         media_by_tab = collected.media_by_tab
+        warnings = collected.warnings
     else:
         media_urls = collected
         profile_tabs = []
         media_by_tab = None
+        warnings = []
 
     if not media_urls:
         LOGGER.warning("Нет медиа по ссылке %s", entry.profile_url)
@@ -195,6 +197,7 @@ async def _rescan_single(
         source="rescan",
         profile_tabs=profile_tabs,
         media_by_tab=media_by_tab,
+        warnings=warnings,
     )
 
 
@@ -253,6 +256,11 @@ async def rescan_profiles(
             continue
         summary.succeeded += 1
         summary.total_added_items += result.added_items
+        if result.warnings:
+            LOGGER.warning(
+                "⚠️ Профиль %s загружен не полностью, данные могут быть неполными.",
+                result.profile_url,
+            )
         LOGGER.info(
             "Профиль %s: добавлено %d новых медиа", result.profile_url, result.added_items
         )
