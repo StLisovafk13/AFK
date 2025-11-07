@@ -22,6 +22,7 @@ polls the database every ``--poll-interval`` seconds.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import datetime as dt
 import logging
 import sqlite3
@@ -34,6 +35,7 @@ from typing import List, Sequence
 import requests
 
 from vsco_utils import generate_media_filename
+from exif_fetcher import DEFAULT_HTTP_HEADERS, build_curl_command
 
 LOGGER = logging.getLogger("photoprism_importer")
 
@@ -137,75 +139,216 @@ def _mark_failure(
     conn.commit()
 
 
+class DownloadTask:
+    """Normalized unit of work for HTTP/Playwright downloaders."""
+
+    __slots__ = ("item_id", "url", "dest", "referer")
+
+    def __init__(self, item_id: int, url: str, dest: Path, referer: str | None):
+        self.item_id = item_id
+        self.url = url
+        self.dest = dest
+        self.referer = referer
+
+
+BASE_HEADERS = dict(DEFAULT_HTTP_HEADERS)
+BASE_HEADERS.setdefault(
+    "Accept", "video/*;q=0.9,image/avif,image/webp,image/*,*/*;q=0.8"
+)
+BASE_HEADERS.setdefault("Accept-Language", "en-US,en;q=0.9,ru;q=0.8")
+
+
 def _download_with_requests(
     session: requests.Session,
-    url: str,
-    dest: Path,
+    task: DownloadTask,
     *,
     timeout: int,
     chunk_size: int = 65536,
     user_agent: str | None = None,
-    referer: str | None = None,
 ) -> None:
-    headers = {}
+    headers = dict(BASE_HEADERS)
     if user_agent:
         headers["User-Agent"] = user_agent
-    if referer:
-        headers["Referer"] = referer
-    if headers:
-        headers.setdefault(
-            "Accept",
-            "video/*;q=0.9,image/avif,image/webp,image/*,*/*;q=0.8",
-        )
-    else:
-        headers = None
-    with session.get(url, stream=True, timeout=timeout, headers=headers) as resp:
+    if task.referer:
+        headers["Referer"] = task.referer
+
+    with session.get(task.url, stream=True, timeout=timeout, headers=headers) as resp:
         resp.raise_for_status()
-        dest_tmp = dest.with_suffix(dest.suffix + ".part")
+        dest_tmp = task.dest.with_suffix(task.dest.suffix + ".part")
         with dest_tmp.open("wb") as handle:
             for chunk in resp.iter_content(chunk_size=chunk_size):
                 if not chunk:
                     continue
                 handle.write(chunk)
-        dest_tmp.replace(dest)
+        dest_tmp.replace(task.dest)
 
 
 def _download_with_curl(
-    url: str,
-    dest: Path,
+    task: DownloadTask,
     *,
     curl_bin: str,
     timeout: int,
-    referer: str | None,
     user_agent: str | None,
 ) -> None:
-    dest_tmp = dest.with_suffix(dest.suffix + ".part")
-    cmd = [
-        curl_bin,
-        "-fL",
-        "--connect-timeout",
-        str(timeout),
-        "--max-time",
-        str(timeout * 2),
-        url,
-        "-o",
-        str(dest_tmp),
-    ]
-    if referer:
-        cmd.extend(["-H", f"Referer: {referer}"])
+    dest_tmp = task.dest.with_suffix(task.dest.suffix + ".part")
+    headers = dict(BASE_HEADERS)
     if user_agent:
-        cmd.extend(["-H", f"User-Agent: {user_agent}"])
-    cmd.extend([
-        "-H",
-        "Accept: video/*;q=0.9,image/avif,image/webp,image/*,*/*;q=0.8",
-    ])
+        headers["User-Agent"] = user_agent
+    cmd = build_curl_command(
+        task.url,
+        referer=task.referer,
+        timeout=timeout,
+        headers=headers,
+        curl_bin=curl_bin,
+    )
+    cmd.extend(["-o", str(dest_tmp)])
+
     LOGGER.debug("Running curl: %s", " ".join(cmd))
     subprocess.run(cmd, check=True)
-    dest_tmp.replace(dest)
+    dest_tmp.replace(task.dest)
 
 
 def _ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _build_tasks(
+    items: Sequence[sqlite3.Row],
+    *,
+    dest_dir: Path,
+    default_referer: str | None,
+) -> list[DownloadTask]:
+    tasks: list[DownloadTask] = []
+    for row in items:
+        item_id = int(row["id"])
+        url = row["image_url"]
+        filename = generate_media_filename(url, item_id)
+        dest_path = dest_dir / filename
+        _ensure_parent(dest_path)
+
+        referer = (row["profile_url"] or "").strip() or (default_referer or None)
+        if referer and not referer.startswith("http"):
+            referer = default_referer or None
+
+        tasks.append(DownloadTask(item_id, url, dest_path, referer))
+
+    return tasks
+
+
+def _process_batch_http(
+    conn: sqlite3.Connection,
+    tasks: Sequence[DownloadTask],
+    *,
+    use_curl: bool,
+    curl_bin: str,
+    timeout: int,
+    user_agent: str | None,
+) -> None:
+    session: requests.Session | None = None
+    if not use_curl:
+        session = requests.Session()
+
+    try:
+        for idx, task in enumerate(tasks, start=1):
+            LOGGER.info(
+                "[%s/%s] Downloading %s -> %s",
+                idx,
+                len(tasks),
+                task.url,
+                task.dest,
+            )
+            try:
+                if use_curl:
+                    _download_with_curl(
+                        task,
+                        curl_bin=curl_bin,
+                        timeout=timeout,
+                        user_agent=user_agent,
+                    )
+                else:
+                    assert session is not None
+                    _download_with_requests(
+                        session,
+                        task,
+                        timeout=timeout,
+                        user_agent=user_agent,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("Failed to download item %s: %s", task.item_id, exc)
+                _mark_failure(conn, task.item_id, error=str(exc))
+                continue
+
+            _mark_success(conn, task.item_id, path=task.dest)
+    finally:
+        if session is not None:
+            session.close()
+
+
+async def _download_batch_playwright(
+    tasks: Sequence[DownloadTask],
+    *,
+    timeout: int,
+    user_agent: str | None,
+    concurrency: int,
+) -> list[tuple[DownloadTask, Exception | None]]:
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as exc:  # pragma: no cover - optional dep
+        raise RuntimeError(
+            "Playwright is not available. Install it or run without --use-playwright"
+        ) from exc
+
+    results: list[tuple[DownloadTask, Exception | None]] = []
+
+    total = len(tasks)
+
+    async with async_playwright() as p:
+        browser = await p.firefox.launch(headless=True)
+        context_kwargs = {}
+        if user_agent:
+            context_kwargs["user_agent"] = user_agent
+        context = await browser.new_context(**context_kwargs)
+
+        headers_base = dict(BASE_HEADERS)
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def fetch(idx: int, task: DownloadTask) -> None:
+            async with sem:
+                LOGGER.info(
+                    "[%s/%s] Downloading %s -> %s (Playwright)",
+                    idx,
+                    total,
+                    task.url,
+                    task.dest,
+                )
+                headers = dict(headers_base)
+                if task.referer:
+                    headers["Referer"] = task.referer
+                try:
+                    response = await context.request.get(
+                        task.url,
+                        timeout=timeout * 1000,
+                        headers=headers,
+                    )
+                    status = response.status
+                    if status >= 400:
+                        raise RuntimeError(f"HTTP {status}")
+                    body = await response.body()
+                    if not body:
+                        raise RuntimeError("empty body")
+                    dest_tmp = task.dest.with_suffix(task.dest.suffix + ".part")
+                    dest_tmp.write_bytes(body)
+                    dest_tmp.replace(task.dest)
+                    results.append((task, None))
+                except Exception as exc:  # noqa: BLE001
+                    results.append((task, exc))
+
+        await asyncio.gather(*(fetch(idx, task) for idx, task in enumerate(tasks, 1)))
+
+        await context.close()
+        await browser.close()
+
+    return results
 
 
 def process_batch(
@@ -218,53 +361,51 @@ def process_batch(
     timeout: int,
     user_agent: str | None,
     default_referer: str | None,
+    use_playwright: bool,
+    playwright_concurrency: int,
 ) -> None:
-    session: requests.Session | None = None
-    if not use_curl:
-        session = requests.Session()
+    tasks = _build_tasks(
+        items,
+        dest_dir=dest_dir,
+        default_referer=default_referer,
+    )
 
-    try:
-        for idx, row in enumerate(items, start=1):
-            item_id = int(row["id"])
-            url = row["image_url"]
-            filename = generate_media_filename(url, item_id)
-            dest_path = dest_dir / filename
-            _ensure_parent(dest_path)
+    if not tasks:
+        return
 
-            referer = (row["profile_url"] or "").strip() or (default_referer or None)
-            if referer and not referer.startswith("http"):
-                referer = default_referer or None
+    if use_playwright:
+        LOGGER.debug(
+            "Downloading %d item(s) via Playwright request context", len(tasks)
+        )
+        results = asyncio.run(
+            _download_batch_playwright(
+                tasks,
+                timeout=timeout,
+                user_agent=user_agent,
+                concurrency=playwright_concurrency,
+            )
+        )
+        for task, error in results:
+            if error is None:
+                _mark_success(conn, task.item_id, path=task.dest)
+            else:
+                LOGGER.warning(
+                    "Playwright download failed for %s (item %s): %s",
+                    task.url,
+                    task.item_id,
+                    error,
+                )
+                _mark_failure(conn, task.item_id, error=str(error))
+        return
 
-            LOGGER.info("[%s/%s] Downloading %s -> %s", idx, len(items), url, dest_path)
-            try:
-                if use_curl:
-                    _download_with_curl(
-                        url,
-                        dest_path,
-                        curl_bin=curl_bin,
-                        timeout=timeout,
-                        referer=referer,
-                        user_agent=user_agent,
-                    )
-                else:
-                    assert session is not None
-                    _download_with_requests(
-                        session,
-                        url,
-                        dest_path,
-                        timeout=timeout,
-                        user_agent=user_agent,
-                        referer=referer,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.exception("Failed to download item %s: %s", item_id, exc)
-                _mark_failure(conn, item_id, error=str(exc))
-                continue
-
-            _mark_success(conn, item_id, path=dest_path)
-    finally:
-        if session is not None:
-            session.close()
+    _process_batch_http(
+        conn,
+        tasks,
+        use_curl=use_curl,
+        curl_bin=curl_bin,
+        timeout=timeout,
+        user_agent=user_agent,
+    )
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -296,12 +437,23 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--user-agent",
         default="",
-        help="Optional custom User-Agent for HTTP requests",
+        help="Optional custom User-Agent for HTTP/Playwright downloads",
     )
     parser.add_argument(
         "--default-referer",
         default="https://vsco.co/",
         help="Fallback Referer header when an item lacks profile_url",
+    )
+    parser.add_argument(
+        "--use-playwright",
+        action="store_true",
+        help="Download files via Playwright request context (best VSCO compatibility)",
+    )
+    parser.add_argument(
+        "--playwright-concurrency",
+        type=int,
+        default=3,
+        help="Maximum simultaneous Playwright downloads when --use-playwright is set",
     )
     parser.add_argument(
         "--use-curl",
@@ -364,6 +516,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 timeout=args.timeout,
                 user_agent=args.user_agent or None,
                 default_referer=args.default_referer or None,
+                use_playwright=args.use_playwright,
+                playwright_concurrency=max(1, args.playwright_concurrency),
             )
 
             if args.once:

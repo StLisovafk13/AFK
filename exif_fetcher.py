@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from typing import Any, Dict, Optional
 
-__all__ = ["extract_exif_from_url"]
+__all__ = ["extract_exif_from_url", "DEFAULT_HTTP_HEADERS", "build_curl_command"]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -18,6 +18,11 @@ _DEFAULT_HEADERS = {
     "Accept-Language": "ru,en;q=0.8",
     "User-Agent": "Mozilla/5.0",
 }
+
+# Public copy so other helpers (e.g. PhotoPrism import service) can reuse the
+# same header baseline when downloading VSCO originals. The dict is copied to
+# prevent accidental mutation of the module-level defaults.
+DEFAULT_HTTP_HEADERS = dict(_DEFAULT_HEADERS)
 
 
 class ExifExtractionError(RuntimeError):
@@ -30,8 +35,9 @@ def _build_curl_command(
     referer: Optional[str],
     timeout: int,
     headers: Dict[str, str],
+    curl_bin: Optional[str] = None,
 ) -> list[str]:
-    curl = shutil.which("curl") or shutil.which("curl.exe")
+    curl = curl_bin or shutil.which("curl") or shutil.which("curl.exe")
     if not curl:
         raise ExifExtractionError("curl binary is not available in PATH")
 
@@ -56,6 +62,28 @@ def _build_curl_command(
 
     cmd.append(url)
     return cmd
+
+
+def build_curl_command(
+    url: str,
+    *,
+    referer: Optional[str],
+    timeout: int,
+    headers: Optional[Dict[str, str]] = None,
+    curl_bin: Optional[str] = None,
+) -> list[str]:
+    """Return a curl command mirroring the EXIF downloader settings."""
+
+    combined = dict(_DEFAULT_HEADERS)
+    if headers:
+        combined.update(headers)
+    return _build_curl_command(
+        url,
+        referer=referer,
+        timeout=timeout,
+        headers=combined,
+        curl_bin=curl_bin,
+    )
 
 
 def _call_exiftool(path: str) -> Optional[Dict[str, Any]]:
