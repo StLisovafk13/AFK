@@ -179,6 +179,7 @@ CLI-загрузчик медиа с Playwright, логированием и ZIP
       - Запустить `photoprism_import_service.py`, который сам читает новые записи (`items.imported_at IS NULL`), помечает прогресс в полях `import_progress`/`import_error` и скачивает оригиналы через `requests` или `curl` прямо в том PhotoPrism.【F:photoprism_import_service.py†L1-L220】
    2. Для именования файлов можно вызвать `generate_media_filename` из `vsco_utils.py`, чтобы получить стабильные имена на базе URL/даты.【F:vsco_utils.py†L140-L199】
    3. После успешной загрузки отметки `import_progress='done'` и `imported_at` обновляются автоматически сервисом, поэтому PhotoPrism не получает дубликаты.
+   4. Если база создана недавно, запустите бота или `profile_link_scanner.py`, чтобы таблица `items` появилась до старта сервиса; иначе он завершится с сообщением об отсутствии схемы.【F:photoprism_import_service.py†L33-L78】
 
 4. **Импорт в PhotoPrism**
    1. Разложите скачанные файлы по структуре, понятной PhotoPrism (по подкаталогам, датам и т.д.).

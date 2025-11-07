@@ -41,6 +41,15 @@ LOGGER = logging.getLogger("photoprism_importer")
 def ensure_import_columns(conn: sqlite3.Connection) -> None:
     """Ensure auxiliary progress columns are present on the ``items`` table."""
 
+    has_items = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='items'"
+    ).fetchone()
+    if not has_items:
+        raise RuntimeError(
+            "items table not found – initialise the VSCO bot database before running the "
+            "PhotoPrism import service"
+        )
+
     existing = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
 
     if "import_progress" not in existing:
@@ -281,7 +290,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     conn = sqlite3.connect(args.db)
     conn.row_factory = sqlite3.Row
     try:
-        ensure_import_columns(conn)
+        try:
+            ensure_import_columns(conn)
+        except RuntimeError as exc:
+            LOGGER.error("%s", exc)
+            return 1
 
         while True:
             items = _claim_items(conn, batch_size=args.batch_size)
