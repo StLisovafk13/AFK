@@ -177,9 +177,12 @@ CLI-загрузчик медиа с Playwright, логированием и ZIP
    1. Выберите стратегию получения файлов:
       - Использовать готовый Playwright-загрузчик `vsco_downloader.py`, указывая каталог внутри смонтированного тома; или
       - Запустить `photoprism_import_service.py`, который сам читает новые записи (`items.imported_at IS NULL`), помечает прогресс в полях `import_progress`/`import_error` и скачивает оригиналы через `requests` или `curl` прямо в том PhotoPrism.【F:photoprism_import_service.py†L1-L220】
-   2. Для именования файлов можно вызвать `generate_media_filename` из `vsco_utils.py`, чтобы получить стабильные имена на базе URL/даты.【F:vsco_utils.py†L140-L199】
-   3. После успешной загрузки отметки `import_progress='done'` и `imported_at` обновляются автоматически сервисом, поэтому PhotoPrism не получает дубликаты.
-   4. Если база создана недавно, запустите бота или `profile_link_scanner.py`, чтобы таблица `items` появилась до старта сервиса; иначе он завершится с сообщением об отсутствии схемы.【F:photoprism_import_service.py†L33-L78】
+   2. При работе с VSCO добавьте HTTP-заголовки, чтобы избежать 403:
+      - Передайте `--user-agent "Mozilla/5.0 ..."` и `--default-referer https://vsco.co/` (значение по умолчанию уже прописано, но его можно переопределить на конкретный профиль).
+      - Если в базе у записи заполнено `profile_url`, сервис автоматически подставит его как Referer; иначе использует значение из `--default-referer`. Для `curl` заголовки пробрасываются теми же опциями.【F:photoprism_import_service.py†L120-L220】
+   3. Для именования файлов можно вызвать `generate_media_filename` из `vsco_utils.py`, чтобы получить стабильные имена на базе URL/даты.【F:vsco_utils.py†L140-L199】
+   4. После успешной загрузки отметки `import_progress='done'` и `imported_at` обновляются автоматически сервисом, поэтому PhotoPrism не получает дубликаты.
+   5. Если база создана недавно, запустите бота или `profile_link_scanner.py`, чтобы таблица `items` появилась до старта сервиса; иначе он завершится с сообщением об отсутствии схемы.【F:photoprism_import_service.py†L33-L90】
 
 4. **Импорт в PhotoPrism**
    1. Разложите скачанные файлы по структуре, понятной PhotoPrism (по подкаталогам, датам и т.д.).
@@ -196,7 +199,7 @@ CLI-загрузчик медиа с Playwright, логированием и ZIP
 | Инструмент | Сценарий использования | Ключевые опции |
 | --- | --- | --- |
 | `vsco_downloader.py` | Полноценная загрузка профиля через Playwright с поддержкой ZIP и логов. Укажите `--out <каталог>` на смонтированный том и при необходимости `--no-zip`, чтобы сохранить оригиналы без архивации.【F:vsco_downloader.py†L25-L117】 | `--username/--profile-url`, `--out`, `--max`, `--concurrency`, `--delay`, `--max-width`, `--no-zip` |
-| `photoprism_import_service.py` | Лёгкий сервис, который по очереди скачивает новые `items` из базы бота, сохраняет файлы в смонтированный каталог PhotoPrism и отмечает прогресс/ошибки в таблице `items`. Можно запускать циклично (`--poll-interval`) или разово (`--once`).【F:photoprism_import_service.py†L1-L220】 | `--db`, `--dest`, `--batch-size`, `--poll-interval`, `--use-curl`, `--timeout`, `--log-level` |
+| `photoprism_import_service.py` | Лёгкий сервис, который по очереди скачивает новые `items` из базы бота, сохраняет файлы в смонтированный каталог PhotoPrism и отмечает прогресс/ошибки в таблице `items`. Можно запускать циклично (`--poll-interval`) или разово (`--once`).【F:photoprism_import_service.py†L1-L220】 | `--db`, `--dest`, `--batch-size`, `--poll-interval`, `--timeout`, `--user-agent`, `--default-referer`, `--use-curl`, `--curl-bin`, `--log-level` |
 | `profile_link_scanner.py` | Асинхронный сборщик ссылок, который можно дополнить небольшим скачивальщиком: используйте `store_profile_media(..., meta_fetcher=None)` для получения списков URL и передавайте их в собственный загрузчик.【F:profile_link_scanner.py†L511-L640】 | `--db`, `--profile-url`, `--username`, `--target-count`, `--delay` |
 | `exif_fetcher.py` | Мини-сервис для извлечения EXIF из URL. Полезен, если нужно дополнительно проверить метаданные перед импортом или хранить `.json` рядом с файлами.【F:exif_fetcher.py†L91-L147】 | `extract_exif_from_url(url, referer, timeout)` |
 | `vsco_rescan.py` | Массовая перекачка уже известных профилей. Можно запускать периодически, чтобы заполнять пропущенные фото и обновлять каталог PhotoPrism.【F:vsco_rescan.py†L367-L428】 | `--db`, `--state-db`, `--limit`, `--concurrency`, `--max-width` |

@@ -81,7 +81,7 @@ def _claim_items(
 
     rows = conn.execute(
         """
-        SELECT id, image_url
+        SELECT id, image_url, profile_url
         FROM items
         WHERE imported_at IS NULL
           AND COALESCE(import_progress, '') NOT IN ('downloading')
@@ -145,8 +145,20 @@ def _download_with_requests(
     timeout: int,
     chunk_size: int = 65536,
     user_agent: str | None = None,
+    referer: str | None = None,
 ) -> None:
-    headers = {"User-Agent": user_agent} if user_agent else None
+    headers = {}
+    if user_agent:
+        headers["User-Agent"] = user_agent
+    if referer:
+        headers["Referer"] = referer
+    if headers:
+        headers.setdefault(
+            "Accept",
+            "video/*;q=0.9,image/avif,image/webp,image/*,*/*;q=0.8",
+        )
+    else:
+        headers = None
     with session.get(url, stream=True, timeout=timeout, headers=headers) as resp:
         resp.raise_for_status()
         dest_tmp = dest.with_suffix(dest.suffix + ".part")
@@ -158,7 +170,15 @@ def _download_with_requests(
         dest_tmp.replace(dest)
 
 
-def _download_with_curl(url: str, dest: Path, *, curl_bin: str, timeout: int) -> None:
+def _download_with_curl(
+    url: str,
+    dest: Path,
+    *,
+    curl_bin: str,
+    timeout: int,
+    referer: str | None,
+    user_agent: str | None,
+) -> None:
     dest_tmp = dest.with_suffix(dest.suffix + ".part")
     cmd = [
         curl_bin,
@@ -171,6 +191,14 @@ def _download_with_curl(url: str, dest: Path, *, curl_bin: str, timeout: int) ->
         "-o",
         str(dest_tmp),
     ]
+    if referer:
+        cmd.extend(["-H", f"Referer: {referer}"])
+    if user_agent:
+        cmd.extend(["-H", f"User-Agent: {user_agent}"])
+    cmd.extend([
+        "-H",
+        "Accept: video/*;q=0.9,image/avif,image/webp,image/*,*/*;q=0.8",
+    ])
     LOGGER.debug("Running curl: %s", " ".join(cmd))
     subprocess.run(cmd, check=True)
     dest_tmp.replace(dest)
@@ -189,6 +217,7 @@ def process_batch(
     curl_bin: str,
     timeout: int,
     user_agent: str | None,
+    default_referer: str | None,
 ) -> None:
     session: requests.Session | None = None
     if not use_curl:
@@ -202,14 +231,30 @@ def process_batch(
             dest_path = dest_dir / filename
             _ensure_parent(dest_path)
 
+            referer = (row["profile_url"] or "").strip() or (default_referer or None)
+            if referer and not referer.startswith("http"):
+                referer = default_referer or None
+
             LOGGER.info("[%s/%s] Downloading %s -> %s", idx, len(items), url, dest_path)
             try:
                 if use_curl:
-                    _download_with_curl(url, dest_path, curl_bin=curl_bin, timeout=timeout)
+                    _download_with_curl(
+                        url,
+                        dest_path,
+                        curl_bin=curl_bin,
+                        timeout=timeout,
+                        referer=referer,
+                        user_agent=user_agent,
+                    )
                 else:
                     assert session is not None
                     _download_with_requests(
-                        session, url, dest_path, timeout=timeout, user_agent=user_agent
+                        session,
+                        url,
+                        dest_path,
+                        timeout=timeout,
+                        user_agent=user_agent,
+                        referer=referer,
                     )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("Failed to download item %s: %s", item_id, exc)
@@ -252,6 +297,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--user-agent",
         default="",
         help="Optional custom User-Agent for HTTP requests",
+    )
+    parser.add_argument(
+        "--default-referer",
+        default="https://vsco.co/",
+        help="Fallback Referer header when an item lacks profile_url",
     )
     parser.add_argument(
         "--use-curl",
@@ -313,6 +363,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 curl_bin=args.curl_bin,
                 timeout=args.timeout,
                 user_agent=args.user_agent or None,
+                default_referer=args.default_referer or None,
             )
 
             if args.once:
