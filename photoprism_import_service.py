@@ -37,7 +37,7 @@ import aiohttp
 import requests
 
 from profile_link_scanner import DEFAULT_USER_AGENT
-from vsco_utils import generate_media_filename
+from vsco_utils import generate_media_filename, is_vsco_logo_url
 from zip_profile import _http_simple as zip_profile_http_simple
 
 LOGGER = logging.getLogger("photoprism_importer")
@@ -48,6 +48,14 @@ ACCEPT_LANGUAGE_HEADER = "en-US,en;q=0.9,ru;q=0.8"
 
 @dataclass(slots=True)
 class _FallbackJob:
+    item_id: int
+    url: str
+    dest: Path
+    referer: str | None
+
+
+@dataclass(slots=True)
+class _PlaywrightJob:
     item_id: int
     url: str
     dest: Path
@@ -228,6 +236,106 @@ def _ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
+async def _download_with_playwright(
+    jobs: Sequence[_PlaywrightJob],
+    *,
+    timeout: int,
+    concurrency: int,
+    user_agent: str | None,
+    browser: str,
+) -> dict[int, tuple[bool, str | None]]:
+    """Download items through Playwright ``context.request`` to reuse bot logic."""
+
+    if not jobs:
+        return {}
+
+    try:
+        from playwright.async_api import async_playwright  # type: ignore
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Playwright is not installed. Run 'pip install playwright' "
+            "and 'python -m playwright install firefox' (or the browser you "
+            "intend to use)."
+        ) from exc
+
+    browser_name = browser.lower()
+    results: dict[int, tuple[bool, str | None]] = {}
+    ua = (user_agent or DEFAULT_USER_AGENT).strip()
+    timeout_ms = max(timeout, 1) * 1000
+
+    async with async_playwright() as pw:
+        try:
+            browser_type = getattr(pw, browser_name)
+        except AttributeError as exc:  # pragma: no cover - invalid CLI input
+            raise RuntimeError(f"Unsupported Playwright browser '{browser}'.") from exc
+
+        launch = await browser_type.launch(headless=True)
+        context = await launch.new_context(user_agent=ua)
+        request = context.request
+
+        warmed: set[str] = set()
+        sem = asyncio.Semaphore(max(1, concurrency))
+
+        async def fetch(job: _PlaywrightJob) -> None:
+            referer = (job.referer or "").strip()
+            headers = {
+                "Accept": ACCEPT_HEADER,
+                "Accept-Language": ACCEPT_LANGUAGE_HEADER,
+                "User-Agent": ua,
+            }
+            if referer:
+                headers["Referer"] = referer
+
+            if job.dest.exists():
+                results[job.item_id] = (True, None)
+                return
+
+            tmp_path = job.dest.with_suffix(job.dest.suffix + ".part")
+            last_error: str | None = None
+
+            async with sem:
+                if referer and referer not in warmed:
+                    try:
+                        await request.get(referer, timeout=timeout_ms)
+                    except Exception:  # pragma: no cover - best effort warmup
+                        pass
+                    warmed.add(referer)
+
+                for attempt in range(1, 3 + 1):
+                    try:
+                        resp = await request.get(
+                            job.url,
+                            headers=headers,
+                            timeout=timeout_ms,
+                        )
+                        status = resp.status
+                        if status >= 400:
+                            raise RuntimeError(f"HTTP {status}")
+                        data = await resp.body()
+                        if not data:
+                            raise RuntimeError("empty body")
+                        job.dest.parent.mkdir(parents=True, exist_ok=True)
+                        tmp_path.write_bytes(data)
+                        tmp_path.replace(job.dest)
+                        results[job.item_id] = (True, None)
+                        return
+                    except Exception as exc:  # noqa: BLE001
+                        last_error = str(exc)
+                        await asyncio.sleep(min(0.8 * attempt, 2.5))
+
+                results[job.item_id] = (
+                    False,
+                    last_error or "playwright download failed",
+                )
+
+        await asyncio.gather(*(fetch(job) for job in jobs))
+
+        await context.close()
+        await launch.close()
+
+    return results
+
+
 async def _download_batch_with_zip_helper(
     jobs: Sequence[_FallbackJob],
     *,
@@ -300,7 +408,65 @@ def process_batch(
     timeout: int,
     user_agent: str | None,
     default_referer: str | None,
+    use_playwright: bool,
+    playwright_concurrency: int,
+    playwright_browser: str,
 ) -> None:
+    if use_playwright:
+        jobs: list[_PlaywrightJob] = []
+        for row in items:
+            item_id = int(row["id"])
+            url = row["image_url"]
+            if is_vsco_logo_url(url):
+                LOGGER.warning("Item %s points to VSCO logo placeholder, skipping", item_id)
+                _mark_failure(conn, item_id, error="placeholder logo URL")
+                continue
+            dest_path = dest_dir / generate_media_filename(url, item_id)
+            _ensure_parent(dest_path)
+            referer = (row["profile_url"] or "").strip() or (default_referer or None)
+            if referer and not referer.startswith("http"):
+                referer = default_referer or None
+            jobs.append(
+                _PlaywrightJob(
+                    item_id=item_id,
+                    url=url,
+                    dest=dest_path,
+                    referer=referer,
+                )
+            )
+
+        if not jobs:
+            return
+
+        try:
+            results = asyncio.run(
+                _download_with_playwright(
+                    jobs,
+                    timeout=timeout,
+                    concurrency=playwright_concurrency,
+                    user_agent=user_agent,
+                    browser=playwright_browser,
+                )
+            )
+        except RuntimeError as exc:
+            LOGGER.error("Playwright failure: %s", exc)
+            for job in jobs:
+                _mark_failure(conn, job.item_id, error=str(exc))
+            return
+
+        for job in jobs:
+            ok, error = results.get(job.item_id, (False, "no result"))
+            if ok:
+                _mark_success(conn, job.item_id, path=job.dest)
+            else:
+                LOGGER.error(
+                    "Playwright download failed for item %s: %s",
+                    job.item_id,
+                    error,
+                )
+                _mark_failure(conn, job.item_id, error=error or "playwright error")
+        return
+
     session: requests.Session | None = None
     if not use_curl:
         session = requests.Session()
@@ -312,6 +478,11 @@ def process_batch(
         for idx, row in enumerate(items, start=1):
             item_id = int(row["id"])
             url = row["image_url"]
+            if is_vsco_logo_url(url):
+                LOGGER.warning("Item %s points to VSCO logo placeholder, skipping", item_id)
+                _mark_failure(conn, item_id, error="placeholder logo URL")
+                continue
+
             filename = generate_media_filename(url, item_id)
             dest_path = dest_dir / filename
             _ensure_parent(dest_path)
@@ -459,6 +630,23 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="Process a single batch and exit instead of running continuously",
     )
     parser.add_argument(
+        "--use-playwright",
+        action="store_true",
+        help="Download via Playwright context.request (matches bot downloader)",
+    )
+    parser.add_argument(
+        "--playwright-browser",
+        default="firefox",
+        choices=["firefox", "chromium", "webkit"],
+        help="Playwright browser engine to launch when --use-playwright is set",
+    )
+    parser.add_argument(
+        "--playwright-concurrency",
+        type=int,
+        default=4,
+        help="Concurrent Playwright requests per batch (when --use-playwright)",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -504,6 +692,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 timeout=args.timeout,
                 user_agent=args.user_agent or None,
                 default_referer=args.default_referer or None,
+                use_playwright=args.use_playwright,
+                playwright_concurrency=args.playwright_concurrency,
+                playwright_browser=args.playwright_browser,
             )
 
             if args.once:
