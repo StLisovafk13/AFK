@@ -34,7 +34,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import RLock
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from vsco_bot import (
@@ -45,6 +45,7 @@ from vsco_bot import (
     db_connect,
     fetch_gallery_users,
     fetch_items_for_map,
+    utc_now_iso,
 )
 
 
@@ -62,6 +63,481 @@ def _inject_auto_refresh(html: str, interval: int) -> str:
     if marker in html:
         return html.replace(marker, refresh_tag + marker, 1)
     return refresh_tag + html
+
+
+def _sanitize_comments(payload: Any) -> List[str]:
+    """Convert *payload* to a cleaned list of comment strings."""
+
+    if payload is None:
+        return []
+
+    entries: List[str] = []
+    if isinstance(payload, str):
+        text = payload.replace("\r\n", "\n").replace("\r", "\n")
+        entries = text.split("\n")
+    elif isinstance(payload, (list, tuple, set)):
+        entries = [str(item) for item in payload]
+    else:
+        return []
+
+    cleaned: List[str] = []
+    for item in entries:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            cleaned.append(text)
+    return cleaned
+
+
+def _update_profile_comments(username: str, comments: List[str]) -> Dict[str, Any]:
+    """Replace all comments for *username* with *comments* and return stats."""
+
+    clean_username = (username or "").strip()
+    if not clean_username:
+        raise ValueError("username is required")
+
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, chat_id FROM items WHERE username = ? ORDER BY created_at ASC",
+            (clean_username,),
+        ).fetchall()
+        if not rows:
+            raise LookupError("profile not found")
+
+        item_pairs = [(int(item_id), int(chat_id)) for item_id, chat_id in rows]
+        item_ids = [item_id for item_id, _ in item_pairs]
+
+        if item_ids:
+            placeholders = ",".join("?" for _ in item_ids)
+            conn.execute(
+                f"DELETE FROM comments WHERE item_id IN ({placeholders})",
+                item_ids,
+            )
+
+        if comments:
+            from itertools import cycle
+
+            iterator = cycle(item_pairs)
+            now = utc_now_iso()
+            for comment in comments:
+                item_id, chat_id = next(iterator)
+                conn.execute(
+                    "INSERT INTO comments(item_id, chat_id, comment, created_at) VALUES(?,?,?,?)",
+                    (item_id, chat_id, comment, now),
+                )
+
+        conn.commit()
+        return {
+            "username": clean_username,
+            "comments": comments,
+            "comments_count": len(comments),
+        }
+    finally:
+        conn.close()
+
+
+def _delete_profile(username: str) -> Dict[str, Any]:
+    """Remove all DB entries associated with *username*."""
+
+    clean_username = (username or "").strip()
+    if not clean_username:
+        raise ValueError("username is required")
+
+    conn = db_connect()
+    try:
+        item_rows = conn.execute(
+            "SELECT id FROM items WHERE username = ?",
+            (clean_username,),
+        ).fetchall()
+        if not item_rows:
+            raise LookupError("profile not found")
+
+        item_ids = [int(row[0]) for row in item_rows]
+        deleted_comments = 0
+        if item_ids:
+            placeholders = ",".join("?" for _ in item_ids)
+            cur = conn.execute(
+                f"DELETE FROM comments WHERE item_id IN ({placeholders})",
+                item_ids,
+            )
+            deleted_comments = cur.rowcount or 0
+
+        cur_items = conn.execute(
+            "DELETE FROM items WHERE username = ?",
+            (clean_username,),
+        )
+        removed_items = cur_items.rowcount or len(item_ids)
+
+        cur_links = conn.execute(
+            "DELETE FROM links WHERE username = ?",
+            (clean_username,),
+        )
+        removed_links = cur_links.rowcount or 0
+
+        conn.commit()
+        return {
+            "username": clean_username,
+            "removed_items": removed_items,
+            "removed_comments": deleted_comments,
+            "removed_links": removed_links,
+        }
+    finally:
+        conn.close()
+
+
+_ADMIN_PANEL_SNIPPET = r"""
+<style>
+  .admin-flash-container { position: fixed; top: 20px; right: 20px; z-index: 5000; display: flex; flex-direction: column; gap: 12px; }
+  .admin-flash { padding: 12px 16px; border-radius: 12px; font-size: 14px; box-shadow: 0 12px 24px rgba(15,23,42,0.18); color: #0f172a; background: #f8fafc; opacity: 0; transform: translateY(-8px); transition: opacity .2s ease, transform .2s ease; }
+  .admin-flash.show { opacity: 1; transform: translateY(0); }
+  .admin-flash.hide { opacity: 0; transform: translateY(-10px); }
+  .admin-flash.error { background: #fee2e2; color: #991b1b; }
+  .admin-modal { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 4000; }
+  .admin-modal.hidden { display: none; }
+  .admin-modal__backdrop { position: absolute; inset: 0; background: rgba(15,23,42,0.45); backdrop-filter: blur(4px); }
+  .admin-modal__dialog { position: relative; background: #fff; border-radius: 20px; padding: 28px; width: min(520px, 90vw); max-height: 80vh; display: flex; flex-direction: column; gap: 18px; box-shadow: 0 28px 60px rgba(15,23,42,0.35); }
+  .admin-modal__dialog h2 { margin: 0; font-size: 22px; }
+  .admin-modal__dialog textarea { flex: 1 1 auto; min-height: 200px; border-radius: 14px; border: 1px solid #cbd5f5; padding: 12px 14px; font-size: 14px; resize: vertical; }
+  .admin-modal__dialog textarea:focus { outline: none; border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,0.15); }
+  .admin-modal__actions { display: flex; gap: 12px; justify-content: flex-end; }
+  .admin-btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 10px 16px; border-radius: 12px; border: none; cursor: pointer; font-weight: 600; font-size: 13px; transition: transform .15s ease, box-shadow .15s ease, background .15s ease; }
+  .admin-btn.primary { background: #4f46e5; color: #fff; }
+  .admin-btn.primary:hover { background: #4338ca; transform: translateY(-1px); }
+  .admin-btn.secondary { background: #e2e8f0; color: #0f172a; }
+  .admin-btn.secondary:hover { background: #cbd5f5; transform: translateY(-1px); }
+  .admin-danger { background: #ef4444; color: #fff; }
+  .admin-danger:hover { background: #dc2626; transform: translateY(-1px); }
+  .profile-actions .admin-control { background: #f97316; color: #fff; border: none; border-radius: 10px; padding: 8px 14px; cursor: pointer; font-weight: 600; display: inline-flex; align-items: center; gap: 6px; transition: background .15s ease, transform .15s ease; }
+  .profile-actions .admin-control:hover { background: #ea580c; transform: translateY(-1px); }
+  .profile-actions .admin-control.delete { background: #ef4444; }
+  .profile-actions .admin-control.delete:hover { background: #dc2626; }
+</style>
+<script>
+(function() {
+  if (window.__VSCO_ADMIN_ENABLED__) {
+    return;
+  }
+  window.__VSCO_ADMIN_ENABLED__ = true;
+
+  const COMMENTS_URL = '/api/admin/comments';
+  const DELETE_URL = '/api/admin/delete-profile';
+
+  const body = document.body;
+  if (!body) {
+    return;
+  }
+
+  function ensureFlashContainer() {
+    let container = document.querySelector('.admin-flash-container');
+    if (!container) {
+      container = document.createElement('div');
+      container.className = 'admin-flash-container';
+      body.appendChild(container);
+    }
+    return container;
+  }
+
+  function showFlash(message, type) {
+    const container = ensureFlashContainer();
+    const item = document.createElement('div');
+    item.className = 'admin-flash' + (type === 'error' ? ' error' : '');
+    item.textContent = message;
+    container.appendChild(item);
+    requestAnimationFrame(() => {
+      item.classList.add('show');
+    });
+    setTimeout(() => {
+      item.classList.add('hide');
+    }, 3200);
+    setTimeout(() => {
+      if (item.parentNode) {
+        item.parentNode.removeChild(item);
+      }
+    }, 3800);
+  }
+
+  function cssEscape(value) {
+    if (window.CSS && typeof window.CSS.escape === 'function') {
+      return window.CSS.escape(value);
+    }
+    return value.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+  }
+
+  const modal = document.createElement('div');
+  modal.className = 'admin-modal hidden';
+  modal.innerHTML = '\n    <div class="admin-modal__backdrop"></div>\n    <div class="admin-modal__dialog">\n      <h2>Редактировать комментарии</h2>\n      <p style="margin:0;color:#475569;font-size:13px;">По одному комментарию в строке. Пустые строки будут проигнорированы.</p>\n      <textarea placeholder="Введите комментарии, каждый с новой строки"></textarea>\n      <div class="admin-modal__actions">\n        <button type="button" class="admin-btn secondary admin-cancel">Отмена</button>\n        <button type="button" class="admin-btn primary admin-save">Сохранить</button>\n      </div>\n    </div>\n  ';
+  body.appendChild(modal);
+
+  const backdrop = modal.querySelector('.admin-modal__backdrop');
+  const textarea = modal.querySelector('textarea');
+  const saveBtn = modal.querySelector('.admin-save');
+  const cancelBtn = modal.querySelector('.admin-cancel');
+
+  let activeUser = null;
+  let saveInProgress = false;
+
+  function closeModal() {
+    modal.classList.add('hidden');
+    saveInProgress = false;
+    if (saveBtn) {
+      saveBtn.disabled = false;
+    }
+  }
+
+  function openModal(user) {
+    activeUser = user;
+    if (textarea) {
+      const list = Array.isArray(user && user.comments) ? user.comments : [];
+      textarea.value = list.join('\n');
+      setTimeout(() => {
+        textarea.focus();
+        textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+      }, 30);
+    }
+    modal.classList.remove('hidden');
+  }
+
+  function parseCommentsFromTextarea() {
+    if (!textarea) {
+      return [];
+    }
+    return textarea.value
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line => line.length > 0);
+  }
+
+  function updateProfileStatsIfVisible(user) {
+    const profileNameEl = document.getElementById('profileUsername');
+    if (!profileNameEl) {
+      return;
+    }
+    const text = (profileNameEl.textContent || '').trim().toLowerCase();
+    const normalized = text.startsWith('@') ? text.slice(1) : text;
+    const target = (user && user.username ? user.username : '').toString().toLowerCase();
+    if (!target || normalized !== target) {
+      return;
+    }
+    const profileStats = document.getElementById('profileStats');
+    if (profileStats) {
+      const images = Array.isArray(user.images) ? user.images.filter(Boolean) : [];
+      const imageCount = typeof user.images_count === 'number' ? user.images_count : images.length;
+      const commentCount = Array.isArray(user.comments) ? user.comments.length : (typeof user.comments_count === 'number' ? user.comments_count : 0);
+      profileStats.innerHTML = '<div class="stat"><span class="value">' + imageCount + '</span><span class="label">posts</span></div>' +
+        '<div class="stat"><span class="value">' + commentCount + '</span><span class="label">comments</span></div>';
+    }
+  }
+
+  function refreshCardForUser(user) {
+    const username = (user && user.username ? user.username : '').toString();
+    if (!username) {
+      return;
+    }
+    const selector = '.card[data-username="' + cssEscape(username) + '"] .cm';
+    const cardComments = document.querySelector(selector);
+    const commentsList = Array.isArray(user.comments) ? user.comments : [];
+    if (cardComments) {
+      if (commentsList.length === 0) {
+        cardComments.innerHTML = '<div class="empty">нет комментариев</div>';
+      } else {
+        const preview = commentsList.slice(0, 3).map(entry => '<li>' + entry.replace(/[&<>"']/g, function(ch) {
+          return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] || ch;
+        }) + '</li>').join('');
+        const more = commentsList.length > 3 ? '<div class="more">и ещё ' + (commentsList.length - 3) + '…</div>' : '';
+        cardComments.innerHTML = '<ul>' + preview + '</ul>' + more;
+      }
+    }
+  }
+
+  function applyCommentsToUser(user, comments) {
+    const cleaned = Array.isArray(comments) ? comments.filter(Boolean) : [];
+    user.comments = cleaned;
+    user.comments_count = cleaned.length;
+    user._commentText = cleaned.map(entry => entry.toLowerCase()).join(' ');
+    if (typeof window.apply === 'function') {
+      try {
+        window.apply();
+      } catch (err) {
+        console.error('Failed to re-render gallery after comment update', err);
+      }
+    }
+    refreshCardForUser(user);
+    updateProfileStatsIfVisible(user);
+    showFlash('Комментарии обновлены', 'success');
+  }
+
+  async function submitComments() {
+    if (saveInProgress || !activeUser) {
+      return;
+    }
+    const username = activeUser.username || '';
+    if (!username) {
+      showFlash('Нельзя обновить комментарии без username', 'error');
+      return;
+    }
+    const comments = parseCommentsFromTextarea();
+    saveInProgress = true;
+    if (saveBtn) {
+      saveBtn.disabled = true;
+    }
+    try {
+      const response = await fetch(COMMENTS_URL, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({ username, comments })
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || 'HTTP ' + response.status);
+      }
+      const payload = await response.json();
+      const updated = Array.isArray(payload.comments) ? payload.comments : comments;
+      applyCommentsToUser(activeUser, updated);
+      closeModal();
+    } catch (err) {
+      console.error('Failed to update comments', err);
+      showFlash('Не удалось обновить комментарии', 'error');
+      saveInProgress = false;
+      if (saveBtn) {
+        saveBtn.disabled = false;
+      }
+    }
+  }
+
+  async function deleteProfile(user) {
+    const username = user && user.username ? user.username : '';
+    if (!username) {
+      showFlash('Нельзя удалить профиль без username', 'error');
+      return;
+    }
+    if (!window.confirm('Удалить профиль @' + username + ' и все связанные записи?')) {
+      return;
+    }
+    try {
+      const response = await fetch(DELETE_URL, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({ username })
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || 'HTTP ' + response.status);
+      }
+      await response.json();
+      const key = (username || '').toLowerCase();
+      if (window.DATA_MAP && typeof window.DATA_MAP.delete === 'function') {
+        window.DATA_MAP.delete(key);
+      }
+      if (Array.isArray(window.DATA)) {
+        const index = window.DATA.indexOf(user);
+        if (index !== -1) {
+          window.DATA.splice(index, 1);
+        } else {
+          const foundIndex = window.DATA.findIndex(item => (item && (item.username || '').toLowerCase()) === key);
+          if (foundIndex !== -1) {
+            window.DATA.splice(foundIndex, 1);
+          }
+        }
+      }
+      if (typeof window.apply === 'function') {
+        try {
+          window.apply();
+        } catch (err) {
+          console.error('Failed to re-render gallery after deletion', err);
+        }
+      }
+      if (typeof window.showGallery === 'function') {
+        try {
+          window.showGallery(true);
+        } catch (err) {
+          console.error('Failed to return to gallery view', err);
+        }
+      }
+      showFlash('Профиль удалён', 'success');
+    } catch (err) {
+      console.error('Failed to delete profile', err);
+      showFlash('Не удалось удалить профиль', 'error');
+    }
+  }
+
+  if (backdrop) {
+    backdrop.addEventListener('click', closeModal);
+  }
+  if (cancelBtn) {
+    cancelBtn.addEventListener('click', closeModal);
+  }
+  if (saveBtn) {
+    saveBtn.addEventListener('click', submitComments);
+  }
+
+  const originalRender = window.renderProfile;
+  if (typeof originalRender !== 'function') {
+    console.warn('Admin панель: renderProfile не найден');
+    return;
+  }
+
+  window.renderProfile = function(user, updateHash, preferredTabKey) {
+    const result = originalRender.apply(this, arguments);
+    try {
+      const profileView = document.getElementById('profileView');
+      if (!profileView) {
+        return result;
+      }
+      const actions = profileView.querySelector('.profile-actions');
+      if (!actions) {
+        return result;
+      }
+      let editBtn = actions.querySelector('.admin-control.edit');
+      if (!editBtn) {
+        editBtn = document.createElement('button');
+        editBtn.type = 'button';
+        editBtn.className = 'admin-control edit';
+        editBtn.innerHTML = '✏️ Редактировать комментарии';
+        actions.appendChild(editBtn);
+      }
+      let deleteBtn = actions.querySelector('.admin-control.delete');
+      if (!deleteBtn) {
+        deleteBtn = document.createElement('button');
+        deleteBtn.type = 'button';
+        deleteBtn.className = 'admin-control delete';
+        deleteBtn.innerHTML = '🗑️ Удалить профиль';
+        actions.appendChild(deleteBtn);
+      }
+      editBtn.onclick = function(ev) {
+        ev.preventDefault();
+        openModal(user);
+      };
+      deleteBtn.onclick = function(ev) {
+        ev.preventDefault();
+        deleteProfile(user);
+      };
+    } catch (err) {
+      console.error('Admin UI error', err);
+    }
+    return result;
+  };
+})();
+</script>
+"""
+
+
+def _inject_admin_panel(html: str) -> str:
+    """Append admin editing assets to the gallery HTML."""
+
+    marker = "</body>"
+    if marker in html:
+        return html.replace(marker, _ADMIN_PANEL_SNIPPET + marker, 1)
+    return html + _ADMIN_PANEL_SNIPPET
 
 
 def _render_login_page(next_url: str, error: Optional[str] = None) -> str:
@@ -309,6 +785,23 @@ class ExportRequestHandler(BaseHTTPRequestHandler):
     ) -> None:
         self._send_bytes(text.encode("utf-8"), status=status, content_type=content_type, filename=filename)
 
+    def _read_json_payload(self) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return None, "Empty body"
+        raw = self.rfile.read(length)
+        try:
+            decoded = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, "Body must be UTF-8 encoded"
+        try:
+            payload = json.loads(decoded)
+        except json.JSONDecodeError as err:
+            return None, f"Invalid JSON: {err.msg}"
+        if not isinstance(payload, dict):
+            return None, "JSON body must be an object"
+        return payload, None
+
     # ------------------------------------------------------------------
     # Authentication helpers
     # ------------------------------------------------------------------
@@ -450,6 +943,7 @@ class ExportRequestHandler(BaseHTTPRequestHandler):
                     subtitle=("All DB" if scope == "all" else f"Chat {chat_id}"),
                 )
                 html = _inject_auto_refresh(html, self.refresh_interval)
+                html = _inject_admin_panel(html)
                 self._send_text(html)
                 return
 
@@ -510,36 +1004,99 @@ class ExportRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
 
-        if path != "/login" or self.auth_manager is None:
+        if path == "/login":
+            if self.auth_manager is None:
+                self._send_text(
+                    json.dumps({"error": "Not found"}, ensure_ascii=False),
+                    status=HTTPStatus.NOT_FOUND,
+                    content_type="application/json; charset=utf-8",
+                )
+                return
+
+            length = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(length).decode("utf-8") if length else ""
+            data = parse_qs(body)
+            username = (data.get("username") or [""])[0]
+            password = (data.get("password") or [""])[0]
+            next_target = (data.get("next") or ["/"])[0] or "/"
+            if not next_target.startswith("/"):
+                next_target = "/"
+
+            if self.auth_manager.check_credentials(username, password):
+                token = self.auth_manager.create_session()
+                cookie = SimpleCookie()
+                cookie[self._session_cookie_name] = token
+                cookie[self._session_cookie_name]["path"] = "/"
+                cookie[self._session_cookie_name]["httponly"] = True
+                if self.auth_manager.session_ttl:
+                    cookie[self._session_cookie_name]["max-age"] = str(self.auth_manager.session_ttl)
+                self._redirect(next_target, cookie=cookie)
+                return
+
+            html = _render_login_page(next_target, error="Неверный логин или пароль")
+            self._send_text(html, status=HTTPStatus.UNAUTHORIZED)
+            return
+
+        if not self._ensure_authenticated():
+            return
+
+        payload, error = self._read_json_payload()
+        if error:
             self._send_text(
-                json.dumps({"error": "Not found"}, ensure_ascii=False),
-                status=HTTPStatus.NOT_FOUND,
+                json.dumps({"error": error}, ensure_ascii=False),
+                status=HTTPStatus.BAD_REQUEST,
                 content_type="application/json; charset=utf-8",
             )
             return
 
-        length = int(self.headers.get("Content-Length") or 0)
-        body = self.rfile.read(length).decode("utf-8") if length else ""
-        data = parse_qs(body)
-        username = (data.get("username") or [""])[0]
-        password = (data.get("password") or [""])[0]
-        next_target = (data.get("next") or ["/"])[0] or "/"
-        if not next_target.startswith("/"):
-            next_target = "/"
+        try:
+            if path == "/api/admin/comments":
+                username = str(payload.get("username") or "").strip()
+                comments = _sanitize_comments(payload.get("comments"))
+                result = _update_profile_comments(username, comments)
+                self._send_text(
+                    json.dumps({"ok": True, **result}, ensure_ascii=False),
+                    content_type="application/json; charset=utf-8",
+                )
+                return
 
-        if self.auth_manager.check_credentials(username, password):
-            token = self.auth_manager.create_session()
-            cookie = SimpleCookie()
-            cookie[self._session_cookie_name] = token
-            cookie[self._session_cookie_name]["path"] = "/"
-            cookie[self._session_cookie_name]["httponly"] = True
-            if self.auth_manager.session_ttl:
-                cookie[self._session_cookie_name]["max-age"] = str(self.auth_manager.session_ttl)
-            self._redirect(next_target, cookie=cookie)
+            if path == "/api/admin/delete-profile":
+                username = str(payload.get("username") or "").strip()
+                result = _delete_profile(username)
+                self._send_text(
+                    json.dumps({"ok": True, **result}, ensure_ascii=False),
+                    content_type="application/json; charset=utf-8",
+                )
+                return
+
+        except ValueError as err:
+            self._send_text(
+                json.dumps({"error": str(err)}, ensure_ascii=False),
+                status=HTTPStatus.BAD_REQUEST,
+                content_type="application/json; charset=utf-8",
+            )
+            return
+        except LookupError as err:
+            self._send_text(
+                json.dumps({"error": str(err)}, ensure_ascii=False),
+                status=HTTPStatus.NOT_FOUND,
+                content_type="application/json; charset=utf-8",
+            )
+            return
+        except sqlite3.Error as err:
+            log.exception("Database error during POST %s", path)
+            self._send_text(
+                json.dumps({"error": "DB error", "details": str(err)}, ensure_ascii=False),
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                content_type="application/json; charset=utf-8",
+            )
             return
 
-        html = _render_login_page(next_target, error="Неверный логин или пароль")
-        self._send_text(html, status=HTTPStatus.UNAUTHORIZED)
+        self._send_text(
+            json.dumps({"error": "Not found"}, ensure_ascii=False),
+            status=HTTPStatus.NOT_FOUND,
+            content_type="application/json; charset=utf-8",
+        )
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: D401, A003 - standard hook
         """Route HTTP server logs through the module logger."""
