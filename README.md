@@ -162,6 +162,7 @@ python photoprism_sync.py --db vsco_links.db --import-dir /mnt/photo/Import --li
 - **`--import-dir`** – каталог, который PhotoPrism сканирует как `Import` (обычно `C:\\Users\\you\\Pictures\\Import` или смонтированная сетевуха). Скрипт создаёт внутри подпапки `username/дата`.
 - **`--limit`** – сколько новых записей обрабатывать за один прогон; оставьте по умолчанию `100`, если не уверены.
 - **`--photoprism`** – команда для запуска PhotoPrism CLI. Можно указать только имя (`photoprism`), полный путь (`"C:\\Program Files\\PhotoPrism\\photoprism.exe"`) или целую команду с доп. аргументами. Например, если PhotoPrism работает в Docker, передайте `--photoprism docker exec photoprism photoprism`.
+- **`--list-containers`** – напечатает таблицу `docker ps` (имя, образ, статус) и завершит работу скрипта. Полезно, чтобы подсмотреть точное имя контейнера перед указанием `--photoprism docker exec …`.
 - **`--skip-import`** – добавьте флаг, если хотите только скачать файлы без вызова `photoprism import` (например, для проверки путей).
 - **`--no-date-subdirs`** – убирает группировку по датам и складывает файлы сразу в папку пользователя.
 - **`--verbose`** – включает подробные логи, в том числе команды запуска `photoprism import`.

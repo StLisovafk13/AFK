@@ -187,6 +187,38 @@ def resolve_photoprism_command(raw_cmd: Sequence[str]) -> List[str]:
     )
 
 
+def list_docker_containers() -> int:
+    """Print a short table with the currently running Docker containers."""
+
+    try:
+        output = subprocess.check_output(
+            [
+                "docker",
+                "ps",
+                "--format",
+                "{{.Names}}\t{{.Image}}\t{{.Status}}",
+            ],
+            text=True,
+        )
+    except FileNotFoundError:
+        LOGGER.error(
+            "Docker executable was not found. Install Docker Desktop or adjust PATH to list containers."
+        )
+        return 3
+    except subprocess.CalledProcessError as exc:  # pragma: no cover - defensive
+        LOGGER.error("docker ps failed: %s", exc)
+        return exc.returncode or 1
+
+    rows = [line for line in output.splitlines() if line.strip()]
+    if not rows:
+        print("No running Docker containers were found.")
+    else:
+        print("NAME\tIMAGE\tSTATUS")
+        for line in rows:
+            print(line)
+    return 0
+
+
 def sync_photoprism(
     *,
     db_path: Path,
@@ -303,6 +335,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable verbose logging",
     )
+    parser.add_argument(
+        "--list-containers",
+        action="store_true",
+        help="Print running Docker containers (shortcut for docker ps) and exit",
+    )
     return parser
 
 
@@ -314,6 +351,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         level=logging.INFO if args.verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
+
+    if args.list_containers:
+        return list_docker_containers()
 
     try:
         processed = sync_photoprism(
