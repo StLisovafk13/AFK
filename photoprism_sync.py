@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import json
 import logging
 import re
 import sqlite3
 import subprocess
 import sys
+import json
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -213,7 +214,20 @@ def sync_photoprism(
             return 0
 
         if not skip_import:
-            run_photoprism_import(photoprism_cmd, touched_dirs)
+            resolved_cmd: Optional[str]
+            explicit_path = Path(photoprism_cmd).expanduser()
+            if explicit_path.is_file():
+                resolved_cmd = str(explicit_path)
+            else:
+                resolved_cmd = shutil.which(photoprism_cmd)
+
+            if not resolved_cmd:
+                raise FileNotFoundError(
+                    f"PhotoPrism CLI executable '{photoprism_cmd}' was not found. "
+                    "Provide the full path via --photoprism or install it in PATH."
+                )
+
+            run_photoprism_import(resolved_cmd, touched_dirs)
         else:
             LOGGER.info("Skipping photoprism import step (dry-run)")
 
@@ -294,6 +308,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             skip_import=args.skip_import,
             date_subdirs=not args.no_date_subdirs,
         )
+    except FileNotFoundError as exc:
+        LOGGER.error("photoprism import skipped: %s", exc)
+        return 3
     except subprocess.CalledProcessError as exc:
         LOGGER.error("photoprism import failed: %s", exc)
         return 2
