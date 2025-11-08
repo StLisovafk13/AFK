@@ -163,7 +163,25 @@ def run_photoprism_import(
 ) -> None:
     for folder in sorted({folder.resolve() for folder in folders}):
         LOGGER.info("Running photoprism import for %s", folder)
-        subprocess.check_call([*photoprism_cmd, "import", "--path", str(folder)])
+        try:
+            result = subprocess.run(
+                [*photoprism_cmd, "import", "--path", str(folder)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            output = "\n".join(
+                part.strip()
+                for part in [exc.stdout or "", exc.stderr or ""]
+                if part and part.strip()
+            )
+            if output:
+                LOGGER.error("photoprism import output:\n%s", output)
+            raise
+        else:
+            if result.stdout:
+                LOGGER.debug("photoprism import output:\n%s", result.stdout.strip())
 
 
 def resolve_photoprism_command(raw_cmd: Sequence[str]) -> List[str]:
@@ -185,6 +203,28 @@ def resolve_photoprism_command(raw_cmd: Sequence[str]) -> List[str]:
         f"PhotoPrism CLI executable '{head}' was not found. "
         "Provide the full path via --photoprism or install it in PATH."
     )
+
+
+def validate_photoprism_command(cmd: Sequence[str]) -> Sequence[str]:
+    """Ensure the resolved command will actually invoke PhotoPrism."""
+
+    if not cmd:
+        raise ValueError("Empty PhotoPrism command received.")
+
+    head_name = Path(cmd[0]).name.lower()
+    if head_name.startswith("photoprism"):
+        return cmd
+
+    container_runtimes = {"docker", "podman"}
+    if head_name in container_runtimes:
+        if not any(Path(part).name.lower().startswith("photoprism") or part.lower() == "photoprism" for part in cmd[1:]):
+            raise ValueError(
+                "The container command does not include the 'photoprism' CLI. "
+                "Add it as the final argument, e.g. --photoprism docker exec <container> photoprism"
+            )
+        return cmd
+
+    return cmd
 
 
 def list_docker_containers() -> int:
@@ -270,7 +310,8 @@ def sync_photoprism(
 
         if not skip_import:
             resolved_cmd = resolve_photoprism_command(photoprism_cmd)
-            run_photoprism_import(resolved_cmd, touched_dirs)
+            validated_cmd = validate_photoprism_command(resolved_cmd)
+            run_photoprism_import(validated_cmd, touched_dirs)
         else:
             LOGGER.info("Skipping photoprism import step (dry-run)")
 
@@ -367,6 +408,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except FileNotFoundError as exc:
         LOGGER.error("photoprism import skipped: %s", exc)
         return 3
+    except ValueError as exc:
+        LOGGER.error("photoprism import skipped: %s", exc)
+        return 4
     except subprocess.CalledProcessError as exc:
         LOGGER.error("photoprism import failed: %s", exc)
         return 2
