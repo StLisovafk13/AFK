@@ -123,6 +123,28 @@ def test_profile_link_scans_direct_media(monkeypatch, vsco_module):
     assert set(gallery_users[0]["images"]) == set(assets)
 
 
+def test_user_unique_links_progress(vsco_module):
+    user_id = 777
+
+    count, invite = vsco_module.record_user_unique_links(user_id, [])
+    assert count == 0
+    assert invite is False
+
+    initial_links = [f"https://vsco.co/testuser{i}" for i in range(5)]
+    count, invite = vsco_module.record_user_unique_links(user_id, initial_links + initial_links[:2])
+    assert count == 5
+    assert invite is False
+
+    more_links = [f"https://vsco.co/testuser{i}" for i in range(5, 10)]
+    count, invite = vsco_module.record_user_unique_links(user_id, more_links)
+    assert count == 10
+    assert invite is True
+
+    count, invite = vsco_module.record_user_unique_links(user_id, ["https://vsco.co/testuser9"])
+    assert count == 10
+    assert invite is False
+
+
 def test_profile_link_scans_http_failure_returns_placeholder(monkeypatch, vsco_module):
     assets = [
         "https://cdn.example.com/photo1.jpg?w=800",

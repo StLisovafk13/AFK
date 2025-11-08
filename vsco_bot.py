@@ -682,9 +682,24 @@ if _required_group:
     REQUIRED_CHATS.append(_required_group)
 
 
+REQUIRED_UNIQUE_LINKS = max(0, int(os.getenv("BOT_REQUIRED_UNIQUE_LINKS", "10") or "10"))
+
+
 ACCESS_CACHE_TTL = int(os.getenv("BOT_REQUIRED_ACCESS_CACHE_TTL", "30") or "30")
 _ACCESS_CACHE: Dict[int, Tuple[float, bool]] = {}
 _ACCESS_PENDING: Dict[int, asyncio.Task[bool]] = {}
+
+
+def _required_chat_lines_html() -> List[str]:
+    lines: List[str] = []
+    for chat in REQUIRED_CHATS:
+        if chat.invite_link:
+            link = escape(chat.invite_link, quote=True)
+            label = escape(chat.label)
+            lines.append(f"• <a href=\"{link}\">{label}</a>")
+        else:
+            lines.append(f"• {escape(chat.label)}")
+    return lines
 
 
 def _access_message_html() -> str:
@@ -695,18 +710,145 @@ def _access_message_html() -> str:
         "🚫 <b>Доступ ограничен</b>.",
         "Для использования бота вступите в следующие сообщества:",
     ]
-    for chat in REQUIRED_CHATS:
-        if chat.invite_link:
-            link = escape(chat.invite_link, quote=True)
-            label = escape(chat.label)
-            lines.append(f"• <a href=\"{link}\">{label}</a>")
-        else:
-            lines.append(f"• {escape(chat.label)}")
+    lines.extend(_required_chat_lines_html())
     lines.append("После вступления повторите команду.")
     return "\n".join(lines)
 
 
 ACCESS_MESSAGE_HTML = _access_message_html()
+
+
+def _normalize_access_profile_url(raw: str) -> Optional[str]:
+    if not isinstance(raw, str):
+        return None
+    trimmed = raw.strip()
+    if not trimmed:
+        return None
+    normalized = normalize_vsco_profile_url(trimmed)
+    if normalized:
+        return normalized
+    if trimmed.startswith("http://") or trimmed.startswith("https://"):
+        return trimmed
+    return None
+
+
+def get_user_unique_link_count(user_id: Optional[int]) -> int:
+    if user_id is None:
+        return 0
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM user_access_links WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return int(row[0] or 0) if row else 0
+    finally:
+        conn.close()
+
+
+def _links_requirement_status(user_id: int) -> Tuple[bool, int]:
+    if REQUIRED_UNIQUE_LINKS <= 0:
+        return True, REQUIRED_UNIQUE_LINKS
+    count = get_user_unique_link_count(user_id)
+    return count >= REQUIRED_UNIQUE_LINKS, count
+
+
+def _build_links_progress_message(count: int) -> str:
+    if REQUIRED_UNIQUE_LINKS <= 0:
+        return ""
+    remaining = max(REQUIRED_UNIQUE_LINKS - count, 0)
+    lines = [
+        "🚧 <b>Доступ ограничен</b>.",
+        f"Отправьте {REQUIRED_UNIQUE_LINKS} уникальных ссылок VSCO, чтобы получить приглашение в чат.",
+        f"Сейчас зачтено: {count}/{REQUIRED_UNIQUE_LINKS}.",
+    ]
+    if remaining > 0:
+        lines.append(f"Осталось добавить: {remaining}.")
+    lines.append("Засчитываются только новые ссылки на профили, которых ещё нет в базе.")
+    return "\n".join(lines)
+
+
+def _build_invite_message_html(count: int) -> str:
+    if not REQUIRED_CHATS:
+        return (
+            "🎉 <b>Спасибо за активность!</b>\n"
+            f"Вы отправили {count} уникальных ссылок и получили полный доступ к боту."
+        )
+    lines = [
+        "🎉 <b>Спасибо за активность!</b>",
+        f"Вы отправили {count} уникальных ссылок и можете присоединиться к закрытому чату.",
+        "Вступите, чтобы открыть полный доступ:",
+    ]
+    lines.extend(_required_chat_lines_html())
+    lines.append("После вступления повторите команду.")
+    return "\n".join(lines)
+
+
+def record_user_unique_links(user_id: Optional[int], links: Sequence[str]) -> Tuple[int, bool]:
+    if user_id is None:
+        return 0, False
+    normalized = [
+        value
+        for value in (_normalize_access_profile_url(link) for link in links)
+        if value
+    ]
+    if not normalized:
+        return get_user_unique_link_count(user_id), False
+
+    conn = db_connect()
+    should_send_invite = False
+    try:
+        for link in dict.fromkeys(normalized):
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO user_access_links(user_id, profile_url, created_at)
+                VALUES(?,?,?)
+                """,
+                (user_id, link, utc_now_iso()),
+            )
+        conn.commit()
+
+        row = conn.execute(
+            "SELECT COUNT(*) FROM user_access_links WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        count = int(row[0] or 0) if row else 0
+
+        invite_row = conn.execute(
+            "SELECT invite_sent_at FROM user_access_state WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        invite_sent = bool(invite_row and (invite_row[0] or "").strip())
+
+        if REQUIRED_UNIQUE_LINKS > 0 and count >= REQUIRED_UNIQUE_LINKS and not invite_sent:
+            conn.execute(
+                """
+                INSERT INTO user_access_state(user_id, invite_sent_at)
+                VALUES(?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET invite_sent_at=excluded.invite_sent_at
+                """,
+                (user_id, utc_now_iso()),
+            )
+            conn.commit()
+            should_send_invite = True
+        return count, should_send_invite
+    finally:
+        conn.close()
+
+
+async def _handle_access_links_progress(msg: Message, links: Sequence[str]) -> None:
+    if not links:
+        return
+    user = getattr(msg, "from_user", None)
+    user_id = getattr(user, "id", None) if user else None
+    if user_id is None:
+        return
+    count, should_send_invite = record_user_unique_links(user_id, links)
+    if should_send_invite:
+        text = _build_invite_message_html(count)
+        if text:
+            with contextlib.suppress(Exception):
+                await msg.answer(text, disable_web_page_preview=True)
 
 
 def _is_positive_membership_status(member: Any) -> bool:
@@ -785,9 +927,6 @@ async def _is_user_allowed(user_id: int) -> bool:
 
 
 async def ensure_user_has_access(message: Message, user_id: Optional[int] = None) -> bool:
-    if not REQUIRED_CHATS:
-        return True
-
     if user_id is None:
         user = getattr(message, "from_user", None)
         user_id = getattr(user, "id", None) if user else None
@@ -795,6 +934,17 @@ async def ensure_user_has_access(message: Message, user_id: Optional[int] = None
         return False
 
     if is_admin_id(user_id):
+        return True
+
+    has_links, count = _links_requirement_status(user_id)
+    if not has_links:
+        text = _build_links_progress_message(count)
+        if text:
+            with contextlib.suppress(Exception):
+                await message.answer(text, disable_web_page_preview=True)
+        return False
+
+    if not REQUIRED_CHATS:
         return True
 
     allowed = await _is_user_allowed(user_id)
@@ -808,15 +958,25 @@ async def ensure_user_has_access(message: Message, user_id: Optional[int] = None
 
 
 async def ensure_callback_access(cq: CallbackQuery) -> bool:
-    if not REQUIRED_CHATS:
-        return True
-
     user = cq.from_user
     user_id = getattr(user, "id", None) if user else None
     if user_id is None:
         return False
 
     if is_admin_id(user_id):
+        return True
+
+    has_links, count = _links_requirement_status(user_id)
+    if not has_links:
+        text = _build_links_progress_message(count) or "Доступ ограничен."
+        with contextlib.suppress(Exception):
+            await cq.answer(text, show_alert=True)
+        if cq.message:
+            with contextlib.suppress(Exception):
+                await cq.message.answer(text, disable_web_page_preview=True)
+        return False
+
+    if not REQUIRED_CHATS:
         return True
 
     allowed = await _is_user_allowed(user_id)
@@ -892,6 +1052,18 @@ def init_db():
       created_at TEXT NOT NULL,
       UNIQUE(item_id, comment),
       FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
+    )""")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS user_access_links(
+      user_id INTEGER NOT NULL,
+      profile_url TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY(user_id, profile_url)
+    )""")
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS user_access_state(
+      user_id INTEGER PRIMARY KEY,
+      invite_sent_at TEXT DEFAULT ''
     )""")
     cols = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
     if "added_by" not in cols:
@@ -4863,6 +5035,7 @@ async def on_document(msg: Message):
     ses = get_session(msg.chat.id)
     found = added_items = added_comments = 0
     new_links: List[str] = []
+    access_links: List[str] = []
     added_by = resolve_added_by(msg.from_user)
     caption_profile_files: List[Path] = []
     background_jobs = 0
@@ -4878,7 +5051,7 @@ async def on_document(msg: Message):
             source_file="caption",
             added_by=added_by,
         )
-        added_items += ai; added_comments += ac; new_links.extend(links)
+        added_items += ai; added_comments += ac; new_links.extend(links); access_links.extend(links)
         background_jobs += await _maybe_schedule_profile_scans(
             msg.chat.id,
             pairs,
@@ -4932,6 +5105,7 @@ async def on_document(msg: Message):
             added_items += ai
             added_comments += ac
             new_links.extend(links)
+            access_links.extend(links)
             background_jobs += await _maybe_schedule_profile_scans(
                 msg.chat.id,
                 pairs,
@@ -4947,12 +5121,14 @@ async def on_document(msg: Message):
                 f"Найдено VSCO-ссылок: {found}, добавлено ссылок/медиа: {added_items}, добавлено комментариев: {added_comments}"
                 f"{links_block}{notice_block}{background_notice}"
             )
+            await _handle_access_links_progress(msg, access_links)
         except Exception as e:
             log.exception("CSV processing failed")
             background_notice = format_background_scan_notice(background_jobs)
             await msg.answer(
                 f"CSV загружен: <code>{escape(p.name)}</code>, но не удалось обработать: {escape(str(e))}{background_notice}"
             )
+            await _handle_access_links_progress(msg, access_links)
         return
 
     if low.endswith(".html") or low.endswith(".htm"):
@@ -4976,6 +5152,7 @@ async def on_document(msg: Message):
             if msg.caption:
                 all_links.extend(new_links)
             all_links.extend(html_links)
+            access_links.extend(all_links)
             links_block = format_new_links_block(all_links)
             extra = ""
             if msg.caption:
@@ -4990,12 +5167,14 @@ async def on_document(msg: Message):
                 f"{extra}"
                 f"{links_block}{notice_block}{background_notice}"
             )
+            await _handle_access_links_progress(msg, access_links)
         except Exception as e:
             log.exception("HTML processing failed")
             background_notice = format_background_scan_notice(background_jobs)
             await msg.answer(
                 f"HTML загружен: <code>{escape(p.name)}</code>, но не удалось обработать: {escape(str(e))}{background_notice}"
             )
+            await _handle_access_links_progress(msg, access_links)
         return
 
     links_block = format_new_links_block(new_links) if msg.caption else ""
@@ -5005,6 +5184,7 @@ async def on_document(msg: Message):
         "Файл сохранён. Нужны .html/.csv. Ссылки из подписи учтены, если были."
         f"{links_block}{notice_block}{background_notice}"
     )
+    await _handle_access_links_progress(msg, access_links)
 
 # ---------- plain text ----------
 @dp.message(F.text & ~F.text.startswith("/"))
@@ -5103,6 +5283,7 @@ async def on_text(msg: Message):
     await msg.answer(
         f"Найдено VSCO-ссылок: {len(pairs)}, добавлено записей: {ai}, комментариев: {ac}{links_block}{notice_block}{background_notice}"
     )
+    await _handle_access_links_progress(msg, links)
 
 # ---------- stats ----------
 def stats_scope_keyboard(ses: Session) -> InlineKeyboardMarkup:
