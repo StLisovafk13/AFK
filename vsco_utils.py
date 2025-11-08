@@ -61,7 +61,8 @@ def select_best_from_srcset(srcset: str) -> Optional[str]:
     """Return the highest-resolution candidate from an HTML ``srcset`` string."""
 
     try:
-        candidates = []
+        best_url: Optional[str] = None
+        best_width = -1
         for chunk in srcset.split(","):
             chunk = chunk.strip()
             if not chunk:
@@ -74,11 +75,10 @@ def select_best_from_srcset(srcset: str) -> Optional[str]:
                     width = 0
             else:
                 url_part, width = chunk, 0
-            candidates.append((width, url_part))
-        if not candidates:
-            return None
-        candidates.sort(key=lambda pair: pair[0], reverse=True)
-        return candidates[0][1]
+            if width > best_width:
+                best_width = width
+                best_url = url_part
+        return best_url
     except Exception:
         return None
 
@@ -140,13 +140,15 @@ def dedupe_keep_order(items: Iterable[str]) -> list[str]:
 def generate_media_filename(url: str, idx: int, *, default_ext: str = "jpg") -> str:
     """Derive a collision-resistant filename for VSCO CDN URLs."""
 
-    path_parts = urlsplit(url).path.rstrip("/").split("/")
+    parsed = urlsplit(url)
+    path = parsed.path
+    path_parts = path.rstrip("/").split("/")
     base = path_parts[-1] if path_parts else ""
     if base and "." in base:
         if len(path_parts) >= 2 and path_parts[-2]:
             return f"{path_parts[-2]}_{base}"
         return base
-    path = urlsplit(url).path.lower()
+    path = path.lower()
     if path.endswith(".mp4"):
         return f"vsco_{idx:05d}.mp4"
     if path.endswith(".webm"):

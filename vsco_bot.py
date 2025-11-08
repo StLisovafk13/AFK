@@ -1612,7 +1612,7 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
 
     semaphore = asyncio.Semaphore(PROFILE_NORMALIZE_CONCURRENCY)
     url_tasks: Dict[str, asyncio.Task[List[Dict[str, str]]]] = {}
-    res: List[Dict[str, str]] = []
+    total_entries = 0
 
     async with aiohttp.ClientSession() as session:
         async def run_with_limit(url: str) -> List[Dict[str, str]]:
@@ -1642,14 +1642,21 @@ async def normalize_vsco_pairs(pairs: List[Dict[str, str]]) -> List[Dict[str, st
         tasks = [asyncio.create_task(process_pair(pair)) for pair in pairs]
         nested_results = await asyncio.gather(*tasks)
 
+    uniq: Dict[Tuple[str, str, str, str], Dict[str, str]] = {}
     for entries in nested_results:
-        res.extend(entries)
-
-    uniq = {(r["username"], r["url"], r["comment"], r.get("image_url", "")): r for r in res}
+        total_entries += len(entries)
+        for entry in entries:
+            key = (
+                entry.get("username", ""),
+                entry.get("url", ""),
+                entry.get("comment", ""),
+                entry.get("image_url", ""),
+            )
+            uniq[key] = entry
     log.debug(
         "normalize_vsco_pairs: produced %d unique record(s) from %d input(s)",
         len(uniq),
-        len(res),
+        total_entries,
     )
     return list(uniq.values())
 
