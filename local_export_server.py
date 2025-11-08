@@ -345,6 +345,7 @@ _ADMIN_PANEL_SNIPPET = r"""
   const selectedProfiles = new Map();
   let bulkToggleBtn = null;
   let bulkBar = null;
+  let bulkSelectAllBtn = null;
   let bulkCancelBtn = null;
   let bulkDeleteBtn = null;
   let bulkCountEl = null;
@@ -352,6 +353,21 @@ _ADMIN_PANEL_SNIPPET = r"""
 
   function normalizeUsername(value) {
     return (value || '').toString().trim().toLowerCase();
+  }
+
+  function countSelectableProfiles() {
+    if (!grid) {
+      return 0;
+    }
+    let count = 0;
+    const cards = grid.querySelectorAll('.card.admin-selectable');
+    cards.forEach(card => {
+      const username = card.dataset ? card.dataset.username : '';
+      if (normalizeUsername(username)) {
+        count += 1;
+      }
+    });
+    return count;
   }
 
   function updateBulkUi() {
@@ -363,6 +379,11 @@ _ADMIN_PANEL_SNIPPET = r"""
     }
     if (bulkToggleBtn) {
       bulkToggleBtn.disabled = bulkDeleteInProgress;
+    }
+    if (bulkSelectAllBtn) {
+      const total = countSelectableProfiles();
+      const allSelected = total > 0 && selectedProfiles.size >= total;
+      bulkSelectAllBtn.disabled = !selectionMode || bulkDeleteInProgress || total === 0 || allSelected;
     }
   }
 
@@ -398,6 +419,24 @@ _ADMIN_PANEL_SNIPPET = r"""
       selectedProfiles.set(key, { username });
       card.classList.add('admin-selected');
     }
+    updateBulkUi();
+  }
+
+  function selectAllProfiles() {
+    if (!grid || bulkDeleteInProgress) {
+      return;
+    }
+    setSelectionMode(true);
+    const cards = grid.querySelectorAll('.card.admin-selectable');
+    cards.forEach(card => {
+      const username = card.dataset ? card.dataset.username : '';
+      const key = normalizeUsername(username);
+      if (!key) {
+        return;
+      }
+      selectedProfiles.set(key, { username });
+      card.classList.add('admin-selected');
+    });
     updateBulkUi();
   }
 
@@ -585,10 +624,14 @@ _ADMIN_PANEL_SNIPPET = r"""
 
     bulkBar = document.createElement('div');
     bulkBar.className = 'admin-bulk-bar hidden';
-    bulkBar.innerHTML = '\n    <div class="admin-bulk-info">Выбрано: <span class="count">0</span></div>\n    <button type="button" class="admin-btn secondary admin-bulk-cancel">Отмена</button>\n    <button type="button" class="admin-btn admin-danger admin-bulk-delete">Удалить выбранные</button>\n  ';
+    bulkBar.innerHTML = '\n    <div class="admin-bulk-info">Выбрано: <span class="count">0</span></div>\n    <button type="button" class="admin-btn secondary admin-bulk-select-all">Выбрать все</button>\n    <button type="button" class="admin-btn secondary admin-bulk-cancel">Отмена</button>\n    <button type="button" class="admin-btn admin-danger admin-bulk-delete">Удалить выбранные</button>\n  ';
     bulkCountEl = bulkBar.querySelector('.count');
+    bulkSelectAllBtn = bulkBar.querySelector('.admin-bulk-select-all');
     bulkCancelBtn = bulkBar.querySelector('.admin-bulk-cancel');
     bulkDeleteBtn = bulkBar.querySelector('.admin-bulk-delete');
+    if (bulkSelectAllBtn) {
+      bulkSelectAllBtn.addEventListener('click', () => selectAllProfiles());
+    }
     if (bulkCancelBtn) {
       bulkCancelBtn.addEventListener('click', () => setSelectionMode(false));
     }
