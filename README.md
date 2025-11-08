@@ -158,6 +158,54 @@ CLI-загрузчик медиа с Playwright, логированием и ZIP
 ### Геоданные и метаданные
 
 - `resolve_city_label(lat, lon)` — обратное геокодирование (через `reverse_geocoder` при наличии) или форматирование координат; кеширует результаты по тысячным долям градуса.【F:vsco_bot.py†L172-L200】
+
+## Интеграция с PhotoPrism
+
+В этом разделе собран полный пошаговый сценарий «VSCO → бот → загрузчик → PhotoPrism», а также перечень готовых инструментов, которые можно комбинировать под свои задачи.
+
+### Этапы интеграции
+
+1. **Сбор ссылок и метаданных**
+   1. Запустите Telegram-бота (`vsco_bot.py`) или CLI-сканер (`profile_link_scanner.py`). Они автоматически создают таблицы `links`, `items`, `comments` и наполняют их ссылками, профилями и комментариями.【F:profile_link_scanner.py†L80-L137】【F:profile_link_scanner.py†L552-L642】
+   2. После добавления профиля фоновые воркеры получают EXIF и складывают JSON в `items.meta_json`, повторяя попытку при блокировках SQLite, поэтому база постепенно обогащается метаданными.【F:vsco_bot.py†L5478-L5566】【F:profile_link_scanner.py†L808-L939】
+
+2. **Подготовка хранилища для PhotoPrism**
+   1. Настройте каталог, который видит PhotoPrism (`PHOTOPRISM_IMPORT_PATH` или `PHOTOPRISM_ORIGINALS_PATH`).
+   2. Если оригиналы лежат вне сервера, смонтируйте их через `rclone mount`/WinFsp (Windows), `rclone mount`/`s3fs`/`sshfs` (Linux/macOS) или иной FUSE-драйвер. PhotoPrism будет работать с этим томом как с локальной директорией.
+
+3. **Организация загрузчика оригиналов**
+   1. Выберите стратегию получения файлов:
+      - Использовать готовый Playwright-загрузчик `vsco_downloader.py`, указывая каталог внутри смонтированного тома; или
+      - Запустить `photoprism_import_service.py`, который сам читает новые записи (`items.imported_at IS NULL`), помечает прогресс в полях `import_progress`/`import_error` и скачивает оригиналы прямо в том PhotoPrism. Сервис поддерживает три режима: `requests`, `curl` и Playwright (`--use-playwright`), используя те же заголовки, что и существующие скрипты (`exif_fetcher.py`, `vsco_downloader.py`).【F:photoprism_import_service.py†L1-L360】【F:exif_fetcher.py†L1-L160】
+   2. При работе с VSCO добавьте HTTP-заголовки, чтобы избежать 403:
+      - Передайте `--user-agent "Mozilla/5.0 ..."` и `--default-referer https://vsco.co/` (значение по умолчанию уже прописано, но его можно переопределить на конкретный профиль).
+      - Если в базе у записи заполнено `profile_url`, сервис автоматически подставит его как Referer; иначе использует значение из `--default-referer`. Для `curl` и Playwright заголовки пробрасываются теми же опциями.【F:photoprism_import_service.py†L120-L360】
+   3. Для именования файлов можно вызвать `generate_media_filename` из `vsco_utils.py`, чтобы получить стабильные имена на базе URL/даты.【F:vsco_utils.py†L140-L199】
+   4. После успешной загрузки отметки `import_progress='done'` и `imported_at` обновляются автоматически сервисом, поэтому PhotoPrism не получает дубликаты.
+   5. Если база создана недавно, запустите бота или `profile_link_scanner.py`, чтобы таблица `items` появилась до старта сервиса; иначе он завершится с сообщением об отсутствии схемы.【F:photoprism_import_service.py†L33-L90】
+
+4. **Импорт в PhotoPrism**
+   1. Разложите скачанные файлы по структуре, понятной PhotoPrism (по подкаталогам, датам и т.д.).
+   2. Запустите `photoprism import --path <подкаталог>` или воспользуйтесь веб-интерфейсом. PhotoPrism построит превью и распознает EXIF.
+   3. При необходимости вызовите REST API PhotoPrism (`/api/v1/photos/<uid>`) и заполните альбомы/теги на основе ваших таблиц `links`/`comments`.
+
+5. **Проверка и мониторинг**
+   - Просмотрите таблицу `items` и убедитесь, что `meta_json` заполнено, а отметки импорта обновились.
+   - Проверьте каталог PhotoPrism, убедившись, что новые файлы и (при необходимости) сопутствующие `.json`/`.xmp` метаданные лежат на месте.
+   - Выполните пробный импорт и убедитесь, что карточки в PhotoPrism отображаются и содержат ожидаемые EXIF/теги.
+
+### Готовые загрузчики и вспомогательные инструменты
+
+| Инструмент | Сценарий использования | Ключевые опции |
+| --- | --- | --- |
+| `vsco_downloader.py` | Полноценная загрузка профиля через Playwright с поддержкой ZIP и логов. Укажите `--out <каталог>` на смонтированный том и при необходимости `--no-zip`, чтобы сохранить оригиналы без архивации.【F:vsco_downloader.py†L25-L117】 | `--username/--profile-url`, `--out`, `--max`, `--concurrency`, `--delay`, `--max-width`, `--no-zip` |
+| `photoprism_import_service.py` | Лёгкий сервис, который по очереди скачивает новые `items` из базы бота, сохраняет файлы в смонтированный каталог PhotoPrism и отмечает прогресс/ошибки в таблице `items`. Можно запускать циклично (`--poll-interval`) или разово (`--once`). Поддерживает `requests`, `curl` и Playwright для обхода 403 CDN.【F:photoprism_import_service.py†L1-L360】 | `--db`, `--dest`, `--batch-size`, `--poll-interval`, `--timeout`, `--user-agent`, `--default-referer`, `--use-playwright`, `--playwright-concurrency`, `--use-curl`, `--curl-bin`, `--log-level` |
+| `profile_link_scanner.py` | Асинхронный сборщик ссылок, который можно дополнить небольшим скачивальщиком: используйте `store_profile_media(..., meta_fetcher=None)` для получения списков URL и передавайте их в собственный загрузчик.【F:profile_link_scanner.py†L511-L640】 | `--db`, `--profile-url`, `--username`, `--target-count`, `--delay` |
+| `exif_fetcher.py` | Мини-сервис для извлечения EXIF из URL. Полезен, если нужно дополнительно проверить метаданные перед импортом или хранить `.json` рядом с файлами.【F:exif_fetcher.py†L91-L147】 | `extract_exif_from_url(url, referer, timeout)` |
+| `vsco_rescan.py` | Массовая перекачка уже известных профилей. Можно запускать периодически, чтобы заполнять пропущенные фото и обновлять каталог PhotoPrism.【F:vsco_rescan.py†L367-L428】 | `--db`, `--state-db`, `--limit`, `--concurrency`, `--max-width` |
+| `vsco_export_impl.py` (`ExportManager`) | Выгружает CSV/галереи/карты. Эти выгрузки полезны для проверки, что все профили обработаны и импортированы в PhotoPrism.【F:vsco_export_impl.py†L81-L290】 | `/export` меню в Telegram, лимиты через переменные окружения |
+
+При необходимости расширьте таблицу `items` дополнительными полями (например, `photoprism_uid`), чтобы отслеживать соответствие между базой бота и медиатекой PhotoPrism.
 - `extract_coordinates_from_meta(meta)` — глубоко обходить словари/списки EXIF, чтобы найти координаты, учитывая `GPSLatitudeRef/GPSLongitudeRef` и альтернативные поля.【F:vsco_bot.py†L294-L357】
 - `extract_camera_models_from_meta(meta)` — собирает уникальные метки моделей камеры из EXIF, нормализует пробелы и возвращает список строк.【F:vsco_bot.py†L362-L395】
 
