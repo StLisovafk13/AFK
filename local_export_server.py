@@ -644,6 +644,12 @@ _ADMIN_PANEL_SNIPPET = r"""
     updateBulkUi();
     gridObserver = new MutationObserver(() => refreshSelectableCards());
     gridObserver.observe(grid, { childList: true });
+
+    const handleGalleryRendered = () => {
+      refreshSelectableCards();
+      updateBulkUi();
+    };
+    document.addEventListener('gallery:rendered', handleGalleryRendered);
   }
 
   const modal = document.createElement('div');

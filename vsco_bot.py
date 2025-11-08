@@ -3702,86 +3702,137 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCOLeak", subtitle="
     profileBack.addEventListener('click', () => showGallery(true));
 
 
+    let lastRenderToken = 0;
+
     function render(list) {{
       if (!gridEl || !statsEl) return;
-      gridEl.innerHTML='';
-      let entries=0;
-      list.forEach(u=>{{
-        const allImages = Array.isArray(u.images) ? u.images.filter(Boolean) : [];
-        const imageCount = typeof u.images_count === 'number' ? u.images_count : allImages.length;
-        const previews = allImages.slice(0,4);
-        const cm = Array.isArray(u.comments) ? u.comments : [];
-        const commentCount = typeof u.comments_count === 'number' ? u.comments_count : cm.length;
-        entries += imageCount;
-        let cmHtml='';
-        if (cm.length===0) cmHtml = '<div class="empty">нет комментариев</div>';
-        else {{
-          const head = cm.slice(0,3).map(c=>'<li>' + escapeHtml(c) + '</li>').join('');
-          const more = cm.length>3 ? '<div class="more">и ещё ' + (cm.length-3) + '…</div>' : '';
-          cmHtml = '<ul>' + head + '</ul>' + more;
+
+      lastRenderToken += 1;
+      const renderToken = lastRenderToken;
+      const batchSize = 40;
+      const totalUsers = list.length;
+      let renderedEntries = 0;
+      let index = 0;
+
+      gridEl.innerHTML = '';
+      statsEl.innerHTML = `<span><span class="value">${{totalUsers}}</span><span>Users</span></span><span><span class="value">0</span><span>Entries</span></span>`;
+
+      function dispatchRenderComplete() {{
+        if (typeof document === 'undefined' || renderToken !== lastRenderToken) {{
+          return;
         }}
-        const thumbs = previews.map(src=>'<img src="' + escapeHtml(src) + '" loading="lazy">').join('');
-        const latStr = (u.lat!=null && u.lon!=null) ? u.lat.toFixed(6) + ', ' + u.lon.toFixed(6) : '';
-        const addedBy = (()=>{{
-          if (!u.added_by) return '';
-          const label = escapeHtml(u.added_by);
-          if (u.added_by_link) {{
-            return '<a href="' + escapeHtml(u.added_by_link) + '" target="_blank">' + label + '</a>';
+        const detail = {{
+          totalUsers,
+          totalEntries: renderedEntries,
+          token: renderToken,
+        }};
+        try {{
+          document.dispatchEvent(new CustomEvent('gallery:rendered', {{ detail }}));
+        }} catch (err) {{
+          if (typeof document !== 'undefined' && document.createEvent) {{
+            const evt = document.createEvent('CustomEvent');
+            evt.initCustomEvent('gallery:rendered', false, false, detail);
+            document.dispatchEvent(evt);
           }}
-          return label;
-        }})();
-        const chipParts=[];
-        (u._cityList || []).slice(0,3).forEach(entry=>{{
-          chipParts.push('<span class="chip chip-city">' + escapeHtml(entry.label) + '</span>');
-        }});
-        (u._datasetList || []).slice(0,3).forEach(ds=>{{
-          const label = ds.label || ds.value;
-          if (label) chipParts.push('<span class="chip chip-data">' + escapeHtml(label) + '</span>');
-        }});
-        (u._phoneList || []).slice(0,3).forEach(phone=>{{
-          if (!phone) return;
-          const label = phone.display || phone.label || '';
-          if (label) chipParts.push('<span class="chip chip-device">' + escapeHtml(label) + '</span>');
-        }});
-        const chipsHtml = chipParts.length ? '<div class="chips">' + chipParts.join('') + '</div>' : '';
-        const createdHtml = u._createdRangeLabel ? '<div class="meta created">Добавлено: ' + escapeHtml(u._createdRangeLabel) + '</div>' : '';
-        const metaPieces = [];
-        if (latStr) metaPieces.push('<span>📍 ' + escapeHtml(latStr) + '</span>');
-        metaPieces.push('<span>🖼️ ' + imageCount + '</span>');
-        metaPieces.push('<span>💬 ' + commentCount + '</span>');
-        const statsHtml = '<div class="card-stats">' + metaPieces.join('') + '</div>';
-        const card = document.createElement('div');
-        card.className = 'card';
-        card.dataset.username = u.username || '';
-        const profileUrl = u.profile_url || '';
-        const safeProfileUrl = escapeHtml(profileUrl);
-        const displayName = u.username ? '@' + escapeHtml(u.username) : 'Без username';
-        card.innerHTML = `
-          <div class="head">
-            <div class="name"><a href="${{safeProfileUrl}}" target="_blank">${{displayName}}</a></div>
-            <a class="btn" href="${{safeProfileUrl}}" target="_blank">View Profile</a>
-          </div>
-          ${{statsHtml}}
-          ${{createdHtml}}
-          ${{chipsHtml}}
-          <div class="meta added">Добавил: ${{addedBy || '—'}}</div>
-          <div class="thumbs">${{thumbs}}</div>
-          <div class="cm">${{cmHtml}}</div>
-          <div class="actions">
-            <button class="btn-secondary profile-btn" type="button">Открыть галерею</button>
-          </div>
-        `;
-        const openBtn = card.querySelector('.profile-btn');
-        if (openBtn) {{
-          openBtn.addEventListener('click', (ev) => {{
-            ev.preventDefault();
-            ev.stopPropagation();
-            renderProfile(u);
-          }});
         }}
-        gridEl.appendChild(card);
-      }});
-      statsEl.innerHTML = `<span><span class=\"value\">${{list.length}}</span><span>Users</span></span><span><span class=\"value\">${{entries}}</span><span>Entries</span></span>`;
+      }}
+
+      function renderBatch() {{
+        if (renderToken !== lastRenderToken) {{
+          return;
+        }}
+
+        const frag = document.createDocumentFragment();
+        const max = Math.min(index + batchSize, list.length);
+
+        for (; index < max; index += 1) {{
+          const u = list[index];
+          const allImages = Array.isArray(u.images) ? u.images.filter(Boolean) : [];
+          const imageCount = typeof u.images_count === 'number' ? u.images_count : allImages.length;
+          const previews = allImages.slice(0, 4);
+          const cm = Array.isArray(u.comments) ? u.comments : [];
+          const commentCount = typeof u.comments_count === 'number' ? u.comments_count : cm.length;
+          renderedEntries += imageCount;
+          let cmHtml = '';
+          if (cm.length === 0) cmHtml = '<div class="empty">нет комментариев</div>';
+          else {{
+            const head = cm.slice(0, 3).map(c => '<li>' + escapeHtml(c) + '</li>').join('');
+            const more = cm.length > 3 ? '<div class="more">и ещё ' + (cm.length - 3) + '…</div>' : '';
+            cmHtml = '<ul>' + head + '</ul>' + more;
+          }}
+          const thumbs = previews.map(src => '<img src="' + escapeHtml(src) + '" loading="lazy">').join('');
+          const latStr = (u.lat != null && u.lon != null) ? u.lat.toFixed(6) + ', ' + u.lon.toFixed(6) : '';
+          const addedBy = (() => {{
+            if (!u.added_by) return '';
+            const label = escapeHtml(u.added_by);
+            if (u.added_by_link) {{
+              return '<a href="' + escapeHtml(u.added_by_link) + '" target="_blank">' + label + '</a>';
+            }}
+            return label;
+          }})();
+          const chipParts = [];
+          (u._cityList || []).slice(0, 3).forEach(entry => {{
+            chipParts.push('<span class="chip chip-city">' + escapeHtml(entry.label) + '</span>');
+          }});
+          (u._datasetList || []).slice(0, 3).forEach(ds => {{
+            const label = ds.label || ds.value;
+            if (label) chipParts.push('<span class="chip chip-data">' + escapeHtml(label) + '</span>');
+          }});
+          (u._phoneList || []).slice(0, 3).forEach(phone => {{
+            if (!phone) return;
+            const label = phone.display || phone.label || '';
+            if (label) chipParts.push('<span class="chip chip-device">' + escapeHtml(label) + '</span>');
+          }});
+          const chipsHtml = chipParts.length ? '<div class="chips">' + chipParts.join('') + '</div>' : '';
+          const createdHtml = u._createdRangeLabel ? '<div class="meta created">Добавлено: ' + escapeHtml(u._createdRangeLabel) + '</div>' : '';
+          const metaPieces = [];
+          if (latStr) metaPieces.push('<span>📍 ' + escapeHtml(latStr) + '</span>');
+          metaPieces.push('<span>🖼️ ' + imageCount + '</span>');
+          metaPieces.push('<span>💬 ' + commentCount + '</span>');
+          const statsHtml = '<div class="card-stats">' + metaPieces.join('') + '</div>';
+          const card = document.createElement('div');
+          card.className = 'card';
+          card.dataset.username = u.username || '';
+          const profileUrl = u.profile_url || '';
+          const safeProfileUrl = escapeHtml(profileUrl);
+          const displayName = u.username ? '@' + escapeHtml(u.username) : 'Без username';
+          card.innerHTML = `
+            <div class="head">
+              <div class="name"><a href="${{safeProfileUrl}}" target="_blank">${{displayName}}</a></div>
+              <a class="btn" href="${{safeProfileUrl}}" target="_blank">View Profile</a>
+            </div>
+            ${{statsHtml}}
+            ${{createdHtml}}
+            ${{chipsHtml}}
+            <div class="meta added">Добавил: ${{addedBy || '—'}}</div>
+            <div class="thumbs">${{thumbs}}</div>
+            <div class="cm">${{cmHtml}}</div>
+            <div class="actions">
+              <button class="btn-secondary profile-btn" type="button">Открыть галерею</button>
+            </div>
+          `;
+          const openBtn = card.querySelector('.profile-btn');
+          if (openBtn) {{
+            openBtn.addEventListener('click', (ev) => {{
+              ev.preventDefault();
+              ev.stopPropagation();
+              renderProfile(u);
+            }});
+          }}
+          frag.appendChild(card);
+        }}
+
+        gridEl.appendChild(frag);
+        statsEl.innerHTML = `<span><span class="value">${{totalUsers}}</span><span>Users</span></span><span><span class="value">${{renderedEntries}}</span><span>Entries</span></span>`;
+
+        if (index < list.length) {{
+          requestAnimationFrame(renderBatch);
+        }} else {{
+          dispatchRenderComplete();
+        }}
+      }}
+
+      requestAnimationFrame(renderBatch);
     }}
 
     function apply() {{
