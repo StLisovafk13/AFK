@@ -3717,6 +3717,26 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCOLeak", subtitle="
       gridEl.innerHTML = '';
       statsEl.innerHTML = `<span><span class="value">${{totalUsers}}</span><span>Users</span></span><span><span class="value">0</span><span>Entries</span></span>`;
 
+      function dispatchRenderComplete() {{
+        if (typeof document === 'undefined' || renderToken !== lastRenderToken) {{
+          return;
+        }}
+        const detail = {{
+          totalUsers,
+          totalEntries: renderedEntries,
+          token: renderToken,
+        }};
+        try {{
+          document.dispatchEvent(new CustomEvent('gallery:rendered', {{ detail }}));
+        }} catch (err) {{
+          if (typeof document !== 'undefined' && document.createEvent) {{
+            const evt = document.createEvent('CustomEvent');
+            evt.initCustomEvent('gallery:rendered', false, false, detail);
+            document.dispatchEvent(evt);
+          }}
+        }}
+      }}
+
       function renderBatch() {{
         if (renderToken !== lastRenderToken) {{
           return;
@@ -3807,6 +3827,8 @@ def build_rich_gallery(users: List[Dict[str, Any]], title="VSCOLeak", subtitle="
 
         if (index < list.length) {{
           requestAnimationFrame(renderBatch);
+        }} else {{
+          dispatchRenderComplete();
         }}
       }}
 
