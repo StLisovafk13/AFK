@@ -156,6 +156,29 @@ python photoprism_sync.py --db vsco_links.db --import-dir /mnt/photo/Import --li
 
 По умолчанию PhotoPrism CLI ищется как `photoprism`, но путь можно переопределить опцией `--photoprism`. После успешного импорта PhotoPrism переносит файлы в `originals/`, поэтому локальный импорт-каталог остаётся свободным.
 
+### Как подобрать значения параметров
+
+- **`--db`** – путь до базы бота (`vsco_links.db`, если запускали стандартный сканер в текущей папке). На Windows указывайте полный путь, например `--db "C:\\Users\\you\\VSCO\\vsco_links.db"`.
+- **`--import-dir`** – каталог, который PhotoPrism сканирует как `Import` (обычно `C:\\Users\\you\\Pictures\\Import` или смонтированная сетевуха). Скрипт создаёт внутри подпапки `username/дата`.
+- **`--limit`** – сколько новых записей обрабатывать за один прогон; оставьте по умолчанию `100`, если не уверены.
+- **`--photoprism`** – исполняемый файл CLI. На Linux достаточно имени `photoprism`, на Windows используйте полный путь до `photoprism.exe`, например `--photoprism "C:\\Program Files\\PhotoPrism\\photoprism.exe"`.
+- **`--skip-import`** – добавьте флаг, если хотите только скачать файлы без вызова `photoprism import` (например, для проверки путей).
+- **`--no-date-subdirs`** – убирает группировку по датам и складывает файлы сразу в папку пользователя.
+- **`--verbose`** – включает подробные логи, в том числе команды запуска `photoprism import`.
+
+#### Пример для Windows
+
+```powershell
+python photoprism_sync.py `
+  --db "C:\Users\you\VSCO\vsco_links.db" `
+  --import-dir "G:\VSCO\cache" `
+  --photoprism "C:\Program Files\PhotoPrism\photoprism.exe" `
+  --limit 50 `
+  --verbose
+```
+
+Если `photoprism.exe` не найден по указанному пути, скрипт завершится с сообщением `PhotoPrism CLI executable ... was not found` — это означает, что нужно поправить значение `--photoprism` или добавить каталог PhotoPrism в `PATH`.
+
 ## `vsco_export_impl.py` и `vsco_export.py`
 
 `vsco_export.py` просто реэкспортирует `ExportDependencies` и `ExportManager` для обратной совместимости.【F:vsco_export.py†L1-L11】
