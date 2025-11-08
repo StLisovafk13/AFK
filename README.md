@@ -27,6 +27,7 @@
 | `vsco_parser.py` | Разбор HTML/Excel выгрузок Visual Search, построение галерей и карт. |
 | `vsco_rescan.py` | Массовое пересканирование уже сохранённых профилей с трекингом состояния. |
 | `local_export_server.py` | Локальный HTTP-сервер для просмотра галерей/карт/CSV по базе. |
+| `photoprism_sync.py` | Синхронизатор, который выгружает новые медиа в каталог PhotoPrism и отмечает их в базе. |
 | `vsco_export.py` / `vsco_export_impl.py` | Хендлеры экспорта бота (CSV, галереи, карты) и инфраструктура для отправки файлов. |
 | `vsco_bot.py` | Основная логика Telegram-бота: парсинг сообщений, хранение данных, построение экспорта и статистики. |
 | `test_*.py` | Наборы автоматических тестов для критичных компонентов. |
@@ -80,7 +81,7 @@ python profile_link_scanner.py --profile-url "https://vsco.co/vsco_user/gallery"
 
 | Компонент | Назначение |
 | --- | --- |
-| `extract_exif_from_url(url, *, referer, timeout, headers)` | Скачивает файл через `curl`, вычисляет размер и, если доступен `exiftool`, возвращает дерево EXIF (`{"size_bytes": ..., "exiftool": {...}}`). Поддерживает переопределение заголовков и реферера.【F:exif_fetcher.py†L91-L147】 |
+| `extract_exif_from_url(url, *, referer, timeout, headers, keep_file=False, download_to=None)` | Скачивает файл через `curl`, вычисляет размер и, если доступен `exiftool`, возвращает дерево EXIF (`{"size_bytes": ..., "exiftool": {...}}`). При сохранении файла (`keep_file=True` или `download_to`) возвращает `download_path`.【F:exif_fetcher.py†L91-L161】 |
 | `_build_curl_command`, `_call_exiftool` | Служебные функции подготовки аргументов `curl` и запуска `exiftool`, поднимают `ExifExtractionError`, если бинарники недоступны.【F:exif_fetcher.py†L27-L89】 |
 
 ## `vsco_downloader.py`
@@ -137,6 +138,62 @@ CLI-загрузчик медиа с Playwright, логированием и ZIP
 - `_generate_csv(scope, chat_id)` — собирает данные через `vsco_bot.fetch_gallery_users`, конвертирует в CSV-строку и возвращает bytes. Ошибки отображаются как HTTP 500.【F:local_export_server.py†L179-L337】
 - `serve(host, port, refresh)` — запускает `http.server.ThreadingHTTPServer` с кастомным обработчиком, обновляющим HTML и CSV на лету.【F:local_export_server.py†L338-L351】
 - `main(argv)` — парсит CLI (`--host`, `--port`, `--refresh`, `--db`) и вызывает `serve`. По умолчанию слушает `127.0.0.1:8765` и обновляет страницы каждые 60 секунд.【F:local_export_server.py†L352-L419】
+
+## `photoprism_sync.py`
+
+Фоновый синхронизатор, который переносит новые записи из таблицы `items` в каталог импорта PhotoPrism и сразу запускает `photoprism import`.
+
+- Создаёт служебную таблицу `photoprism_files(item_id INTEGER PRIMARY KEY, local_path TEXT, size_bytes INTEGER, imported_at TEXT)` для отметки обработанных элементов.
+- Складывает файлы по структуре `Import/<username>/<YYYY-MM-DD>/`, где дата берётся из `items.created_at` (или текущая при отсутствии значения). Флаг `--no-date-subdirs` отключает группировку по датам.
+- Повторно использует уже скачанные файлы и пропускает недоступные URL с подробным логированием ошибок `curl`/`exiftool`.
+- Параметр `--skip-import` сохраняет файлы в каталоге импорта без вызова PhotoPrism — удобно для отладки пайплайна.
+
+Пример запуска:
+
+```bash
+python photoprism_sync.py --db vsco_links.db --import-dir /mnt/photo/Import --limit 50 --verbose
+```
+
+По умолчанию PhotoPrism CLI ищется как `photoprism`, но путь можно переопределить опцией `--photoprism`. После успешного импорта PhotoPrism переносит файлы в `originals/`, поэтому локальный импорт-каталог остаётся свободным.
+
+### Как подобрать значения параметров
+
+- **`--db`** – путь до базы бота (`vsco_links.db`, если запускали стандартный сканер в текущей папке). На Windows указывайте полный путь, например `--db "C:\\Users\\you\\VSCO\\vsco_links.db"`.
+- **`--import-dir`** – каталог, который PhotoPrism сканирует как `Import` (обычно `C:\\Users\\you\\Pictures\\Import` или смонтированная сетевуха). Скрипт создаёт внутри подпапки `username/дата`.
+- **`--limit`** – сколько новых записей обрабатывать за один прогон; оставьте по умолчанию `100`, если не уверены.
+- **`--photoprism`** – команда для запуска PhotoPrism CLI. Можно указать только имя (`photoprism`), полный путь (`"C:\\Program Files\\PhotoPrism\\photoprism.exe"`) или целую команду с доп. аргументами. Например, если PhotoPrism работает в Docker, передайте `--photoprism docker exec photoprism photoprism` (последний аргумент **обязательно** должен быть `photoprism`, иначе внутри контейнера запустится другое приложение вроде ImageMagick `import`).
+- **`--list-containers`** – напечатает таблицу `docker ps` (имя, образ, статус) и завершит работу скрипта. Полезно, чтобы подсмотреть точное имя контейнера перед указанием `--photoprism docker exec …`.
+- **`--skip-import`** – добавьте флаг, если хотите только скачать файлы без вызова `photoprism import` (например, для проверки путей).
+- **`--no-date-subdirs`** – убирает группировку по датам и складывает файлы сразу в папку пользователя.
+- **`--verbose`** – включает подробные логи, в том числе команды запуска `photoprism import`.
+
+#### Пример для Windows
+
+```powershell
+python photoprism_sync.py `
+  --db "C:\Users\you\VSCO\vsco_links.db" `
+  --import-dir "G:\VSCO\cache" `
+  --photoprism "C:\Program Files\PhotoPrism\photoprism.exe" `
+  --limit 50 `
+  --verbose
+```
+
+Если указанный исполняемый файл не найден (включая вариант с Docker), скрипт завершится с сообщением `PhotoPrism CLI executable ... was not found` — это означает, что нужно поправить значение `--photoprism` или добавить команду в `PATH`/имя контейнера.
+
+#### Пример для Docker-контейнера
+
+```bash
+python photoprism_sync.py \
+  --db /srv/bot/vsco_links.db \
+  --import-dir /srv/photoprism/import \
+  --photoprism docker exec photoprism photoprism \
+  --limit 50 \
+  --verbose
+```
+
+Здесь `photoprism` — имя контейнера, а последним аргументом указывается бинарь внутри контейнера. По этой же схеме можно добавить `--user` или другие опции `docker exec`.
+
+> ⚠️ Если в логах появляется строка вроде `import: unable to open X server '@ error/import.c/ImportImageCommand/348`, это значит, что контейнеру передана команда без завершающего `photoprism`. Добавьте его последним аргументом `docker exec`, чтобы запустился именно PhotoPrism CLI, а не утилита ImageMagick.
 
 ## `vsco_export_impl.py` и `vsco_export.py`
 
