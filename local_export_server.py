@@ -138,53 +138,110 @@ def _update_profile_comments(username: str, comments: List[str]) -> Dict[str, An
         conn.close()
 
 
-def _delete_profile(username: str) -> Dict[str, Any]:
-    """Remove all DB entries associated with *username*."""
+def _delete_profiles(usernames: Iterable[str]) -> Dict[str, Any]:
+    """Remove all DB entries associated with the provided usernames."""
 
-    clean_username = (username or "").strip()
-    if not clean_username:
-        raise ValueError("username is required")
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for raw in usernames:
+        candidate = (raw or "").strip()
+        if not candidate:
+            continue
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(candidate)
+
+    if not cleaned:
+        raise ValueError("usernames are required")
 
     conn = db_connect()
     try:
-        item_rows = conn.execute(
-            "SELECT id FROM items WHERE username = ?",
-            (clean_username,),
-        ).fetchall()
-        if not item_rows:
-            raise LookupError("profile not found")
+        pending: List[Tuple[str, List[int]]] = []
+        missing: List[str] = []
+        for username in cleaned:
+            rows = conn.execute(
+                "SELECT id FROM items WHERE username = ?",
+                (username,),
+            ).fetchall()
+            if not rows:
+                missing.append(username)
+                continue
+            item_ids = [int(row[0]) for row in rows]
+            pending.append((username, item_ids))
 
-        item_ids = [int(row[0]) for row in item_rows]
-        deleted_comments = 0
-        if item_ids:
-            placeholders = ",".join("?" for _ in item_ids)
-            cur = conn.execute(
-                f"DELETE FROM comments WHERE item_id IN ({placeholders})",
-                item_ids,
+        if missing:
+            if len(cleaned) == 1:
+                raise LookupError("profile not found")
+            raise LookupError("profiles not found: " + ", ".join(missing))
+
+        total_items = 0
+        total_comments = 0
+        total_links = 0
+        details: List[Dict[str, Any]] = []
+
+        for username, item_ids in pending:
+            deleted_comments = 0
+            if item_ids:
+                placeholders = ",".join("?" for _ in item_ids)
+                cur = conn.execute(
+                    f"DELETE FROM comments WHERE item_id IN ({placeholders})",
+                    item_ids,
+                )
+                deleted_comments = cur.rowcount or 0
+
+            cur_items = conn.execute(
+                "DELETE FROM items WHERE username = ?",
+                (username,),
             )
-            deleted_comments = cur.rowcount or 0
+            removed_items = cur_items.rowcount or len(item_ids)
 
-        cur_items = conn.execute(
-            "DELETE FROM items WHERE username = ?",
-            (clean_username,),
-        )
-        removed_items = cur_items.rowcount or len(item_ids)
+            cur_links = conn.execute(
+                "DELETE FROM links WHERE username = ?",
+                (username,),
+            )
+            removed_links = cur_links.rowcount or 0
 
-        cur_links = conn.execute(
-            "DELETE FROM links WHERE username = ?",
-            (clean_username,),
-        )
-        removed_links = cur_links.rowcount or 0
+            total_items += removed_items
+            total_comments += deleted_comments
+            total_links += removed_links
+            details.append(
+                {
+                    "username": username,
+                    "removed_items": removed_items,
+                    "removed_comments": deleted_comments,
+                    "removed_links": removed_links,
+                }
+            )
 
         conn.commit()
         return {
-            "username": clean_username,
-            "removed_items": removed_items,
-            "removed_comments": deleted_comments,
-            "removed_links": removed_links,
+            "usernames": cleaned,
+            "removed_profiles": len(details),
+            "removed_items": total_items,
+            "removed_comments": total_comments,
+            "removed_links": total_links,
+            "details": details,
         }
     finally:
         conn.close()
+
+
+def _delete_profile(username: str) -> Dict[str, Any]:
+    """Remove all DB entries associated with *username*."""
+
+    result = _delete_profiles([username])
+    details = result.get("details") or []
+    if details:
+        return details[0]
+    clean_username = (username or "").strip()
+    return {
+        "username": clean_username,
+        "removed_items": 0,
+        "removed_comments": 0,
+        "removed_links": 0,
+    }
 
 
 _ADMIN_PANEL_SNIPPET = r"""
@@ -213,6 +270,21 @@ _ADMIN_PANEL_SNIPPET = r"""
   .profile-actions .admin-control:hover { background: #ea580c; transform: translateY(-1px); }
   .profile-actions .admin-control.delete { background: #ef4444; }
   .profile-actions .admin-control.delete:hover { background: #dc2626; }
+  .admin-bulk-toggle { position: fixed; bottom: 28px; right: 28px; z-index: 4500; display: inline-flex; align-items: center; gap: 8px; padding: 12px 18px; border-radius: 999px; background: #2563eb; color: #fff; border: none; font-weight: 600; font-size: 14px; cursor: pointer; box-shadow: 0 18px 40px rgba(37,99,235,0.35); transition: transform .18s ease, box-shadow .18s ease, background .18s ease; }
+  .admin-bulk-toggle:hover { background: #1d4ed8; transform: translateY(-2px); box-shadow: 0 22px 48px rgba(29,78,216,0.4); }
+  .admin-bulk-toggle:disabled { opacity: .6; cursor: default; transform: none; box-shadow: none; }
+  .admin-bulk-bar { position: fixed; left: 50%; bottom: 28px; transform: translate(-50%, 24px); z-index: 4600; display: flex; align-items: center; gap: 16px; padding: 14px 20px; border-radius: 18px; background: rgba(15,23,42,0.95); color: #f8fafc; box-shadow: 0 24px 48px rgba(15,23,42,0.45); transition: opacity .2s ease, transform .2s ease; }
+  .admin-bulk-bar.hidden { opacity: 0; pointer-events: none; transform: translate(-50%, 40px); }
+  .admin-bulk-info { font-size: 14px; font-weight: 600; }
+  .admin-bulk-info .count { font-variant-numeric: tabular-nums; margin: 0 4px; }
+  .admin-bulk-bar .admin-btn { font-size: 13px; padding: 8px 14px; border-radius: 12px; }
+  .card.admin-selectable { position: relative; }
+  .admin-select-indicator { position: absolute; top: 12px; left: 12px; width: 26px; height: 26px; border-radius: 8px; border: 2px solid rgba(15,23,42,0.25); background: rgba(255,255,255,0.9); display: flex; align-items: center; justify-content: center; font-size: 16px; font-weight: 700; color: rgba(15,23,42,0.55); box-shadow: 0 10px 20px rgba(15,23,42,0.18); opacity: 0; transform: scale(0.8); transition: opacity .18s ease, transform .18s ease, background .18s ease, color .18s ease, border-color .18s ease; pointer-events: none; }
+  body.admin-selection-active .card.admin-selectable { cursor: pointer; }
+  body.admin-selection-active .card.admin-selectable .admin-select-indicator { opacity: 1; transform: scale(1); }
+  body.admin-selection-active .card.admin-selectable.admin-selected { box-shadow: 0 0 0 3px rgba(239,68,68,0.45); }
+  body.admin-selection-active .card.admin-selectable.admin-selected .admin-select-indicator { background: #ef4444; border-color: #b91c1c; color: #fff; }
+  body.admin-selection-active .card.admin-selectable.admin-selected::after { content: ''; position: absolute; inset: 0; border-radius: inherit; box-shadow: inset 0 0 0 2px rgba(239,68,68,0.45); pointer-events: none; }
 </style>
 <script>
 (function() {
@@ -223,6 +295,7 @@ _ADMIN_PANEL_SNIPPET = r"""
 
   const COMMENTS_URL = '/api/admin/comments';
   const DELETE_URL = '/api/admin/delete-profile';
+  const DELETE_BULK_URL = '/api/admin/delete-profiles';
 
   const body = document.body;
   if (!body) {
@@ -263,6 +336,271 @@ _ADMIN_PANEL_SNIPPET = r"""
       return window.CSS.escape(value);
     }
     return value.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+  }
+
+  const grid = document.getElementById('grid');
+
+  let selectionMode = false;
+  let bulkDeleteInProgress = false;
+  const selectedProfiles = new Map();
+  let bulkToggleBtn = null;
+  let bulkBar = null;
+  let bulkCancelBtn = null;
+  let bulkDeleteBtn = null;
+  let bulkCountEl = null;
+  let gridObserver = null;
+
+  function normalizeUsername(value) {
+    return (value || '').toString().trim().toLowerCase();
+  }
+
+  function updateBulkUi() {
+    if (bulkCountEl) {
+      bulkCountEl.textContent = selectedProfiles.size.toString();
+    }
+    if (bulkDeleteBtn) {
+      bulkDeleteBtn.disabled = bulkDeleteInProgress || selectedProfiles.size === 0;
+    }
+    if (bulkToggleBtn) {
+      bulkToggleBtn.disabled = bulkDeleteInProgress;
+    }
+  }
+
+  function syncCardSelectionState(card) {
+    if (!card) {
+      return;
+    }
+    if (!selectionMode) {
+      card.classList.remove('admin-selected');
+      return;
+    }
+    const key = normalizeUsername(card.dataset ? card.dataset.username : '');
+    if (key && selectedProfiles.has(key)) {
+      card.classList.add('admin-selected');
+    } else {
+      card.classList.remove('admin-selected');
+    }
+  }
+
+  function toggleCardSelection(card) {
+    if (!card) {
+      return;
+    }
+    const username = card.dataset ? card.dataset.username : '';
+    const key = normalizeUsername(username);
+    if (!key) {
+      return;
+    }
+    if (selectedProfiles.has(key)) {
+      selectedProfiles.delete(key);
+      card.classList.remove('admin-selected');
+    } else {
+      selectedProfiles.set(key, { username });
+      card.classList.add('admin-selected');
+    }
+    updateBulkUi();
+  }
+
+  function handleCardClick(event) {
+    if (!selectionMode) {
+      return;
+    }
+    const card = event.currentTarget;
+    if (!card) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    toggleCardSelection(card);
+  }
+
+  function refreshSelectableCards() {
+    if (!grid) {
+      return;
+    }
+    const cards = grid.querySelectorAll('.card');
+    const existing = new Set();
+    cards.forEach(card => {
+      const username = card.dataset ? card.dataset.username : '';
+      const key = normalizeUsername(username);
+      if (key) {
+        existing.add(key);
+      }
+      card.classList.add('admin-selectable');
+      if (!card.querySelector('.admin-select-indicator')) {
+        const indicator = document.createElement('div');
+        indicator.className = 'admin-select-indicator';
+        indicator.textContent = '✓';
+        card.appendChild(indicator);
+      }
+      if (!card.dataset.adminSelectBound) {
+        card.addEventListener('click', handleCardClick);
+        card.dataset.adminSelectBound = '1';
+      }
+      syncCardSelectionState(card);
+    });
+    Array.from(selectedProfiles.keys()).forEach(key => {
+      if (!existing.has(key)) {
+        selectedProfiles.delete(key);
+      }
+    });
+    if (!selectionMode && selectedProfiles.size) {
+      selectedProfiles.clear();
+    }
+    updateBulkUi();
+  }
+
+  function setSelectionMode(next) {
+    if (!grid) {
+      return;
+    }
+    const enabled = !!next;
+    if (!enabled) {
+      if (selectionMode) {
+        selectionMode = false;
+        body.classList.remove('admin-selection-active');
+        if (bulkToggleBtn) {
+          bulkToggleBtn.style.display = 'inline-flex';
+        }
+        if (bulkBar) {
+          bulkBar.classList.add('hidden');
+        }
+      }
+      selectedProfiles.clear();
+      grid.querySelectorAll('.card.admin-selectable').forEach(card => card.classList.remove('admin-selected'));
+      updateBulkUi();
+      return;
+    }
+    if (selectionMode) {
+      return;
+    }
+    selectionMode = true;
+    body.classList.add('admin-selection-active');
+    if (bulkToggleBtn) {
+      bulkToggleBtn.style.display = 'none';
+    }
+    if (bulkBar) {
+      bulkBar.classList.remove('hidden');
+    }
+    refreshSelectableCards();
+    updateBulkUi();
+  }
+
+  async function deleteSelectedProfiles() {
+    if (!grid || selectedProfiles.size === 0 || bulkDeleteInProgress) {
+      return;
+    }
+    const usernames = Array.from(selectedProfiles.values()).map(entry => entry.username).filter(Boolean);
+    if (!usernames.length) {
+      return;
+    }
+    if (!window.confirm('Удалить выбранные профили (' + usernames.length + ') и все связанные записи?')) {
+      return;
+    }
+    bulkDeleteInProgress = true;
+    updateBulkUi();
+    try {
+      const response = await fetch(DELETE_BULK_URL, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json'
+        },
+        body: JSON.stringify({ usernames })
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || 'HTTP ' + response.status);
+      }
+      const payload = await response.json();
+      if (!payload || payload.ok !== true) {
+        const message = payload && payload.error ? payload.error : 'Не удалось удалить выбранные профили';
+        throw new Error(message);
+      }
+      const detailList = Array.isArray(payload.details) ? payload.details : [];
+      const removedKeys = new Set();
+      detailList.forEach(entry => {
+        const uname = entry && entry.username ? entry.username : '';
+        const key = normalizeUsername(uname);
+        if (key) {
+          removedKeys.add(key);
+        }
+      });
+      if (!removedKeys.size) {
+        usernames.forEach(name => {
+          const key = normalizeUsername(name);
+          if (key) {
+            removedKeys.add(key);
+          }
+        });
+      }
+      if (window.DATA_MAP && typeof window.DATA_MAP.delete === 'function') {
+        removedKeys.forEach(key => window.DATA_MAP.delete(key));
+      }
+      if (Array.isArray(window.DATA)) {
+        for (let idx = window.DATA.length - 1; idx >= 0; idx -= 1) {
+          const item = window.DATA[idx];
+          const key = normalizeUsername(item && item.username);
+          if (key && removedKeys.has(key)) {
+            window.DATA.splice(idx, 1);
+          }
+        }
+      }
+      if (typeof window.apply === 'function') {
+        try {
+          window.apply();
+        } catch (err) {
+          console.error('Failed to re-render gallery after bulk deletion', err);
+        }
+      }
+      if (typeof window.showGallery === 'function') {
+        try {
+          window.showGallery(true);
+        } catch (err) {
+          console.error('Failed to return to gallery view after bulk deletion', err);
+        }
+      }
+      setSelectionMode(false);
+      const removedCount = typeof payload.removed_profiles === 'number' ? payload.removed_profiles : removedKeys.size;
+      showFlash('Удалено профилей: ' + removedCount, 'success');
+    } catch (err) {
+      console.error('Failed to delete profiles', err);
+      const message = err && err.message ? err.message : 'Не удалось удалить выбранные профили';
+      showFlash(message, 'error');
+    } finally {
+      bulkDeleteInProgress = false;
+      updateBulkUi();
+      refreshSelectableCards();
+    }
+  }
+
+  if (grid) {
+    bulkToggleBtn = document.createElement('button');
+    bulkToggleBtn.type = 'button';
+    bulkToggleBtn.className = 'admin-bulk-toggle';
+    bulkToggleBtn.textContent = '🗑️ Выбор профилей';
+    bulkToggleBtn.addEventListener('click', () => setSelectionMode(true));
+    body.appendChild(bulkToggleBtn);
+
+    bulkBar = document.createElement('div');
+    bulkBar.className = 'admin-bulk-bar hidden';
+    bulkBar.innerHTML = '\n    <div class="admin-bulk-info">Выбрано: <span class="count">0</span></div>\n    <button type="button" class="admin-btn secondary admin-bulk-cancel">Отмена</button>\n    <button type="button" class="admin-btn admin-danger admin-bulk-delete">Удалить выбранные</button>\n  ';
+    bulkCountEl = bulkBar.querySelector('.count');
+    bulkCancelBtn = bulkBar.querySelector('.admin-bulk-cancel');
+    bulkDeleteBtn = bulkBar.querySelector('.admin-bulk-delete');
+    if (bulkCancelBtn) {
+      bulkCancelBtn.addEventListener('click', () => setSelectionMode(false));
+    }
+    if (bulkDeleteBtn) {
+      bulkDeleteBtn.addEventListener('click', () => deleteSelectedProfiles());
+    }
+    body.appendChild(bulkBar);
+
+    refreshSelectableCards();
+    updateBulkUi();
+    gridObserver = new MutationObserver(() => refreshSelectableCards());
+    gridObserver.observe(grid, { childList: true });
   }
 
   const modal = document.createElement('div');
@@ -463,6 +801,7 @@ _ADMIN_PANEL_SNIPPET = r"""
           console.error('Failed to return to gallery view', err);
         }
       }
+      setSelectionMode(false);
       showFlash('Профиль удалён', 'success');
     } catch (err) {
       console.error('Failed to delete profile', err);
@@ -487,6 +826,7 @@ _ADMIN_PANEL_SNIPPET = r"""
   }
 
   window.renderProfile = function(user, updateHash, preferredTabKey) {
+    setSelectionMode(false);
     const result = originalRender.apply(this, arguments);
     try {
       const profileView = document.getElementById('profileView');
@@ -1063,6 +1403,21 @@ class ExportRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/admin/delete-profile":
                 username = str(payload.get("username") or "").strip()
                 result = _delete_profile(username)
+                self._send_text(
+                    json.dumps({"ok": True, **result}, ensure_ascii=False),
+                    content_type="application/json; charset=utf-8",
+                )
+                return
+
+            if path == "/api/admin/delete-profiles":
+                raw_usernames = payload.get("usernames")
+                if isinstance(raw_usernames, str):
+                    usernames = [raw_usernames]
+                elif isinstance(raw_usernames, (list, tuple)):
+                    usernames = [str(item) for item in raw_usernames]
+                else:
+                    raise ValueError("usernames must be a list of strings")
+                result = _delete_profiles(usernames)
                 self._send_text(
                     json.dumps({"ok": True, **result}, ensure_ascii=False),
                     content_type="application/json; charset=utf-8",
