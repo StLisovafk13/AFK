@@ -158,10 +158,33 @@ def download_item(item: PendingItem, dest_dir: Path) -> Tuple[Path, Optional[int
     return dest_path, int(size_bytes) if isinstance(size_bytes, (int, float)) else None
 
 
-def run_photoprism_import(photoprism_cmd: str, folders: Iterable[Path]) -> None:
+def run_photoprism_import(
+    photoprism_cmd: Sequence[str], folders: Iterable[Path]
+) -> None:
     for folder in sorted({folder.resolve() for folder in folders}):
         LOGGER.info("Running photoprism import for %s", folder)
-        subprocess.check_call([photoprism_cmd, "import", "--path", str(folder)])
+        subprocess.check_call([*photoprism_cmd, "import", "--path", str(folder)])
+
+
+def resolve_photoprism_command(raw_cmd: Sequence[str]) -> List[str]:
+    if not raw_cmd:
+        raise FileNotFoundError(
+            "PhotoPrism CLI executable was not specified. Use --photoprism to set it explicitly."
+        )
+
+    head = raw_cmd[0]
+    explicit_path = Path(head).expanduser()
+    if explicit_path.is_file():
+        return [str(explicit_path), *raw_cmd[1:]]
+
+    resolved = shutil.which(head)
+    if resolved:
+        return [resolved, *raw_cmd[1:]]
+
+    raise FileNotFoundError(
+        f"PhotoPrism CLI executable '{head}' was not found. "
+        "Provide the full path via --photoprism or install it in PATH."
+    )
 
 
 def sync_photoprism(
@@ -169,7 +192,7 @@ def sync_photoprism(
     db_path: Path,
     import_dir: Path,
     limit: int,
-    photoprism_cmd: str,
+    photoprism_cmd: Sequence[str],
     skip_import: bool,
     date_subdirs: bool,
 ) -> int:
@@ -214,19 +237,7 @@ def sync_photoprism(
             return 0
 
         if not skip_import:
-            resolved_cmd: Optional[str]
-            explicit_path = Path(photoprism_cmd).expanduser()
-            if explicit_path.is_file():
-                resolved_cmd = str(explicit_path)
-            else:
-                resolved_cmd = shutil.which(photoprism_cmd)
-
-            if not resolved_cmd:
-                raise FileNotFoundError(
-                    f"PhotoPrism CLI executable '{photoprism_cmd}' was not found. "
-                    "Provide the full path via --photoprism or install it in PATH."
-                )
-
+            resolved_cmd = resolve_photoprism_command(photoprism_cmd)
             run_photoprism_import(resolved_cmd, touched_dirs)
         else:
             LOGGER.info("Skipping photoprism import step (dry-run)")
@@ -269,8 +280,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--photoprism",
-        default="photoprism",
-        help="PhotoPrism CLI executable (default: photoprism)",
+        nargs="+",
+        default=["photoprism"],
+        metavar="CMD",
+        help=(
+            "PhotoPrism CLI command (executable plus optional arguments); "
+            "default: photoprism"
+        ),
     )
     parser.add_argument(
         "--skip-import",

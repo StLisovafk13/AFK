@@ -161,7 +161,7 @@ python photoprism_sync.py --db vsco_links.db --import-dir /mnt/photo/Import --li
 - **`--db`** – путь до базы бота (`vsco_links.db`, если запускали стандартный сканер в текущей папке). На Windows указывайте полный путь, например `--db "C:\\Users\\you\\VSCO\\vsco_links.db"`.
 - **`--import-dir`** – каталог, который PhotoPrism сканирует как `Import` (обычно `C:\\Users\\you\\Pictures\\Import` или смонтированная сетевуха). Скрипт создаёт внутри подпапки `username/дата`.
 - **`--limit`** – сколько новых записей обрабатывать за один прогон; оставьте по умолчанию `100`, если не уверены.
-- **`--photoprism`** – исполняемый файл CLI. На Linux достаточно имени `photoprism`, на Windows используйте полный путь до `photoprism.exe`, например `--photoprism "C:\\Program Files\\PhotoPrism\\photoprism.exe"`.
+- **`--photoprism`** – команда для запуска PhotoPrism CLI. Можно указать только имя (`photoprism`), полный путь (`"C:\\Program Files\\PhotoPrism\\photoprism.exe"`) или целую команду с доп. аргументами. Например, если PhotoPrism работает в Docker, передайте `--photoprism docker exec photoprism photoprism`.
 - **`--skip-import`** – добавьте флаг, если хотите только скачать файлы без вызова `photoprism import` (например, для проверки путей).
 - **`--no-date-subdirs`** – убирает группировку по датам и складывает файлы сразу в папку пользователя.
 - **`--verbose`** – включает подробные логи, в том числе команды запуска `photoprism import`.
@@ -177,7 +177,20 @@ python photoprism_sync.py `
   --verbose
 ```
 
-Если `photoprism.exe` не найден по указанному пути, скрипт завершится с сообщением `PhotoPrism CLI executable ... was not found` — это означает, что нужно поправить значение `--photoprism` или добавить каталог PhotoPrism в `PATH`.
+Если указанный исполняемый файл не найден (включая вариант с Docker), скрипт завершится с сообщением `PhotoPrism CLI executable ... was not found` — это означает, что нужно поправить значение `--photoprism` или добавить команду в `PATH`/имя контейнера.
+
+#### Пример для Docker-контейнера
+
+```bash
+python photoprism_sync.py \
+  --db /srv/bot/vsco_links.db \
+  --import-dir /srv/photoprism/import \
+  --photoprism docker exec photoprism photoprism \
+  --limit 50 \
+  --verbose
+```
+
+Здесь `photoprism` — имя контейнера, а последним аргументом указывается бинарь внутри контейнера. По этой же схеме можно добавить `--user` или другие опции `docker exec`.
 
 ## `vsco_export_impl.py` и `vsco_export.py`
 
