@@ -141,6 +141,8 @@ REQUIRED_CHANNEL_LABEL = os.getenv("BOT_REQUIRED_CHANNEL_LABEL", "").strip()
 REQUIRED_GROUP_LABEL = os.getenv("BOT_REQUIRED_GROUP_LABEL", "").strip()
 REQUIRED_CHANNEL_LINK = os.getenv("BOT_REQUIRED_CHANNEL_LINK", "").strip()
 REQUIRED_GROUP_LINK = os.getenv("BOT_REQUIRED_GROUP_LINK", "").strip()
+DAILY_DIGEST_CHAT_ID_ENV = os.getenv("BOT_DAILY_DIGEST_CHAT_ID", "").strip()
+DAILY_DIGEST_TIME_ENV = os.getenv("BOT_DAILY_DIGEST_TIME", "").strip()
 MEDIA_PAGE_MAX_WIDTH = int(os.getenv("BOT_MEDIA_SCAN_MAX_WIDTH", "2048") or "2048")
 PROFILE_SCAN_WORKERS = max(
     1,
@@ -624,6 +626,45 @@ def _resolve_channel_ids() -> None:
 
 
 _resolve_channel_ids()
+
+
+def _parse_daily_time(value: str) -> Optional[Tuple[int, int]]:
+    text = (value or "").strip()
+    if not text:
+        return None
+    match = re.match(r"^(\d{1,2}):(\d{2})$", text)
+    if not match:
+        log.warning("BOT_DAILY_DIGEST_TIME must be in HH:MM format, got %r", value)
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        log.warning("BOT_DAILY_DIGEST_TIME is out of range: %r", value)
+        return None
+    return hour, minute
+
+
+DEFAULT_DAILY_DIGEST_TIME = "21:00"
+DAILY_DIGEST_CHAT_ID: Optional[int] = None
+DAILY_DIGEST_TIME: Optional[Tuple[int, int]] = None
+
+if DAILY_DIGEST_CHAT_ID_ENV:
+    parsed_chat = _parse_channel_id_value(DAILY_DIGEST_CHAT_ID_ENV, env_name="BOT_DAILY_DIGEST_CHAT_ID")
+    if isinstance(parsed_chat, int):
+        DAILY_DIGEST_CHAT_ID = parsed_chat
+    else:
+        log.warning(
+            "Daily digest disabled: BOT_DAILY_DIGEST_CHAT_ID must be a numeric chat id, got %r",
+            DAILY_DIGEST_CHAT_ID_ENV,
+        )
+
+time_setting = DAILY_DIGEST_TIME_ENV or DEFAULT_DAILY_DIGEST_TIME
+DAILY_DIGEST_TIME = _parse_daily_time(time_setting)
+if DAILY_DIGEST_CHAT_ID is not None and DAILY_DIGEST_TIME is None:
+    log.warning(
+        "Daily digest disabled: invalid BOT_DAILY_DIGEST_TIME value %r",
+        time_setting,
+    )
 
 
 @dataclass(frozen=True)
@@ -1748,6 +1789,151 @@ def format_background_scan_notice(scheduled_jobs: int) -> str:
         f"(запущено {scheduled_jobs} фоновых сканирований)."
         " Уведомим, когда появится новое."
     )
+
+
+def _fetch_new_profiles_since(chat_id: int, since_iso: str) -> List[Dict[str, str]]:
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                COALESCE(NULLIF(TRIM(l.username), ''), '') AS username,
+                COALESCE(NULLIF(TRIM(l.url), ''), '') AS profile_url,
+                l.created_at,
+                (
+                    SELECT added_by FROM items
+                    WHERE chat_id = l.chat_id AND username = l.username
+                    ORDER BY datetime(created_at) ASC
+                    LIMIT 1
+                ) AS added_by
+            FROM links AS l
+            WHERE l.chat_id = ? AND l.created_at >= ?
+            ORDER BY datetime(l.created_at) ASC
+            """,
+            (chat_id, since_iso),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    result: List[Dict[str, str]] = []
+    for username, profile_url, created_at, added_by in rows:
+        result.append(
+            {
+                "username": str(username or ""),
+                "profile_url": str(profile_url or ""),
+                "created_at": str(created_at or ""),
+                "added_by": str(added_by or ""),
+            }
+        )
+    return result
+
+
+def _format_daily_time_label(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=LOCAL_TZ)
+        else:
+            dt = dt.astimezone(LOCAL_TZ)
+        return dt.strftime("%H:%M")
+    except Exception:
+        return ""
+
+
+DAILY_DIGEST_MAX_ROWS = 30
+
+
+def _format_daily_digest_message(rows: Sequence[Dict[str, str]]) -> str:
+    total = len(rows)
+    lines = [
+        "🗓️ <b>Итоги за день</b>",
+        "Период: последние 24 часа.",
+        f"Добавлено новых профилей: <b>{total}</b>.",
+    ]
+
+    if total == 0:
+        lines.append(
+            f"Пока новых профилей нет — добавляйте ссылки, чтобы приблизиться к дневному лимиту экспорта ({DAILY_PROFILE_LIMIT})."
+        )
+        return "\n".join(lines)
+
+    lines.append("")
+    for entry in rows[:DAILY_DIGEST_MAX_ROWS]:
+        username = (entry.get("username") or "").strip()
+        profile_url = (entry.get("profile_url") or "").strip()
+        added_by = entry.get("added_by") or ""
+        created_at = entry.get("created_at") or ""
+
+        display = f"@{username}" if username else "Без username"
+        link_target = profile_url or (f"https://vsco.co/{username}" if username else "")
+        if link_target:
+            link_html = f"<a href=\"{escape(link_target, quote=True)}\">{escape(display)}</a>"
+        else:
+            link_html = escape(display)
+
+        parts = [link_html]
+        added_html = added_by_html(added_by)
+        if added_html:
+            parts.append(f"— добавил {added_html}")
+        time_label = _format_daily_time_label(created_at)
+        if time_label:
+            parts.append(f"<i>({LOCAL_TZ_LABEL} {time_label})</i>")
+
+        lines.append("• " + " ".join(parts))
+
+    if total > DAILY_DIGEST_MAX_ROWS:
+        lines.append(f"… и ещё {total - DAILY_DIGEST_MAX_ROWS} профилей.")
+
+    return "\n".join(lines)
+
+
+async def _send_daily_digest(chat_id: int, *, since_iso: Optional[str] = None) -> None:
+    since = since_iso or _since_utc_iso(1)
+    rows = _fetch_new_profiles_since(chat_id, since)
+    message = _format_daily_digest_message(rows)
+    await bot.send_message(
+        chat_id,
+        message,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+async def _daily_digest_loop() -> None:
+    if DAILY_DIGEST_CHAT_ID is None or DAILY_DIGEST_TIME is None:
+        return
+
+    hour, minute = DAILY_DIGEST_TIME
+    log.info(
+        "Daily digest loop started for chat_id=%s at %02d:%02d %s",
+        DAILY_DIGEST_CHAT_ID,
+        hour,
+        minute,
+        LOCAL_TZ_LABEL,
+    )
+
+    while True:
+        now = datetime.now(LOCAL_TZ)
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        delay = max((target - now).total_seconds(), 0)
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            log.info("Daily digest loop cancelled")
+            raise
+        try:
+            await _send_daily_digest(DAILY_DIGEST_CHAT_ID)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "Failed to send daily digest for chat_id=%s",
+                DAILY_DIGEST_CHAT_ID,
+            )
 
 def _get_item_id(conn: sqlite3.Connection, username: str, profile_url: str, image_url: str) -> Optional[int]:
     row = conn.execute(
@@ -5562,6 +5748,8 @@ _PROFILE_SCAN_QUEUE: asyncio.Queue | None = None
 _PROFILE_SCAN_TASKS: list[asyncio.Task] = []
 _PROFILE_SCAN_PENDING: set[tuple[int, str]] = set()
 
+_DAILY_DIGEST_TASK: asyncio.Task | None = None
+
 _META_UPDATE_QUEUE: asyncio.Queue | None = None
 _META_WORKER_TASKS: list[asyncio.Task] = []
 
@@ -6928,6 +7116,10 @@ async def main():
     for idx in range(current_meta, META_FETCH_WORKERS):
         task = asyncio.create_task(_metadata_worker(idx + 1))
         _META_WORKER_TASKS.append(task)
+    global _DAILY_DIGEST_TASK
+    if DAILY_DIGEST_CHAT_ID is not None and DAILY_DIGEST_TIME is not None:
+        if _DAILY_DIGEST_TASK is None or _DAILY_DIGEST_TASK.done():
+            _DAILY_DIGEST_TASK = asyncio.create_task(_daily_digest_loop())
     log.info("Bot is starting polling…")
     try:
         await _start_polling_with_retries()
@@ -6944,6 +7136,10 @@ async def main():
             task.cancel()
             with contextlib.suppress(Exception):
                 await task
+        if _DAILY_DIGEST_TASK:
+            _DAILY_DIGEST_TASK.cancel()
+            with contextlib.suppress(Exception):
+                await _DAILY_DIGEST_TASK
         with contextlib.suppress(Exception):
             await bot.session.close()
 if __name__ == "__main__":
