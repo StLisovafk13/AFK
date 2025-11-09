@@ -1796,19 +1796,43 @@ def _fetch_new_profiles_since(chat_id: int, since_iso: str) -> List[Dict[str, st
     try:
         rows = conn.execute(
             """
+            WITH normalized AS (
+                SELECT
+                    l.id AS link_id,
+                    l.chat_id,
+                    COALESCE(NULLIF(TRIM(l.username), ''), '') AS username,
+                    COALESCE(NULLIF(TRIM(l.url), ''), '') AS profile_url,
+                    l.created_at,
+                    (
+                        CASE
+                            WHEN COALESCE(NULLIF(TRIM(l.url), ''), '') != ''
+                                THEN LOWER(TRIM(l.url))
+                            WHEN COALESCE(NULLIF(TRIM(l.username), ''), '') != ''
+                                THEN 'username:' || LOWER(TRIM(l.username))
+                            ELSE 'id:' || CAST(l.id AS TEXT)
+                        END
+                    ) AS digest_key,
+                    (
+                        SELECT added_by FROM items
+                        WHERE chat_id = l.chat_id AND username = l.username
+                        ORDER BY datetime(created_at) ASC
+                        LIMIT 1
+                    ) AS added_by
+                FROM links AS l
+            )
             SELECT
-                COALESCE(NULLIF(TRIM(l.username), ''), '') AS username,
-                COALESCE(NULLIF(TRIM(l.url), ''), '') AS profile_url,
-                l.created_at,
-                (
-                    SELECT added_by FROM items
-                    WHERE chat_id = l.chat_id AND username = l.username
-                    ORDER BY datetime(created_at) ASC
-                    LIMIT 1
-                ) AS added_by
-            FROM links AS l
-            WHERE l.chat_id = ? AND l.created_at >= ?
-            ORDER BY datetime(l.created_at) ASC
+                n.username,
+                n.profile_url,
+                n.created_at,
+                n.added_by
+            FROM normalized AS n
+            WHERE n.chat_id = ? AND n.created_at >= ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM normalized AS prev
+                  WHERE prev.digest_key = n.digest_key
+                    AND datetime(prev.created_at) < datetime(n.created_at)
+              )
+            ORDER BY datetime(n.created_at) ASC
             """,
             (chat_id, since_iso),
         ).fetchall()
@@ -1845,10 +1869,21 @@ def _format_daily_time_label(value: str) -> str:
 DAILY_DIGEST_MAX_ROWS = 30
 
 
-def _format_daily_digest_message(rows: Sequence[Dict[str, str]]) -> str:
-    total = len(rows)
+def _format_daily_digest_message(
+    rows: Sequence[Dict[str, str]],
+    *,
+    page: int,
+    total_pages: int,
+    total_count: int,
+    start_index: int,
+) -> str:
+    total = total_count
     lines = [
-        "🗓️ <b>Итоги за день</b>",
+        (
+            "🗓️ <b>Итоги за день</b>"
+            if total_pages <= 1
+            else f"🗓️ <b>Итоги за день</b> — страница {page}/{total_pages}"
+        ),
         "Период: последние 24 часа.",
         f"Добавлено новых профилей: <b>{total}</b>.",
     ]
@@ -1859,8 +1894,16 @@ def _format_daily_digest_message(rows: Sequence[Dict[str, str]]) -> str:
         )
         return "\n".join(lines)
 
+    lines.append(
+        f"Показаны профили {start_index + 1}–{start_index + len(rows)} из {total}."
+        if total_pages > 1
+        else ""
+    )
+    if lines[-1] == "":
+        lines.pop()
     lines.append("")
-    for entry in rows[:DAILY_DIGEST_MAX_ROWS]:
+
+    for entry in rows:
         username = (entry.get("username") or "").strip()
         profile_url = (entry.get("profile_url") or "").strip()
         added_by = entry.get("added_by") or ""
@@ -1882,23 +1925,45 @@ def _format_daily_digest_message(rows: Sequence[Dict[str, str]]) -> str:
             parts.append(f"<i>({LOCAL_TZ_LABEL} {time_label})</i>")
 
         lines.append("• " + " ".join(parts))
-
-    if total > DAILY_DIGEST_MAX_ROWS:
-        lines.append(f"… и ещё {total - DAILY_DIGEST_MAX_ROWS} профилей.")
-
     return "\n".join(lines)
 
 
 async def _send_daily_digest(chat_id: int, *, since_iso: Optional[str] = None) -> None:
     since = since_iso or _since_utc_iso(1)
     rows = _fetch_new_profiles_since(chat_id, since)
-    message = _format_daily_digest_message(rows)
-    await bot.send_message(
-        chat_id,
-        message,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
+    total = len(rows)
+    if total == 0:
+        message = _format_daily_digest_message(
+            rows,
+            page=1,
+            total_pages=1,
+            total_count=0,
+            start_index=0,
+        )
+        await bot.send_message(
+            chat_id,
+            message,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    total_pages = max(1, math.ceil(total / DAILY_DIGEST_MAX_ROWS))
+    for page_index, start in enumerate(range(0, total, DAILY_DIGEST_MAX_ROWS), start=1):
+        chunk = rows[start : start + DAILY_DIGEST_MAX_ROWS]
+        message = _format_daily_digest_message(
+            chunk,
+            page=page_index,
+            total_pages=total_pages,
+            total_count=total,
+            start_index=start,
+        )
+        await bot.send_message(
+            chat_id,
+            message,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
 
 
 async def _daily_digest_loop() -> None:
