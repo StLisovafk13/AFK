@@ -35,7 +35,7 @@ from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Dict, Any, Tuple, Sequence, Set
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dtime
 from urllib.parse import (
     urljoin,
     urlparse,
@@ -156,6 +156,7 @@ PROFILE_NORMALIZE_CONCURRENCY = max(
     int(os.getenv("BOT_PROFILE_NORMALIZE_CONCURRENCY", "4") or "4"),
 )
 LINKS_NOTIFY_CHAT_ID_ENV = os.getenv("BOT_LINKS_NOTIFY_CHAT_ID", "").strip()
+LINKS_NOTIFY_AT_ENV = os.getenv("BOT_LINKS_NOTIFY_AT", "").strip()
 try:
     LINKS_NOTIFY_LIMIT = max(
         1,
@@ -558,6 +559,40 @@ def setup_logging():
 
 setup_logging()
 log = logging.getLogger("vsco-bot")
+
+
+def _parse_links_notify_time(raw: str) -> Optional[dtime]:
+    text = (raw or "").strip()
+    if not text:
+        return None
+
+    parts = text.split(":")
+    if len(parts) < 2:
+        log.error("Invalid BOT_LINKS_NOTIFY_AT value %r: expected HH:MM", raw)
+        return None
+
+    hour_text, minute_text = parts[0], parts[1]
+    try:
+        hour = int(hour_text)
+        minute = int(minute_text)
+    except ValueError:
+        log.error("Invalid BOT_LINKS_NOTIFY_AT value %r: non-numeric time", raw)
+        return None
+
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        log.error("Invalid BOT_LINKS_NOTIFY_AT value %r: hour/minute out of range", raw)
+        return None
+
+    return dtime(hour=hour, minute=minute, tzinfo=LOCAL_TZ)
+
+
+LINKS_NOTIFY_AT: Optional[dtime] = _parse_links_notify_time(LINKS_NOTIFY_AT_ENV)
+if LINKS_NOTIFY_AT is not None:
+    log.info(
+        "Link notifications scheduled for %s (%s)",
+        LINKS_NOTIFY_AT.strftime("%H:%M"),
+        LOCAL_TZ_LABEL,
+    )
 
 _PRIVATE_CHAT_LINK_RE = re.compile(r"^https?://t\.me/c/(\d{1,15})(?:/|$)", re.IGNORECASE)
 
@@ -1769,6 +1804,7 @@ def format_background_scan_notice(scheduled_jobs: int) -> str:
 
 
 _LINKS_NOTIFY_LOCK = asyncio.Lock()
+_LINKS_NOTIFY_SCHEDULER_TASK: Optional[asyncio.Task] = None
 
 
 @dataclass
@@ -1794,6 +1830,25 @@ def _cleanup_links_notify_digests(*, now: Optional[datetime] = None) -> None:
     for key, digest in list(_LINKS_NOTIFY_DIGESTS.items()):
         if digest.created_at < threshold:
             _LINKS_NOTIFY_DIGESTS.pop(key, None)
+
+
+def _next_links_notify_run(*, now: Optional[datetime] = None) -> Optional[datetime]:
+    if LINKS_NOTIFY_AT is None:
+        return None
+
+    if now is None:
+        now = datetime.now(LOCAL_TZ)
+
+    scheduled = datetime.combine(now.date(), LINKS_NOTIFY_AT)
+    if scheduled.tzinfo is None:
+        scheduled = scheduled.replace(tzinfo=LOCAL_TZ)
+    else:
+        scheduled = scheduled.astimezone(LOCAL_TZ)
+
+    if scheduled <= now:
+        scheduled += timedelta(days=1)
+
+    return scheduled
 
 
 def _collect_pending_link_notifications(
@@ -1932,8 +1987,11 @@ def _links_notify_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
-async def maybe_notify_new_links() -> None:
+async def maybe_notify_new_links(*, force: bool = False) -> None:
     if LINKS_NOTIFY_CHAT_ID is None:
+        return
+
+    if LINKS_NOTIFY_AT is not None and not force:
         return
 
     async with _LINKS_NOTIFY_LOCK:
@@ -1978,6 +2036,43 @@ async def maybe_notify_new_links() -> None:
             LINKS_NOTIFY_CHAT_ID,
             len(entries),
         )
+
+
+async def _links_notify_scheduler_loop() -> None:
+    log.info("Link notification scheduler started")
+    try:
+        while True:
+            next_run = _next_links_notify_run()
+            if next_run is None:
+                log.info("Link notification schedule disabled, stopping scheduler")
+                return
+
+            now = datetime.now(LOCAL_TZ)
+            delay = max(0.0, (next_run - now).total_seconds())
+            log.info(
+                "Next link notification digest scheduled at %s (%s) in %s seconds",
+                next_run.strftime("%Y-%m-%d %H:%M"),
+                LOCAL_TZ_LABEL,
+                int(delay),
+            )
+
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Link notification scheduler sleep interrupted")
+                continue
+
+            try:
+                await maybe_notify_new_links(force=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Scheduled link notification failed")
+                await asyncio.sleep(5)
+    finally:
+        log.info("Link notification scheduler stopped")
 
 def _get_item_id(conn: sqlite3.Connection, username: str, profile_url: str, image_url: str) -> Optional[int]:
     row = conn.execute(
@@ -7226,6 +7321,11 @@ async def main():
     for idx in range(current_meta, META_FETCH_WORKERS):
         task = asyncio.create_task(_metadata_worker(idx + 1))
         _META_WORKER_TASKS.append(task)
+    global _LINKS_NOTIFY_SCHEDULER_TASK
+    if LINKS_NOTIFY_AT is not None and (
+        _LINKS_NOTIFY_SCHEDULER_TASK is None or _LINKS_NOTIFY_SCHEDULER_TASK.done()
+    ):
+        _LINKS_NOTIFY_SCHEDULER_TASK = asyncio.create_task(_links_notify_scheduler_loop())
     log.info("Bot is starting polling…")
     try:
         await _start_polling_with_retries()
@@ -7242,6 +7342,10 @@ async def main():
             task.cancel()
             with contextlib.suppress(Exception):
                 await task
+        if _LINKS_NOTIFY_SCHEDULER_TASK is not None:
+            _LINKS_NOTIFY_SCHEDULER_TASK.cancel()
+            with contextlib.suppress(Exception):
+                await _LINKS_NOTIFY_SCHEDULER_TASK
         with contextlib.suppress(Exception):
             await bot.session.close()
 if __name__ == "__main__":
