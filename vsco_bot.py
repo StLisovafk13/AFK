@@ -34,7 +34,7 @@ from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Dict, Any, Tuple, Sequence, Set
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dt_time
 from urllib.parse import (
     urljoin,
     urlparse,
@@ -154,6 +154,16 @@ PROFILE_NORMALIZE_CONCURRENCY = max(
     1,
     int(os.getenv("BOT_PROFILE_NORMALIZE_CONCURRENCY", "4") or "4"),
 )
+LINKS_NOTIFY_CHAT_ID_ENV = os.getenv("BOT_LINKS_NOTIFY_CHAT_ID", "").strip()
+try:
+    LINKS_NOTIFY_LIMIT = max(
+        1,
+        int(os.getenv("BOT_LINKS_NOTIFY_LIMIT", "20") or "20"),
+    )
+except ValueError:
+    LINKS_NOTIFY_LIMIT = 20
+LINKS_NOTIFY_CHAT_ID: Optional[int | str] = None
+LINKS_NOTIFY_AT_ENV = os.getenv("BOT_LINKS_NOTIFY_AT", "").strip()
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -549,6 +559,53 @@ def setup_logging():
 setup_logging()
 log = logging.getLogger("vsco-bot")
 
+LINKS_NOTIFY_SCHEDULE_TIME: Optional[dt_time] = None
+_LINKS_NOTIFY_TASK: Optional[asyncio.Task] = None
+
+
+def _init_links_notify_schedule() -> None:
+    """Parse the daily notification schedule from environment variables."""
+
+    global LINKS_NOTIFY_SCHEDULE_TIME
+    if not LINKS_NOTIFY_AT_ENV:
+        return
+
+    parts = LINKS_NOTIFY_AT_ENV.split(":")
+    if len(parts) < 2:
+        log.error(
+            "BOT_LINKS_NOTIFY_AT must be in HH:MM format, got: %s",
+            LINKS_NOTIFY_AT_ENV,
+        )
+        return
+
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError:
+        log.error(
+            "BOT_LINKS_NOTIFY_AT must contain numeric hour and minute, got: %s",
+            LINKS_NOTIFY_AT_ENV,
+        )
+        return
+
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        log.error(
+            "BOT_LINKS_NOTIFY_AT is out of range (00:00-23:59), got: %s",
+            LINKS_NOTIFY_AT_ENV,
+        )
+        return
+
+    LINKS_NOTIFY_SCHEDULE_TIME = dt_time(hour=hour, minute=minute)
+    log.info(
+        "Daily link notifications scheduled at %02d:%02d (%s)",
+        hour,
+        minute,
+        LOCAL_TZ_LABEL,
+    )
+
+
+_init_links_notify_schedule()
+
 
 _PRIVATE_CHAT_LINK_RE = re.compile(r"^https?://t\.me/c/(\d{1,15})(?:/|$)", re.IGNORECASE)
 
@@ -680,6 +737,13 @@ _required_group = _make_required_chat(
 )
 if _required_group:
     REQUIRED_CHATS.append(_required_group)
+
+
+if LINKS_NOTIFY_CHAT_ID_ENV:
+    LINKS_NOTIFY_CHAT_ID = _parse_channel_id_value(
+        LINKS_NOTIFY_CHAT_ID_ENV,
+        env_name="BOT_LINKS_NOTIFY_CHAT_ID",
+    )
 
 
 REQUIRED_UNIQUE_LINKS = max(0, int(os.getenv("BOT_REQUIRED_UNIQUE_LINKS", "10") or "10"))
@@ -1073,6 +1137,8 @@ def init_db():
     link_cols = {row[1] for row in conn.execute("PRAGMA table_info(links)")}
     if "extra_json" not in link_cols:
         conn.execute("ALTER TABLE links ADD COLUMN extra_json TEXT DEFAULT ''")
+    if "notified_at" not in link_cols:
+        conn.execute("ALTER TABLE links ADD COLUMN notified_at TEXT DEFAULT ''")
     conn.commit(); conn.close()
     log.info("DB initialized at %s", DB_PATH)
 
@@ -1748,6 +1814,180 @@ def format_background_scan_notice(scheduled_jobs: int) -> str:
         f"(запущено {scheduled_jobs} фоновых сканирований)."
         " Уведомим, когда появится новое."
     )
+
+
+_LINKS_NOTIFY_LOCK = asyncio.Lock()
+
+
+def _collect_pending_link_notifications(
+    limit: int,
+    since_iso: str,
+) -> Tuple[List[Tuple[int, str, str, str, int, Optional[str]]], int]:
+    if limit <= 0:
+        return ([], 0)
+
+    conn = db_connect()
+    try:
+        total_row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM links
+            WHERE created_at >= ? AND COALESCE(notified_at, '') = ''
+            """,
+            (since_iso,),
+        ).fetchone()
+        total = int(total_row[0] or 0) if total_row else 0
+        if total == 0:
+            return ([], 0)
+
+        rows = conn.execute(
+            """
+            SELECT id, username, url, created_at, chat_id,
+                   (
+                       SELECT added_by FROM items
+                       WHERE chat_id = links.chat_id AND username = links.username
+                       ORDER BY datetime(created_at) ASC
+                       LIMIT 1
+                   ) AS added_by
+            FROM links
+            WHERE created_at >= ? AND COALESCE(notified_at, '') = ''
+            ORDER BY datetime(created_at) ASC, username ASC
+            LIMIT ?
+            """,
+            (since_iso, limit),
+        ).fetchall()
+
+        prepared: List[Tuple[int, str, str, str, int, Optional[str]]] = []
+        for row in rows:
+            link_id = int(row[0]) if row and row[0] is not None else 0
+            username = row[1] or ""
+            url = row[2] or ""
+            created_at = row[3] or ""
+            chat_id = row[4]
+            added_by = row[5] if row[5] else None
+            prepared.append((link_id, username, url, created_at, chat_id, added_by))
+
+        return prepared, total
+    finally:
+        conn.close()
+
+
+def _mark_links_notified(link_ids: Sequence[int]) -> None:
+    if not link_ids:
+        return
+
+    conn = db_connect()
+    try:
+        placeholders = ",".join("?" for _ in link_ids)
+        conn.execute(
+            f"UPDATE links SET notified_at=? WHERE id IN ({placeholders})",
+            (utc_now_iso(), *link_ids),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def maybe_notify_new_links() -> None:
+    if LINKS_NOTIFY_CHAT_ID is None:
+        return
+
+    async with _LINKS_NOTIFY_LOCK:
+        since = _since_utc_iso(1)
+        while True:
+            rows, total = _collect_pending_link_notifications(LINKS_NOTIFY_LIMIT, since)
+            if not rows:
+                break
+
+            link_ids = [row[0] for row in rows if row[0]]
+            entries = [(row[1], row[2], row[3], row[4], row[5]) for row in rows]
+            body = _fmt_links_block(entries)
+            if not body:
+                _mark_links_notified(link_ids)
+                if total <= len(rows):
+                    break
+                continue
+
+            header = "🔔 Новые ссылки за 24 часа"
+            summary = f"Показано {len(entries)} из {total}."
+            if total > len(entries):
+                summary += f" Остальные {total - len(entries)} будут отправлены позже."
+            text = f"{header}\n{summary}\n\n{body}"
+
+            try:
+                await bot.send_message(
+                    LINKS_NOTIFY_CHAT_ID,
+                    text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+            except Exception:
+                log.exception(
+                    "Failed to send link notification to %s",
+                    LINKS_NOTIFY_CHAT_ID,
+                )
+                break
+
+            _mark_links_notified(link_ids)
+            log.info(
+                "Notified chat %s about %s new link(s)",
+                LINKS_NOTIFY_CHAT_ID,
+                len(entries),
+            )
+
+            if total <= len(rows):
+                break
+
+
+async def maybe_notify_new_links_auto() -> None:
+    """Trigger notifications immediately when no daily schedule is configured."""
+
+    if LINKS_NOTIFY_SCHEDULE_TIME is not None:
+        return
+
+    await maybe_notify_new_links()
+
+
+async def _links_notify_scheduler_loop() -> None:
+    """Send the daily digest at the configured time of day."""
+
+    if LINKS_NOTIFY_SCHEDULE_TIME is None or LINKS_NOTIFY_CHAT_ID is None:
+        return
+
+    next_run: Optional[datetime] = None
+
+    while True:
+        now = datetime.now(LOCAL_TZ)
+        if next_run is None:
+            next_run = datetime.combine(
+                now.date(),
+                LINKS_NOTIFY_SCHEDULE_TIME,
+                tzinfo=LOCAL_TZ,
+            )
+            if next_run <= now:
+                next_run += timedelta(days=1)
+
+        delay = max(0.0, (next_run - now).total_seconds())
+        log.debug(
+            "Next scheduled link notification at %s (sleep %.0fs)",
+            next_run.isoformat(),
+            delay,
+        )
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            raise
+
+        try:
+            await maybe_notify_new_links()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Scheduled link notification failed")
+            next_run = datetime.now(LOCAL_TZ) + timedelta(minutes=5)
+            continue
+
+        next_run += timedelta(days=1)
 
 def _get_item_id(conn: sqlite3.Connection, username: str, profile_url: str, image_url: str) -> Optional[int]:
     row = conn.execute(
@@ -5179,6 +5419,8 @@ async def on_document(msg: Message):
                 f"Найдено VSCO-ссылок: {found}, добавлено ссылок/медиа: {added_items}, добавлено комментариев: {added_comments}"
                 f"{links_block}{notice_block}{background_notice}"
             )
+            if new_links:
+                await maybe_notify_new_links_auto()
             await _handle_access_links_progress(msg, access_links)
         except Exception as e:
             log.exception("CSV processing failed")
@@ -5225,6 +5467,8 @@ async def on_document(msg: Message):
                 f"{extra}"
                 f"{links_block}{notice_block}{background_notice}"
             )
+            if new_links or html_links:
+                await maybe_notify_new_links_auto()
             await _handle_access_links_progress(msg, access_links)
         except Exception as e:
             log.exception("HTML processing failed")
@@ -5232,6 +5476,8 @@ async def on_document(msg: Message):
             await msg.answer(
                 f"HTML загружен: <code>{escape(p.name)}</code>, но не удалось обработать: {escape(str(e))}{background_notice}"
             )
+            if new_links:
+                await maybe_notify_new_links_auto()
             await _handle_access_links_progress(msg, access_links)
         return
 
@@ -5242,6 +5488,8 @@ async def on_document(msg: Message):
         "Файл сохранён. Нужны .html/.csv. Ссылки из подписи учтены, если были."
         f"{links_block}{notice_block}{background_notice}"
     )
+    if new_links:
+        await maybe_notify_new_links_auto()
     await _handle_access_links_progress(msg, access_links)
 
 # ---------- plain text ----------
@@ -5315,6 +5563,12 @@ async def on_text(msg: Message):
         await cmd_tutorial(msg, user_id=getattr(msg.from_user, "id", None))
         return
 
+    if text == "🔔 Уведомления":
+        if not await ensure_user_has_access(msg):
+            return
+        await cmd_links_notify_info(msg, user_id=getattr(msg.from_user, "id", None))
+        return
+
     pairs = await normalize_vsco_pairs(parse_vsco_pairs_from_message(text, msg.entities))
     if not pairs:
         await ensure_user_has_access(msg)
@@ -5341,6 +5595,8 @@ async def on_text(msg: Message):
     await msg.answer(
         f"Найдено VSCO-ссылок: {len(pairs)}, добавлено записей: {ai}, комментариев: {ac}{links_block}{notice_block}{background_notice}"
     )
+    if links:
+        await maybe_notify_new_links_auto()
     await _handle_access_links_progress(msg, links)
 
 # ---------- stats ----------
@@ -5473,6 +5729,34 @@ async def cmd_links(msg: Message, user_id: Optional[int] = None):
     page = 1
     txt, total = _render_links_text(msg.chat.id, ses.export_scope, page)
     await msg.answer(txt, reply_markup=_links_scope_keyboard(ses, page, total))
+
+
+@dp.message(Command("linksnotify", "notify"))
+async def cmd_links_notify_info(msg: Message, user_id: Optional[int] = None) -> None:
+    if not await ensure_user_has_access(msg, user_id=user_id):
+        return
+
+    schedule_hint = (
+        f"⏰ Текущее расписание: ежедневно в <b>{LINKS_NOTIFY_SCHEDULE_TIME.strftime('%H:%M')}</b> {LOCAL_TZ_LABEL}."
+        if LINKS_NOTIFY_SCHEDULE_TIME
+        else "⏰ Расписание не задано — уведомления отправляются сразу после появления новых ссылок."
+    )
+
+    text = (
+        "🔔 <b>Уведомления о новых ссылках</b>\n\n"
+        "1. Укажите чат для рассылки через <code>BOT_LINKS_NOTIFY_CHAT_ID</code>. "
+        "Можно передать @username, числовой ID (с -100…) или ссылку вида https://t.me/c/<id>.\n"
+        f"2. Необязательно: задайте время ежедневного дайджеста переменной <code>BOT_LINKS_NOTIFY_AT</code> "
+        f"в формате <code>HH:MM</code> (24-часовой формат, часовой пояс сервера — {LOCAL_TZ_LABEL}).\n"
+        "3. При необходимости ограничьте размер одной рассылки переменной <code>BOT_LINKS_NOTIFY_LIMIT</code>.\n\n"
+        "Если расписание не указано, бот отправляет уведомление сразу, как только появляются свежие ссылки "
+        "за последние 24 часа. При включённом расписании отправляется один дайджест в сутки, а все свежие ссылки "
+        "помечаются как доставленные после отправки.\n\n"
+        "Проверьте логи бота: при запуске выводится итоговая конфигурация и ошибки чтения переменных."\n
+    )
+
+    await msg.answer(f"{schedule_hint}\n\n{text}")
+
 
 @dp.callback_query(F.data.startswith("links:"))
 async def on_links_click(cq: CallbackQuery):
@@ -5775,6 +6059,8 @@ async def _profile_scan_worker(worker_id: int) -> None:
                         text,
                         parse_mode="HTML",
                     )
+                if result.link_added:
+                    await maybe_notify_new_links_auto()
         except asyncio.CancelledError:
             log.info("Profile scan worker #%s cancelled", worker_id)
             raise
@@ -6625,6 +6911,8 @@ async def _dl_worker():
                             db_items_added,
                             " + profile link" if db_link_added else "",
                         )
+                        if db_link_added:
+                            await maybe_notify_new_links_auto()
                 except Exception:
                     log.exception("Job #%s: failed to ingest download results", job.id)
 
@@ -6755,6 +7043,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton(text="📊 Очередь", callback_data="menu:qstat")],
             [InlineKeyboardButton(text="📚 Туториал", callback_data="menu:tutorial")],
+            [InlineKeyboardButton(text="🔔 Уведомления", callback_data="menu:linksnotify")],
         ]
     )
 
@@ -6774,6 +7063,7 @@ def functions_reply_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton(text="📊 Очередь"),
                 KeyboardButton(text="📚 Туториал"),
             ],
+            [KeyboardButton(text="🔔 Уведомления")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выберите функцию",
@@ -6795,6 +7085,7 @@ async def cmd_help(msg: Message):
         "• <b>/dl &lt;username|profile_url&gt; [--flags]</b> — поставить профиль на скачивание\n"
         "• <b>/qstat</b> — показать размер очереди\n"
         "• <b>/links</b> — ссылки за последние 24 часа\n"
+        "• <b>/linksnotify</b> — подсказка по авто-уведомлениям о ссылках\n"
         f"• <b>/export</b> — экспорт CSV/галереи или карты (после {DAILY_PROFILE_LIMIT} новых профилей за сутки)\n"
         "• <b>/stats</b> — статистика по скачанным данным\n"
         "• <b>/reset</b> — очистить текущую сессию\n"
@@ -6868,6 +7159,11 @@ async def on_menu_click(cq: CallbackQuery):
         await cq.answer()
         return
 
+    if action == "linksnotify":
+        await cmd_links_notify_info(cq.message, user_id=getattr(cq.from_user, "id", None))
+        await cq.answer()
+        return
+
     await cq.answer()
 
 
@@ -6928,6 +7224,17 @@ async def main():
     for idx in range(current_meta, META_FETCH_WORKERS):
         task = asyncio.create_task(_metadata_worker(idx + 1))
         _META_WORKER_TASKS.append(task)
+    global _LINKS_NOTIFY_TASK
+    if (
+        LINKS_NOTIFY_SCHEDULE_TIME is not None
+        and LINKS_NOTIFY_CHAT_ID is not None
+        and (_LINKS_NOTIFY_TASK is None or _LINKS_NOTIFY_TASK.done())
+    ):
+        _LINKS_NOTIFY_TASK = asyncio.create_task(_links_notify_scheduler_loop())
+    elif LINKS_NOTIFY_SCHEDULE_TIME is not None and LINKS_NOTIFY_CHAT_ID is None:
+        log.warning(
+            "BOT_LINKS_NOTIFY_AT is set but BOT_LINKS_NOTIFY_CHAT_ID is missing; scheduled notifications are disabled",
+        )
     log.info("Bot is starting polling…")
     try:
         await _start_polling_with_retries()
@@ -6944,6 +7251,10 @@ async def main():
             task.cancel()
             with contextlib.suppress(Exception):
                 await task
+        if _LINKS_NOTIFY_TASK:
+            _LINKS_NOTIFY_TASK.cancel()
+            with contextlib.suppress(Exception):
+                await _LINKS_NOTIFY_TASK
         with contextlib.suppress(Exception):
             await bot.session.close()
 if __name__ == "__main__":

@@ -138,6 +138,8 @@ def ensure_db_schema(conn: sqlite3.Connection) -> None:
     link_cols = {row[1] for row in conn.execute("PRAGMA table_info(links)")}
     if "extra_json" not in link_cols:
         conn.execute("ALTER TABLE links ADD COLUMN extra_json TEXT DEFAULT ''")
+    if "notified_at" not in link_cols:
+        conn.execute("ALTER TABLE links ADD COLUMN notified_at TEXT DEFAULT ''")
 
 
 def connect_db(path: Path) -> sqlite3.Connection:
@@ -631,6 +633,7 @@ def store_profile_media(
     try:
         added_items = 0
         new_items_for_meta: list[tuple[int, str]] = []
+        link_inserted = False
         for tab_url, urls_for_tab in normalized_media_by_tab.items():
             prepared = _prepare_urls(urls_for_tab, max_width=2048)
             if not prepared:
@@ -663,10 +666,12 @@ def store_profile_media(
                     item_id = cur.lastrowid
                     if item_id:
                         new_items_for_meta.append((item_id, url))
-        conn.execute(
+        cur = conn.execute(
             "INSERT OR IGNORE INTO links(chat_id,username,url,created_at) VALUES(?,?,?,?)",
             (chat_id, username, profile_url, utc_now_iso()),
         )
+        if cur.rowcount > 0:
+            link_inserted = True
         if sanitized_tabs:
             payload = json.dumps({"profile_tabs": sanitized_tabs}, ensure_ascii=False)
             conn.execute(
@@ -681,7 +686,7 @@ def store_profile_media(
         conn.commit()
     finally:
         result.added_items = added_items
-        result.link_added = added_items > 0
+        result.link_added = link_inserted or added_items > 0
         result.metadata_targets = new_items_for_meta
         conn.close()
 

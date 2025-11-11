@@ -157,6 +157,13 @@ def test_store_profile_media_deduplicates(tmp_path: Path):
         tabs_payload = json.loads(extra_row[0])
         stored_tabs = tabs_payload.get("profile_tabs") or []
         assert stored_tabs and stored_tabs[0]["href"].endswith("/collection/1")
+
+        notified_row = conn.execute(
+            "SELECT notified_at FROM links WHERE username=?",
+            ("example",),
+        ).fetchone()
+        assert notified_row is not None
+        assert (notified_row[0] or "") == ""
     finally:
         conn.close()
 
