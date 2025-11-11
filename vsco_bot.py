@@ -112,6 +112,7 @@ from profile_link_scanner import (
     populate_media_metadata,
     store_profile_media,
 )
+from export_profile_html import ProfilePayload, build_profile_html, load_profile
 
 # ---------------------- setup & logging ----------------------
 load_dotenv()
@@ -5602,6 +5603,13 @@ async def on_text(msg: Message):
         ses.pending_action = None
         return
 
+    if ses.pending_action == "profile_export":
+        if not await ensure_user_has_access(msg):
+            return
+        await _handle_profile_export_request(msg, text)
+        ses.pending_action = None
+        return
+
     if text == "📥 Скачать профиль":
         if not await ensure_user_has_access(msg):
             return
@@ -5612,6 +5620,19 @@ async def on_text(msg: Message):
         await msg.answer(
             "Отправьте username или ссылку профиля VSCO, чтобы поставить скачивание в очередь."
             " Можно добавить флаги, например: <code>username --max 100</code>."
+        )
+        return
+
+    if text == "📑 Экспорт профиля":
+        if not await ensure_user_has_access(msg):
+            return
+        if msg.chat.type in ("group", "supergroup"):
+            await msg.answer("Экспорт профиля доступен только в личных сообщениях. Напишите мне в ЛС.")
+            return
+        ses.pending_action = "profile_export"
+        await msg.answer(
+            "Отправьте username или ссылку профиля VSCO, чтобы получить HTML-экспорт галереи."
+            " Если данных ещё нет, я соберу профиль и пришлю файл позже."
         )
         return
 
@@ -5954,6 +5975,8 @@ _PROFILE_SCAN_PENDING: set[tuple[int, str]] = set()
 _META_UPDATE_QUEUE: asyncio.Queue | None = None
 _META_WORKER_TASKS: list[asyncio.Task] = []
 
+_PROFILE_EXPORT_WAITERS: Dict[tuple[int, str], List["ProfileExportRequest"]] = {}
+
 
 async def _enqueue_download_request(
     msg: Message,
@@ -6053,6 +6076,277 @@ class MetadataJob:
     items: list[tuple[int, str]]
     username: str
     profile_url: str
+
+
+@dataclass
+class ProfileExportRequest:
+    chat_id: int
+    username: str
+    profile_url: str
+    requested_by: str = ""
+    reply_to_message_id: Optional[int] = None
+    user_id: Optional[int] = None
+
+
+def _profile_export_key(chat_id: int, username: str) -> tuple[int, str]:
+    return (chat_id, (username or "").strip().lower())
+
+
+def _register_profile_export_waiter(request: ProfileExportRequest) -> None:
+    key = _profile_export_key(request.chat_id, request.username)
+    waiters = _PROFILE_EXPORT_WAITERS.setdefault(key, [])
+    waiters.append(request)
+
+
+def _profile_export_filename(username: str) -> str:
+    base = (username or "profile").strip()
+    if not base:
+        base = "profile"
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", base)
+    timestamp = datetime.now(LOCAL_TZ).strftime("%Y%m%d_%H%M%S")
+    return f"vsco_profile_{safe}_{timestamp}.html"
+
+
+def _derive_profile_url(target: str, username: str) -> str:
+    raw = (target or "").strip()
+    candidates = [raw]
+    if raw and "://" not in raw:
+        candidates.append(f"https://{raw}")
+    for candidate in candidates:
+        if not candidate:
+            continue
+        normalized = normalize_vsco_profile_url(candidate)
+        if normalized:
+            return normalized
+        slug = vsco_short_slug(candidate)
+        if slug and ("/" in candidate or "." in candidate):
+            return build_perception_gallery_url(slug)
+    return f"https://vsco.co/{username}/gallery"
+
+
+def _load_profile_for_export(chat_id: int, username: str) -> Optional[ProfilePayload]:
+    if not username:
+        return None
+    conn = db_connect()
+    try:
+        return load_profile(conn, username, chat_id=chat_id)
+    except LookupError:
+        return None
+    except ValueError:
+        return None
+    except Exception:
+        log.exception(
+            "Failed to load profile export payload: chat_id=%s username=%s",
+            chat_id,
+            username,
+        )
+        return None
+    finally:
+        conn.close()
+
+
+async def _send_profile_export_document(
+    chat_id: int,
+    profile: ProfilePayload,
+    *,
+    requested_by: str,
+    reply_to_message_id: Optional[int],
+    fallback_username: str,
+) -> None:
+    html_payload = build_profile_html(profile)
+    filename = _profile_export_filename(profile.username or profile.profile_url)
+    document = BufferedInputFile(html_payload.encode("utf-8"), filename=filename)
+    display_username = profile.username or fallback_username or profile.profile_url or ""
+    header = (
+        f"📑 Экспорт профиля <code>@{escape(display_username)}</code>"
+        if display_username
+        else "📑 Экспорт профиля"
+    )
+    caption_parts = [
+        header,
+        f"Фото: <b>{len(profile.photos)}</b>",
+    ]
+    if requested_by:
+        caption_parts.append(f"Запрос: {escape(requested_by)}")
+    caption = "\n".join(part for part in caption_parts if part)
+    await bot.send_document(
+        chat_id,
+        document,
+        caption=caption,
+        parse_mode="HTML",
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
+async def _try_send_profile_export(
+    chat_id: int,
+    username: str,
+    *,
+    requested_by: str,
+    reply_to_message_id: Optional[int],
+) -> bool:
+    profile = _load_profile_for_export(chat_id, username)
+    if profile is None:
+        return False
+    try:
+        await _send_profile_export_document(
+            chat_id,
+            profile,
+            requested_by=requested_by,
+            reply_to_message_id=reply_to_message_id,
+            fallback_username=username,
+        )
+    except Exception:
+        log.exception(
+            "Failed to send profile export: chat_id=%s username=%s",
+            chat_id,
+            username,
+        )
+        return False
+    return True
+
+
+async def _dispatch_pending_profile_exports(chat_id: int, username: str) -> None:
+    key = _profile_export_key(chat_id, username)
+    requests = _PROFILE_EXPORT_WAITERS.pop(key, [])
+    if not requests:
+        return
+    for req in requests:
+        success = await _try_send_profile_export(
+            req.chat_id,
+            req.username,
+            requested_by=req.requested_by,
+            reply_to_message_id=req.reply_to_message_id,
+        )
+        if success:
+            continue
+        text = (
+            "❌ Пока не удалось подготовить экспорт профиля "
+            f"<code>@{escape(req.username)}</code>. Попробуйте запросить позже."
+        )
+        with contextlib.suppress(Exception):
+            await bot.send_message(
+                req.chat_id,
+                text,
+                parse_mode="HTML",
+                reply_to_message_id=req.reply_to_message_id,
+            )
+
+
+async def _notify_profile_export_failure(chat_id: int, username: str, reason: str) -> None:
+    key = _profile_export_key(chat_id, username)
+    requests = _PROFILE_EXPORT_WAITERS.pop(key, [])
+    if not requests:
+        return
+    text = (
+        "❌ Не удалось подготовить экспорт профиля "
+        f"<code>@{escape(username)}</code>. {escape(reason)}"
+        "\nПопробуйте запросить экспорт позже."
+    )
+    for req in requests:
+        with contextlib.suppress(Exception):
+            await bot.send_message(
+                req.chat_id,
+                text,
+                parse_mode="HTML",
+                reply_to_message_id=req.reply_to_message_id,
+            )
+
+
+async def _queue_profile_export(
+    msg: Message,
+    username: str,
+    profile_url: str,
+    *,
+    requested_by: str,
+) -> None:
+    chat_id = msg.chat.id
+    request = ProfileExportRequest(
+        chat_id=chat_id,
+        username=username,
+        profile_url=profile_url,
+        requested_by=requested_by,
+        reply_to_message_id=msg.message_id,
+        user_id=getattr(msg.from_user, "id", None),
+    )
+    _register_profile_export_waiter(request)
+
+    added_link = False
+    conn = db_connect()
+    try:
+        added_link = add_vsco_link_legacy(username, profile_url, chat_id, conn)
+        conn.commit()
+    except Exception:
+        log.exception(
+            "Failed to register profile link for export: chat_id=%s username=%s",
+            chat_id,
+            username,
+        )
+    finally:
+        conn.close()
+
+    if added_link:
+        await maybe_notify_new_links()
+
+    scheduled = False
+    try:
+        scheduled = await _enqueue_profile_scan(
+            ProfileScanJob(
+                chat_id=chat_id,
+                username=username,
+                profile_url=profile_url,
+                source="profile_export",
+                added_by=requested_by,
+            )
+        )
+    except Exception:
+        scheduled = False
+        log.exception(
+            "Failed to enqueue profile scan for export: chat_id=%s username=%s",
+            chat_id,
+            username,
+        )
+
+    status = (
+        "🔄 Профиль поставлен в очередь на сбор." if scheduled else "ℹ️ Профиль уже ожидает обработки."
+    )
+    text = (
+        f"Профиль <code>@{escape(username)}</code> пока не найден в базе.\n"
+        f"{status} Я пришлю HTML-файл, как только экспорт будет готов."
+    )
+    await msg.answer(text)
+
+
+async def _handle_profile_export_request(msg: Message, raw_text: str) -> None:
+    clean = (raw_text or "").strip()
+    if not clean:
+        await msg.answer("Отправьте username или ссылку на профиль VSCO для экспорта.")
+        return
+
+    username_hint = _extract_username_from_target(clean)
+    if not username_hint:
+        await msg.answer(
+            "Не распознал username или ссылку профиля VSCO. Попробуйте ещё раз."
+        )
+        return
+
+    username = username_hint.lstrip("@")
+    requested_by = resolve_added_by(msg.from_user)
+    if await _try_send_profile_export(
+        msg.chat.id,
+        username,
+        requested_by=requested_by,
+        reply_to_message_id=msg.message_id,
+    ):
+        return
+
+    profile_url = _derive_profile_url(clean, username)
+    await _queue_profile_export(
+        msg,
+        username,
+        profile_url,
+        requested_by=requested_by,
+    )
 
 
 async def _enqueue_profile_scan(job: ProfileScanJob) -> bool:
@@ -6164,8 +6458,9 @@ async def _profile_scan_worker(worker_id: int) -> None:
                         text,
                         parse_mode="HTML",
                     )
-                if result.link_added:
-                    await maybe_notify_new_links()
+            if result.link_added:
+                await maybe_notify_new_links()
+            await _dispatch_pending_profile_exports(job.chat_id, job.username)
         except asyncio.CancelledError:
             log.info("Profile scan worker #%s cancelled", worker_id)
             raise
@@ -6185,6 +6480,11 @@ async def _profile_scan_worker(worker_id: int) -> None:
                     ),
                     parse_mode="HTML",
                 )
+            await _notify_profile_export_failure(
+                job.chat_id,
+                job.username,
+                "Не удалось собрать данные профиля.",
+            )
         finally:
             _PROFILE_SCAN_PENDING.discard(key)
             if _PROFILE_SCAN_QUEUE is not None:
@@ -7141,6 +7441,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📥 Скачать профиль", callback_data="menu:download")],
+            [InlineKeyboardButton(text="📑 Экспорт профиля", callback_data="menu:profile_export")],
             [InlineKeyboardButton(text="📤 Экспорт", callback_data="menu:export")],
             [
                 InlineKeyboardButton(text="🔗 Ссылки за 24ч", callback_data="menu:links"),
@@ -7158,6 +7459,7 @@ def functions_reply_keyboard() -> ReplyKeyboardMarkup:
             [
                 KeyboardButton(text="📥 Скачать профиль"),
                 KeyboardButton(text="📤 Экспорт"),
+                KeyboardButton(text="📑 Экспорт профиля"),
             ],
             [
                 KeyboardButton(text="🔗 Ссылки за 24ч"),
@@ -7229,6 +7531,19 @@ async def on_menu_click(cq: CallbackQuery):
             "Отправьте username или ссылку профиля VSCO, чтобы поставить скачивание в очередь."
             " Можно добавить флаги, например: <code>username --max 100</code>."
         )
+        await cq.answer("Ожидаю ввод")
+        return
+
+    if action == "profile_export":
+        if cq.message and cq.message.chat.type in ("group", "supergroup"):
+            await cq.answer("Экспорт профиля доступен только в личных сообщениях. Напишите мне в ЛС.", show_alert=True)
+            return
+        ses.pending_action = "profile_export"
+        if cq.message is not None:
+            await cq.message.answer(
+                "Отправьте username или ссылку профиля VSCO, чтобы получить HTML-экспорт галереи."
+                " Если данных ещё нет, я соберу профиль и пришлю файл позже."
+            )
         await cq.answer("Ожидаю ввод")
         return
 
