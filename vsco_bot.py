@@ -5745,7 +5745,7 @@ async def cmd_links_notify_info(msg: Message, user_id: Optional[int] = None) -> 
     text = (
         "🔔 <b>Уведомления о новых ссылках</b>\n\n"
         "1. Укажите чат для рассылки через <code>BOT_LINKS_NOTIFY_CHAT_ID</code>. "
-        "Можно передать @username, числовой ID (с -100…) или ссылку вида https://t.me/c/<id>.\n"
+        "Можно передать @username, числовой ID (с -100…) или ссылку вида https://t.me/c/&lt;id&gt;.\n"
         f"2. Необязательно: задайте время ежедневного дайджеста переменной <code>BOT_LINKS_NOTIFY_AT</code> "
         f"в формате <code>HH:MM</code> (24-часовой формат, часовой пояс сервера — {LOCAL_TZ_LABEL}).\n"
         "3. При необходимости ограничьте размер одной рассылки переменной <code>BOT_LINKS_NOTIFY_LIMIT</code>.\n\n"
