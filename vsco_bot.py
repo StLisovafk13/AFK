@@ -69,7 +69,11 @@ from aiogram.types import (
     KeyboardButton,
 )
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+)
 from aiogram.utils.text_decorations import add_surrogates, remove_surrogates
 import aiohttp
 try:
@@ -1966,11 +1970,44 @@ async def _send_daily_digest(chat_id: int, *, since_iso: Optional[str] = None) -
         )
 
 
+async def _ensure_chat_available(chat_id: int) -> bool:
+    try:
+        await bot.get_chat(chat_id)
+    except TelegramForbiddenError as err:
+        log.warning(
+            "Daily digest chat %s is not accessible: forbidden (%s). Disabling digest.",
+            chat_id,
+            err,
+        )
+        return False
+    except TelegramBadRequest as err:
+        log.warning(
+            "Daily digest chat %s is not accessible: bad request (%s). Disabling digest.",
+            chat_id,
+            err,
+        )
+        return False
+    return True
+
+
 async def _daily_digest_loop() -> None:
     if DAILY_DIGEST_CHAT_ID is None or DAILY_DIGEST_TIME is None:
         return
 
     hour, minute = DAILY_DIGEST_TIME
+    try:
+        if not await _ensure_chat_available(DAILY_DIGEST_CHAT_ID):
+            return
+    except TelegramNetworkError as err:
+        log.warning(
+            "Unable to verify daily digest chat %s due to network error: %s",
+            DAILY_DIGEST_CHAT_ID,
+            err,
+        )
+    except Exception:
+        log.exception(
+            "Unexpected error while verifying daily digest chat %s", DAILY_DIGEST_CHAT_ID
+        )
     log.info(
         "Daily digest loop started for chat_id=%s at %02d:%02d %s",
         DAILY_DIGEST_CHAT_ID,
@@ -1991,6 +2028,8 @@ async def _daily_digest_loop() -> None:
             log.info("Daily digest loop cancelled")
             raise
         try:
+            if not await _ensure_chat_available(DAILY_DIGEST_CHAT_ID):
+                return
             await _send_daily_digest(DAILY_DIGEST_CHAT_ID)
         except asyncio.CancelledError:
             raise
