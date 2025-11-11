@@ -158,6 +158,25 @@ PROFILE_NORMALIZE_CONCURRENCY = max(
 )
 LINKS_NOTIFY_CHAT_ID_ENV = os.getenv("BOT_LINKS_NOTIFY_CHAT_ID", "").strip()
 LINKS_NOTIFY_AT_ENV = os.getenv("BOT_LINKS_NOTIFY_AT", "").strip()
+
+CITY_SCAN_HINT = os.getenv("BOT_CITY_SCAN_HINT", "").strip()
+if CITY_SCAN_HINT:
+    CITY_SCAN_PROMPT = f"в боте {CITY_SCAN_HINT}"
+else:
+    CITY_SCAN_PROMPT = "в другом боте сканирования"
+
+CITY_EXPORT_MAX_IMAGES_PER_USER = max(
+    1,
+    int(os.getenv("BOT_CITY_EXPORT_MAX_IMAGES", "24") or "24"),
+)
+CITY_EXPORT_MAX_POINTS = max(
+    1,
+    int(os.getenv("BOT_CITY_EXPORT_MAX_POINTS", "1500") or "1500"),
+)
+CITY_EXPORT_MAX_LIST_ITEMS = max(
+    1,
+    int(os.getenv("BOT_CITY_EXPORT_MAX_LIST_ITEMS", "120") or "120"),
+)
 try:
     LINKS_NOTIFY_LIMIT = max(
         1,
@@ -228,6 +247,59 @@ def resolve_city_label(lat: Optional[float], lon: Optional[float]) -> Optional[s
         label = f"{lat_f:.3f}, {lon_f:.3f}"
     _CITY_CACHE[key] = label
     return label or None
+
+
+_CITY_VARIANT_SPLIT_RE = re.compile(r"[\\/,;|]+")
+
+
+def _normalize_city_query(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip()).casefold()
+
+
+def _match_city_label(normalized_query: str, candidates: Iterable[str]) -> Optional[str]:
+    if not normalized_query:
+        return None
+    prepared: List[str] = [str(candidate) for candidate in candidates if candidate]
+    for entry in prepared:
+        normalized = _normalize_city_query(entry)
+        if normalized == normalized_query:
+            return entry
+        for variant in _CITY_VARIANT_SPLIT_RE.split(entry):
+            variant_clean = variant.strip()
+            if variant_clean and _normalize_city_query(variant_clean) == normalized_query:
+                return variant_clean
+    for entry in prepared:
+        normalized = _normalize_city_query(entry)
+        if normalized_query in normalized:
+            return entry
+    return None
+
+
+def _city_slug(value: str) -> str:
+    cleaned = re.sub(r"\s+", "-", value.strip())
+    cleaned = re.sub(r"[^0-9A-Za-zА-Яа-яёЁ_-]+", "-", cleaned)
+    cleaned = re.sub(r"-{2,}", "-", cleaned)
+    cleaned = cleaned.strip("-_")
+    if not cleaned:
+        cleaned = "city"
+    if len(cleaned) > 80:
+        cleaned = cleaned[:80]
+    return cleaned
+
+
+def _user_image_count(user: Dict[str, Any]) -> int:
+    value = user.get("images_count")
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except Exception:
+            pass
+    images_raw = user.get("images") or []
+    if isinstance(images_raw, (list, tuple, set)):
+        return sum(1 for item in images_raw if isinstance(item, str) and item.strip())
+    return 0
 
 
 def _safe_float(value: Any) -> Optional[float]:
@@ -5291,6 +5363,501 @@ def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"
         },
     )
 
+def build_city_gallery_map(
+    city_name: str,
+    users: List[Dict[str, Any]],
+    map_items: List[Dict[str, Any]],
+) -> str:
+    display_city = (city_name or "").strip() or "Неизвестный город"
+    safe_city = escape(display_city)
+    user_count = len(users)
+    total_images = sum(_user_image_count(user) for user in users)
+
+    points_with_coords: List[Dict[str, Any]] = []
+    for item in map_items:
+        lat_raw = item.get("lat")
+        lon_raw = item.get("lon")
+        try:
+            lat_val = float(lat_raw) if lat_raw is not None else None
+            lon_val = float(lon_raw) if lon_raw is not None else None
+        except (TypeError, ValueError):
+            lat_val = lon_val = None
+        if lat_val is None or lon_val is None:
+            continue
+        clone = dict(item)
+        clone["lat"] = lat_val
+        clone["lon"] = lon_val
+        points_with_coords.append(clone)
+
+    coords_total = len(points_with_coords)
+    limited_points = points_with_coords[:CITY_EXPORT_MAX_POINTS]
+    hidden_points = max(0, coords_total - len(limited_points))
+    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M %Z")
+    summary_text = f"{user_count} профилей • {total_images} фото • {coords_total} с координатами"
+
+    gallery_cards: List[str] = []
+    for user in users:
+        username_raw = str(user.get("username") or "").strip()
+        profile_url_raw = str(
+            user.get("profile_url")
+            or (f"https://vsco.co/{username_raw}" if username_raw else "")
+        ).strip()
+        username_display = escape(username_raw) if username_raw else ""
+        name_label = f"@{username_display}" if username_raw else "Без username"
+        profile_link = escape(profile_url_raw) if profile_url_raw else ""
+        name_html = (
+            f'<a href="{profile_link}" target="_blank" rel="noopener">{name_label}</a>'
+            if profile_link
+            else name_label
+        )
+
+        seen_urls: Set[str] = set()
+        image_urls: List[str] = []
+        for raw_url in user.get("images") or []:
+            if not isinstance(raw_url, str):
+                continue
+            trimmed = raw_url.strip()
+            if not trimmed or trimmed in seen_urls:
+                continue
+            seen_urls.add(trimmed)
+            image_urls.append(trimmed)
+            if len(image_urls) >= CITY_EXPORT_MAX_IMAGES_PER_USER:
+                break
+        thumb_elements = [
+            f'<a href="{escape(url)}" target="_blank" rel="noopener"><img src="{escape(url)}" loading="lazy" alt=""/></a>'
+            for url in image_urls
+        ]
+
+        dataset_labels: List[str] = []
+        for entry in user.get("datasets") or []:
+            if isinstance(entry, dict):
+                label = str(entry.get("label") or entry.get("value") or "")
+            else:
+                label = str(entry or "")
+            label = label.strip()
+            if label and label not in dataset_labels:
+                dataset_labels.append(label)
+
+        city_labels: List[str] = []
+        for entry in user.get("cities") or []:
+            text = str(entry or "").strip()
+            if text:
+                city_labels.append(text)
+
+        comments_clean = [
+            str(comment).strip()
+            for comment in (user.get("comments") or [])
+            if str(comment).strip()
+        ]
+        comment_preview = comments_clean[:2]
+
+        added_by_display = str(user.get("added_by") or "").strip()
+        added_by_link = str(user.get("added_by_link") or "").strip()
+        if added_by_display:
+            added_html = (
+                f'<a href="{escape(added_by_link)}" target="_blank" rel="noopener">{escape(added_by_display)}</a>'
+                if added_by_link
+                else escape(added_by_display)
+            )
+        else:
+            added_html = ""
+
+        first_created = str(user.get("first_created") or "").strip()
+        last_created = str(user.get("last_created") or "").strip()
+
+        location_count_raw = user.get("location_photo_count")
+        try:
+            location_count = int(location_count_raw or 0)
+        except Exception:
+            location_count = 0
+
+        img_total = _user_image_count(user)
+        comment_total = len(comments_clean)
+
+        card_lines = [
+            '        <article class="user-card">',
+            f'          <h3>{name_html}</h3>',
+        ]
+
+        stats_parts: List[str] = [f"📸 {img_total}"]
+        if comment_total:
+            stats_parts.append(f"💬 {comment_total}")
+        if location_count:
+            stats_parts.append(f"📍 {location_count}")
+        if stats_parts:
+            card_lines.append('          <div class="stats">')
+            for part in stats_parts:
+                card_lines.append(f'            <span>{escape(part)}</span>')
+            card_lines.append('          </div>')
+
+        if dataset_labels:
+            card_lines.append('          <div class="tags">')
+            for label in dataset_labels[:5]:
+                card_lines.append(f'            <span class="tag">{escape(label)}</span>')
+            card_lines.append('          </div>')
+
+        if city_labels:
+            card_lines.append('          <div class="chips">')
+            for label in city_labels[:5]:
+                card_lines.append(f'            <span class="chip">{escape(label)}</span>')
+            card_lines.append('          </div>')
+
+        if added_html:
+            card_lines.append(f'          <div class="meta">Добавил: {added_html}</div>')
+
+        if first_created and last_created and first_created != last_created:
+            card_lines.append(
+                f'          <div class="meta">Добавлено: {escape(first_created)} — {escape(last_created)}</div>'
+            )
+        elif last_created:
+            card_lines.append(f'          <div class="meta">Добавлено: {escape(last_created)}</div>')
+        elif first_created:
+            card_lines.append(f'          <div class="meta">Добавлено: {escape(first_created)}</div>')
+
+        if thumb_elements:
+            card_lines.append('          <div class="thumbs">')
+            for thumb in thumb_elements:
+                card_lines.append(f'            {thumb}')
+            card_lines.append('          </div>')
+        else:
+            card_lines.append('          <div class="thumbs"><div class="empty">Нет медиа в базе.</div></div>')
+
+        if comment_preview:
+            card_lines.append('          <div class="comments">')
+            for text in comment_preview:
+                card_lines.append(f'            <p>💬 {escape(text)}</p>')
+            if len(comments_clean) > len(comment_preview):
+                card_lines.append('            <p class="more">…</p>')
+            card_lines.append('          </div>')
+
+        card_lines.append('        </article>')
+        gallery_cards.append("\n".join(card_lines))
+
+    gallery_section = "\n".join(gallery_cards)
+    if not gallery_section:
+        gallery_section = '      <p class="empty">Нет профилей с указанным городом.</p>'
+    else:
+        gallery_section = '      <div class="gallery-grid">\n' + "\n".join(gallery_cards) + '\n      </div>'
+
+    map_list_items: List[str] = []
+    for point in limited_points[:CITY_EXPORT_MAX_LIST_ITEMS]:
+        username = str(point.get("username") or "").strip()
+        profile_url = str(point.get("profile_url") or "").strip()
+        image_url = str(point.get("image_url") or "").strip()
+        added_by = str(point.get("added_by") or "").strip()
+        added_link = str(point.get("added_by_link") or "").strip()
+        created_at = str(point.get("created_at") or "").strip()
+        dataset_labels_point: List[str] = []
+        for entry in point.get("datasets") or []:
+            if isinstance(entry, dict):
+                label = str(entry.get("label") or entry.get("value") or "")
+            else:
+                label = str(entry or "")
+            label = label.strip()
+            if label:
+                dataset_labels_point.append(label)
+        comments_point = [
+            str(comment).strip()
+            for comment in (point.get("comments") or [])
+            if str(comment).strip()
+        ]
+
+        item_lines = ['      <li>']
+        if image_url:
+            escaped_image = escape(image_url)
+            item_lines.append(
+                f'        <a class="map-thumb" href="{escaped_image}" target="_blank" rel="noopener"><img src="{escaped_image}" loading="lazy" alt=""/></a>'
+            )
+        else:
+            item_lines.append('        <div class="map-thumb">📍</div>')
+
+        item_lines.append('        <div class="map-info">')
+        if username or profile_url:
+            if profile_url:
+                label = f'@{escape(username)}' if username else 'Профиль'
+                item_lines.append(
+                    f'          <a href="{escape(profile_url)}" target="_blank" rel="noopener">{label}</a>'
+                )
+            elif username:
+                item_lines.append(f'          @{escape(username)}')
+        if created_at:
+            item_lines.append(f'          <span>Добавлено: {escape(created_at)}</span>')
+        if added_by:
+            if added_link:
+                item_lines.append(
+                    f'          <span>Добавил: <a href="{escape(added_link)}" target="_blank" rel="noopener">{escape(added_by)}</a></span>'
+                )
+            else:
+                item_lines.append(f'          <span>Добавил: {escape(added_by)}</span>')
+        if dataset_labels_point:
+            datasets_html = ", ".join(escape(label) for label in dataset_labels_point[:3])
+            item_lines.append(f'          <span>💾 {datasets_html}</span>')
+        if comments_point:
+            item_lines.append(f'          <span>💬 {escape(comments_point[0])}</span>')
+        item_lines.append('        </div>')
+        item_lines.append('      </li>')
+        map_list_items.append("\n".join(item_lines))
+
+    map_note = ""
+    if hidden_points > 0:
+        map_note = (
+            f"Показано {len(limited_points)} из {coords_total} точек. "
+            "Сузьте область экспорта, чтобы получить полный список."
+        )
+
+    payload: List[Dict[str, Any]] = []
+    for point in limited_points:
+        dataset_payload: List[str] = []
+        for entry in point.get("datasets") or []:
+            if isinstance(entry, dict):
+                label = str(entry.get("label") or entry.get("value") or "")
+            else:
+                label = str(entry or "")
+            label = label.strip()
+            if label:
+                dataset_payload.append(label)
+        comments_payload = [
+            str(comment).strip()
+            for comment in (point.get("comments") or [])
+            if str(comment).strip()
+        ]
+        payload.append(
+            {
+                "lat": point.get("lat"),
+                "lon": point.get("lon"),
+                "username": str(point.get("username") or ""),
+                "profile_url": str(point.get("profile_url") or ""),
+                "image_url": str(point.get("image_url") or ""),
+                "datasets": dataset_payload,
+                "added_by": str(point.get("added_by") or ""),
+                "added_by_link": str(point.get("added_by_link") or ""),
+                "comments": comments_payload,
+                "created_at": str(point.get("created_at") or ""),
+            }
+        )
+
+    map_data_json = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
+
+    html_parts: List[str] = []
+    html_parts.append("<!DOCTYPE html>")
+    html_parts.append("<html>")
+    html_parts.append("<head>")
+    html_parts.append('  <meta charset="utf-8"/>')
+    html_parts.append('  <meta name="viewport" content="width=device-width, initial-scale=1"/>')
+    html_parts.append(f'  <title>VSCO — {safe_city}</title>')
+    html_parts.append('  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>')
+    html_parts.append('  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>')
+    html_parts.append('  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>')
+    html_parts.append('  <style>')
+    html_parts.append('    :root { color-scheme: light; }')
+    html_parts.append('    * { box-sizing: border-box; }')
+    html_parts.append('    body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:#f8fafc; color:#0f172a; margin:0; }')
+    html_parts.append('    a { color:#2563eb; }')
+    html_parts.append('    a:hover { text-decoration: underline; }')
+    html_parts.append('    .container { max-width:1280px; margin:0 auto; padding:32px 20px 72px; }')
+    html_parts.append('    .page-head { text-align:center; margin-bottom:36px; }')
+    html_parts.append('    .page-head h1 { margin:0; font-size:36px; font-weight:700; }')
+    html_parts.append('    .page-head .summary { margin-top:8px; color:#475569; font-size:15px; }')
+    html_parts.append('    .page-head .meta { margin-top:6px; color:#94a3b8; font-size:13px; }')
+    html_parts.append('    .section { margin-bottom:48px; }')
+    html_parts.append('    .section h2 { margin:0 0 18px; font-size:24px; font-weight:700; color:#0f172a; }')
+    html_parts.append('    .gallery-grid { display:grid; grid-template-columns: repeat(auto-fill,minmax(280px,1fr)); gap:20px; }')
+    html_parts.append('    .user-card { background:#fff; border-radius:20px; box-shadow:0 20px 40px rgba(15,23,42,0.12); padding:20px; display:flex; flex-direction:column; gap:12px; }')
+    html_parts.append('    .user-card h3 { margin:0; font-size:18px; }')
+    html_parts.append('    .user-card h3 a { color:#0f172a; text-decoration:none; }')
+    html_parts.append('    .user-card h3 a:hover { text-decoration:underline; }')
+    html_parts.append('    .user-card .stats { display:flex; flex-wrap:wrap; gap:10px; font-size:13px; color:#0f172a; }')
+    html_parts.append('    .user-card .stats span { display:inline-flex; align-items:center; gap:6px; background:#e2e8f0; padding:4px 10px; border-radius:999px; }')
+    html_parts.append('    .user-card .stats span:last-child { background:#dbeafe; color:#1d4ed8; }')
+    html_parts.append('    .user-card .tags, .user-card .chips { display:flex; flex-wrap:wrap; gap:6px; }')
+    html_parts.append('    .user-card .tag { background:#f3f4f6; padding:4px 8px; border-radius:999px; font-size:11px; color:#475569; }')
+    html_parts.append('    .user-card .chip { background:#dbeafe; color:#1d4ed8; padding:4px 10px; border-radius:999px; font-size:11px; }')
+    html_parts.append('    .user-card .thumbs { display:flex; flex-wrap:wrap; gap:8px; }')
+    html_parts.append('    .user-card .thumbs a { flex:0 0 auto; }')
+    html_parts.append('    .user-card .thumbs img { width:88px; height:120px; object-fit:cover; border-radius:14px; border:1px solid #e2e8f0; background:#f8fafc; }')
+    html_parts.append('    .user-card .empty { font-size:12px; color:#94a3b8; }')
+    html_parts.append('    .user-card .meta { font-size:12px; color:#64748b; }')
+    html_parts.append('    .user-card .comments p { margin:0; font-size:13px; color:#475569; }')
+    html_parts.append('    .user-card .comments p + p { margin-top:6px; }')
+    html_parts.append('    .user-card .comments .more { color:#94a3b8; font-size:12px; }')
+    html_parts.append('    .map-wrap { background:#fff; border-radius:20px; box-shadow:0 20px 40px rgba(15,23,42,0.12); overflow:hidden; }')
+    html_parts.append('    #cityMap { width:100%; height:460px; background:#e2e8f0; }')
+    html_parts.append('    .map-empty { text-align:center; color:#94a3b8; margin:16px 0 0; }')
+    html_parts.append('    .map-note { margin-top:12px; color:#94a3b8; font-size:12px; }')
+    html_parts.append('    .map-list { list-style:none; margin:20px 0 0; padding:0; display:grid; gap:12px; }')
+    html_parts.append('    .map-list li { background:#fff; border-radius:16px; box-shadow:0 16px 32px rgba(15,23,42,0.1); padding:12px 16px; display:flex; gap:12px; align-items:center; }')
+    html_parts.append('    .map-thumb { width:78px; height:78px; border-radius:12px; border:1px solid #e2e8f0; background:#f8fafc; object-fit:cover; flex:0 0 auto; display:flex; align-items:center; justify-content:center; font-size:24px; color:#94a3b8; text-decoration:none; }')
+    html_parts.append('    .map-thumb img { width:100%; height:100%; object-fit:cover; border-radius:12px; }')
+    html_parts.append('    .map-info { display:flex; flex-direction:column; gap:4px; font-size:13px; color:#475569; }')
+    html_parts.append('    .empty { color:#94a3b8; font-size:14px; text-align:center; background:#fff; border-radius:20px; padding:32px; box-shadow:0 16px 32px rgba(15,23,42,0.08); }')
+    html_parts.append('    .hidden { display:none; }')
+    html_parts.append('    @media (max-width: 720px) { .user-card .thumbs img { width:72px; height:104px; } .map-list { grid-template-columns:1fr; } .map-list li { flex-direction:column; align-items:flex-start; } .map-thumb { width:100%; height:180px; } }')
+    html_parts.append('  </style>')
+    html_parts.append('</head>')
+    html_parts.append('<body>')
+    html_parts.append('  <main class="container">')
+    html_parts.append('    <header class="page-head">')
+    html_parts.append(f'      <h1>🏙️ {safe_city}</h1>')
+    html_parts.append(f'      <div class="summary">{escape(summary_text)}</div>')
+    html_parts.append(f'      <div class="meta">Генерировано {escape(generated_at)}</div>')
+    html_parts.append('    </header>')
+    html_parts.append('    <section class="section gallery-section">')
+    html_parts.append('      <h2>Галерея</h2>')
+    html_parts.append(gallery_section)
+    html_parts.append('    </section>')
+    html_parts.append('    <section class="section map-section">')
+    html_parts.append('      <h2>Карта</h2>')
+    html_parts.append('      <div class="map-wrap">')
+    html_parts.append('        <div id="cityMap"></div>')
+    html_parts.append('      </div>')
+    html_parts.append('      <p id="mapEmpty" class="map-empty hidden">По этому городу нет точек с координатами.</p>')
+    if map_note:
+        html_parts.append(f'      <p class="map-note">{escape(map_note)}</p>')
+    if map_list_items:
+        html_parts.append('      <ul class="map-list">')
+        html_parts.extend(map_list_items)
+        html_parts.append('      </ul>')
+    html_parts.append('    </section>')
+    html_parts.append('  </main>')
+    html_parts.append(f'  <script type="application/json" id="city-map-data">{map_data_json}</script>')
+    html_parts.append('  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>')
+    html_parts.append('  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>')
+    html_parts.append('  <script>')
+    html_parts.append('    (function() {')
+    html_parts.append("      const escapeHtml = value => {")
+    html_parts.append("        const replacements = {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'};")
+    html_parts.append("        return String(value ?? '').replace(/[&<>\"']/g, char => {")
+    html_parts.append("""          if (char === "'") return '&#39;';""")
+    html_parts.append("          return replacements[char] || char;")
+    html_parts.append("        });")
+    html_parts.append("      };")
+    html_parts.append("      function init() {")
+    html_parts.append("        const dataNode = document.getElementById('city-map-data');")
+    html_parts.append('        let points = [];')
+    html_parts.append('        if (dataNode) {')
+    html_parts.append("          try { points = JSON.parse(dataNode.textContent || '[]'); } catch (err) { console.error('City map data parse error', err); }")
+    html_parts.append('        }')
+    html_parts.append("        const mapContainer = document.getElementById('cityMap');")
+    html_parts.append("        const emptyNode = document.getElementById('mapEmpty');")
+    html_parts.append('        if (!mapContainer || typeof L === "undefined") {')
+    html_parts.append('          if (emptyNode) {')
+    html_parts.append("            emptyNode.textContent = 'Не удалось загрузить карту.';")
+    html_parts.append('            emptyNode.classList.remove("hidden");')
+    html_parts.append('          }')
+    html_parts.append('          return;')
+    html_parts.append('        }')
+    html_parts.append('        const valid = points.filter(point => typeof point.lat === "number" && typeof point.lon === "number");')
+    html_parts.append("        const map = L.map(mapContainer, { preferCanvas: true });")
+    html_parts.append("        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap contributors', maxZoom: 19, minZoom: 1, updateWhenIdle: true, keepBuffer: 4 }).addTo(map);")
+    html_parts.append('        if (!valid.length) {')
+    html_parts.append('          if (emptyNode) emptyNode.classList.remove("hidden");')
+    html_parts.append('          map.setView([20, 0], 2);')
+    html_parts.append('          return;')
+    html_parts.append('        }')
+    html_parts.append('        if (emptyNode) emptyNode.classList.add("hidden");')
+    html_parts.append('        let cluster = null;')
+    html_parts.append('        if (typeof L.markerClusterGroup === "function") {')
+    html_parts.append('          cluster = L.markerClusterGroup({ chunkedLoading: true, chunkDelay: 20, chunkInterval: 200, spiderfyDistanceMultiplier: 1.1 });')
+    html_parts.append('        }')
+    html_parts.append('        const bounds = [];')
+    html_parts.append('        valid.forEach(point => {')
+    html_parts.append('          const marker = L.marker([point.lat, point.lon]);')
+    html_parts.append('          const parts = [];')
+    html_parts.append('          const username = point.username ? escapeHtml(point.username) : "";')
+    html_parts.append('          const profileUrl = point.profile_url ? escapeHtml(point.profile_url) : "";')
+    html_parts.append('          if (username || profileUrl) {')
+    html_parts.append('            if (profileUrl) {')
+    html_parts.append('              const label = username ? "@" + username : "Профиль";')
+    html_parts.append('              parts.push("<div><a href=\"" + profileUrl + "\" target=\"_blank\" rel=\"noopener\"><strong>" + label + "</strong></a></div>");')
+    html_parts.append('            } else if (username) {')
+    html_parts.append('              parts.push("<div><strong>@" + username + "</strong></div>");')
+    html_parts.append('            }')
+    html_parts.append('          }')
+    html_parts.append('          if (point.image_url) {')
+    html_parts.append('            const imgUrl = escapeHtml(point.image_url);')
+    html_parts.append('            parts.push("<div style=\"margin-top:8px;\"><img src=\"" + imgUrl + "\" loading=\"lazy\" style=\"width:140px;height:140px;object-fit:cover;border-radius:12px;border:1px solid #e2e8f0;\"/></div>");')
+    html_parts.append('          }')
+    html_parts.append('          if (Array.isArray(point.datasets) && point.datasets.length) {')
+    html_parts.append('            const tags = point.datasets.map(value => "<span style=\"display:inline-block;background:#f3f4f6;border-radius:999px;padding:2px 8px;margin:2px;font-size:11px;color:#475569;\">" + escapeHtml(value) + "</span>").join("");')
+    html_parts.append('            parts.push("<div style=\"margin-top:8px;\">💾 " + tags + "</div>");')
+    html_parts.append('          }')
+    html_parts.append('          if (point.added_by) {')
+    html_parts.append('            const added = escapeHtml(point.added_by);')
+    html_parts.append('            if (point.added_by_link) {')
+    html_parts.append('              const link = escapeHtml(point.added_by_link);')
+    html_parts.append('              parts.push("<div style=\"margin-top:6px;\">Добавил: <a href=\"" + link + "\" target=\"_blank\" rel=\"noopener\">" + added + "</a></div>");')
+    html_parts.append('            } else {')
+    html_parts.append('              parts.push("<div style=\"margin-top:6px;\">Добавил: " + added + "</div>");')
+    html_parts.append('            }')
+    html_parts.append('          }')
+    html_parts.append('          if (point.created_at) {')
+    html_parts.append('            parts.push("<div style=\"margin-top:6px;font-size:12px;color:#94a3b8;\">Добавлено: " + escapeHtml(point.created_at) + "</div>");')
+    html_parts.append('          }')
+    html_parts.append('          if (Array.isArray(point.comments) && point.comments.length) {')
+    html_parts.append('            parts.push("<div style=\"margin-top:6px;font-size:12px;\">💬 " + escapeHtml(point.comments[0]) + "</div>");')
+    html_parts.append('          }')
+    html_parts.append('          marker.bindPopup(parts.join(""));')
+    html_parts.append('          if (cluster) {')
+    html_parts.append('            cluster.addLayer(marker);')
+    html_parts.append('          } else {')
+    html_parts.append('            marker.addTo(map);')
+    html_parts.append('          }')
+    html_parts.append('          bounds.push([point.lat, point.lon]);')
+    html_parts.append('        });')
+    html_parts.append('        if (cluster) {')
+    html_parts.append('          map.addLayer(cluster);')
+    html_parts.append('        }')
+    html_parts.append('        if (bounds.length) {')
+    html_parts.append('          const boundsObj = L.latLngBounds(bounds);')
+    html_parts.append('          if (boundsObj.isValid()) {')
+    html_parts.append('            map.fitBounds(boundsObj.pad(0.1));')
+    html_parts.append('          } else {')
+    html_parts.append('            map.setView([20, 0], 2);')
+    html_parts.append('          }')
+    html_parts.append('        } else {')
+    html_parts.append('          map.setView([20, 0], 2);')
+    html_parts.append('        }')
+    html_parts.append('      }')
+    html_parts.append('      if (document.readyState === "complete") {')
+    html_parts.append('        init();')
+    html_parts.append('      } else {')
+    html_parts.append('        window.addEventListener("load", init);')
+    html_parts.append('      }')
+    html_parts.append('    })();')
+    html_parts.append('  </script>')
+    html_parts.append('</body>')
+    html_parts.append('</html>')
+    return "\n".join(html_parts)
+
+
+def collect_city_export_data(
+    scope: str, chat_id: int, city_query: str
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Optional[str]]:
+    normalized_query = _normalize_city_query(city_query)
+    if not normalized_query:
+        return [], [], None
+
+    matched_label: Optional[str] = None
+    users: List[Dict[str, Any]] = []
+    for user in fetch_gallery_users(scope, chat_id):
+        cities = user.get("cities") or []
+        candidate = _match_city_label(normalized_query, cities)
+        if candidate:
+            if matched_label is None:
+                matched_label = candidate
+            users.append(user)
+
+    matching_items: List[Dict[str, Any]] = []
+    for item in fetch_items_for_map(scope, chat_id):
+        cities = item.get("cities") or []
+        candidate = _match_city_label(normalized_query, cities)
+        if candidate:
+            if matched_label is None:
+                matched_label = candidate
+            matching_items.append(item)
+
+    return users, matching_items, matched_label
+
 # ---------------------- Bot ----------------------
 if not TOKEN: raise SystemExit("TELEGRAM_BOT_TOKEN is not set")
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
@@ -5349,6 +5916,7 @@ async def mirror_export_to_admin(
         "gallery": "Галерея",
         "map_users": "Карта (польз.)",
         "map_images": "Карта (фото)",
+        "city": "Город",
     }
     fmt_label = fmt_labels.get(export_format, export_format)
     user_label = _format_export_initiator(user)
@@ -5388,6 +5956,58 @@ async def mirror_export_to_admin(
             log.exception("Export mirror failed for %s", path)
     except Exception:
         log.exception("Export mirror failed for %s", path)
+
+
+async def _handle_city_export_request(msg: Message, city_raw: str) -> None:
+    city = city_raw.strip()
+    if not city:
+        await msg.answer("Введите название города текстом.")
+        return
+
+    ses = get_session(msg.chat.id)
+    users, map_items, matched_label = collect_city_export_data(
+        ses.export_scope,
+        msg.chat.id,
+        city,
+    )
+    if not users and not map_items:
+        await msg.answer(
+            "По городу <b>{}</b> данных пока нет. Попробуйте отсканировать город {}.".format(
+                escape(city),
+                escape(CITY_SCAN_PROMPT),
+            )
+        )
+        return
+
+    display_city = matched_label or city
+    html = build_city_gallery_map(display_city, users, map_items)
+    slug = _city_slug(display_city)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filename = f"city_{slug}_{timestamp}.html" if slug else f"city_{timestamp}.html"
+    output = ses.dir / filename
+    output.write_text(html, encoding="utf-8")
+
+    total_users = len(users)
+    total_photos = sum(_user_image_count(user) for user in users)
+    caption = f"🏙️ {display_city} — профилей: {total_users}, фото: {total_photos}"
+
+    await msg.answer_document(
+        FSInputFile(output, filename=output.name),
+        caption=caption[:1024],
+        request_timeout=SEND_TIMEOUT,
+    )
+
+    chat_title = getattr(msg.chat, "title", None) or getattr(msg.chat, "full_name", None)
+    await mirror_export_to_admin(
+        output,
+        caption,
+        msg.chat.id,
+        ses.export_scope,
+        "city",
+        False,
+        chat_title,
+        msg.from_user,
+    )
 
 
 export_manager = ExportManager(
@@ -5607,6 +6227,13 @@ async def on_text(msg: Message):
         if not await ensure_user_has_access(msg):
             return
         await _handle_profile_export_request(msg, text)
+        ses.pending_action = None
+        return
+
+    if ses.pending_action == "city_export":
+        if not await ensure_user_has_access(msg):
+            return
+        await _handle_city_export_request(msg, text)
         ses.pending_action = None
         return
 
