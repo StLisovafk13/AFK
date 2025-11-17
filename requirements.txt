@@ -1,0 +1,9 @@
+aiohttp>=3.8
+aiogram>=3.3
+beautifulsoup4>=4.12
+openpyxl>=3.1
+pandas>=2.1
+playwright>=1.41
+pytest>=7.4
+python-dotenv>=1.0
+reverse_geocoder>=1.5
