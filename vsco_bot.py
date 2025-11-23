@@ -6547,12 +6547,18 @@ async def _profile_scan_worker(worker_id: int) -> None:
                 )
 
             if result.added_items == 1 and result.media_urls:
-                log.info(
-                    "Only one new link added for %s, retrying with refreshed cookies",
-                    job.profile_url,
-                )
-                rescan_result = await _rescan_profile_with_fresh_cookies(job)
-                if rescan_result:
+                attempt = 0
+                while attempt < 10:
+                    attempt += 1
+                    log.info(
+                        "Only one new link added for %s, retrying with refreshed cookies (attempt %s/10)",
+                        job.profile_url,
+                        attempt,
+                    )
+                    rescan_result = await _rescan_profile_with_fresh_cookies(job)
+                    if not rescan_result:
+                        continue
+
                     if rescan_result.metadata_targets:
                         await _enqueue_metadata_job(
                             MetadataJob(
@@ -6573,6 +6579,9 @@ async def _profile_scan_worker(worker_id: int) -> None:
                     for warning in rescan_result.warnings:
                         if warning not in result.warnings:
                             result.warnings.append(warning)
+
+                    if rescan_result.added_items > 0:
+                        break
             if result.added_items > 0 or not result.media_urls:
                 total = len(result.media_urls)
                 text = (
