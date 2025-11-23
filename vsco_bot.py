@@ -6546,6 +6546,31 @@ async def _profile_scan_worker(worker_id: int) -> None:
                     )
                 )
 
+            async def _merge_rescan_result(rescan_result: ScanResult) -> None:
+                if rescan_result.metadata_targets:
+                    await _enqueue_metadata_job(
+                        MetadataJob(
+                            items=rescan_result.metadata_targets,
+                            username=job.username,
+                            profile_url=job.profile_url,
+                        )
+                    )
+                result.media_urls = dedupe_keep_order(
+                    result.media_urls + rescan_result.media_urls
+                )
+                result.added_items += rescan_result.added_items
+                result.link_added = result.link_added or rescan_result.link_added
+                if rescan_result.profile_tabs:
+                    result.profile_tabs = rescan_result.profile_tabs
+                if rescan_result.media_by_tab:
+                    result.media_by_tab.update(rescan_result.media_by_tab)
+                if rescan_result.warnings:
+                    for warning in rescan_result.warnings:
+                        if warning not in result.warnings:
+                            result.warnings.append(warning)
+                else:
+                    result.warnings = []
+
             if result.added_items == 1 and result.media_urls:
                 attempt = 0
                 while attempt < 10:
@@ -6559,28 +6584,26 @@ async def _profile_scan_worker(worker_id: int) -> None:
                     if not rescan_result:
                         continue
 
-                    if rescan_result.metadata_targets:
-                        await _enqueue_metadata_job(
-                            MetadataJob(
-                                items=rescan_result.metadata_targets,
-                                username=job.username,
-                                profile_url=job.profile_url,
-                            )
-                        )
-                    result.media_urls = dedupe_keep_order(
-                        result.media_urls + rescan_result.media_urls
-                    )
-                    result.added_items += rescan_result.added_items
-                    result.link_added = result.link_added or rescan_result.link_added
-                    if rescan_result.profile_tabs:
-                        result.profile_tabs = rescan_result.profile_tabs
-                    if rescan_result.media_by_tab:
-                        result.media_by_tab.update(rescan_result.media_by_tab)
-                    for warning in rescan_result.warnings:
-                        if warning not in result.warnings:
-                            result.warnings.append(warning)
+                    await _merge_rescan_result(rescan_result)
 
                     if rescan_result.added_items > 0:
+                        break
+            if result.warnings:
+                attempt = 0
+                while attempt < 10 and result.warnings:
+                    attempt += 1
+                    log.info(
+                        "Profile flagged as partially scanned for %s, refreshing cookies (attempt %s/10)",
+                        job.profile_url,
+                        attempt,
+                    )
+                    rescan_result = await _rescan_profile_with_fresh_cookies(job)
+                    if not rescan_result:
+                        continue
+
+                    await _merge_rescan_result(rescan_result)
+
+                    if not result.warnings:
                         break
             if result.added_items > 0 or not result.media_urls:
                 total = len(result.media_urls)
