@@ -34,7 +34,18 @@ from collections import Counter
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Dict, Any, Tuple, Sequence, Set
+from typing import (
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Dict,
+    Any,
+    Tuple,
+    Sequence,
+    Set,
+    Callable,
+)
 from datetime import datetime, timedelta, timezone, time as dtime
 from urllib.parse import (
     urljoin,
@@ -104,6 +115,11 @@ from vsco_utils import (
     scan_profile_media,
     playwright_scan_profile,
     upscale_w_param,
+)
+from exif_fetcher import (
+    ExifExtractionError,
+    extract_exif_from_url,
+    extract_exif_with_playwright,
 )
 from profile_link_scanner import (
     ProfileMediaCollection,
@@ -6078,6 +6094,33 @@ class MetadataJob:
     profile_url: str
 
 
+def _build_metadata_fetcher(profile_url: str) -> Callable[[str], Dict[str, Any]]:
+    referer = profile_url or "https://vsco.co/"
+
+    def fetch(url: str) -> Dict[str, Any]:
+        try:
+            return extract_exif_from_url(url, referer=referer)
+        except ExifExtractionError as exc:
+            log.warning(
+                "EXIF через curl не получен для %s (referer=%s): %s. Пробуем Playwright.",
+                url,
+                referer,
+                exc,
+            )
+        try:
+            return extract_exif_with_playwright(url, referer=referer)
+        except Exception as exc:
+            log.debug(
+                "Playwright тоже не смог вытащить EXIF для %s (referer=%s): %s",
+                url,
+                referer,
+                exc,
+            )
+            raise
+
+    return fetch
+
+
 @dataclass
 class ProfileExportRequest:
     chat_id: int
@@ -6501,10 +6544,12 @@ async def _metadata_worker(worker_id: int) -> None:
         job: MetadataJob = await _META_UPDATE_QUEUE.get()
         try:
             if job.items:
+                meta_fetcher = _build_metadata_fetcher(job.profile_url)
                 await asyncio.to_thread(
                     populate_media_metadata,
                     Path(DB_PATH),
                     job.items,
+                    meta_fetcher=meta_fetcher,
                 )
         except asyncio.CancelledError:
             log.info("Metadata worker #%s cancelled", worker_id)
