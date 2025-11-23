@@ -122,6 +122,7 @@ from exif_fetcher import (
     extract_exif_with_playwright,
 )
 from profile_link_scanner import (
+    DEFAULT_USER_AGENT,
     ProfileMediaCollection,
     ScanResult,
     collect_profile_media,
@@ -6121,6 +6122,65 @@ def _build_metadata_fetcher(profile_url: str) -> Callable[[str], Dict[str, Any]]
     return fetch
 
 
+async def _rescan_profile_with_fresh_cookies(
+    job: ProfileScanJob,
+    *,
+    delay: float = 0.4,
+) -> Optional[ScanResult]:
+    """Retry profile scan with a fresh cookie jar when only one new link is found."""
+
+    fresh_ua = f"{DEFAULT_USER_AGENT} ({secrets.token_hex(4)})"
+    headers = {
+        "User-Agent": fresh_ua,
+        "Cache-Control": "no-cache",
+    }
+
+    try:
+        collected = await collect_profile_media(
+            job.profile_url,
+            max_width=MEDIA_PAGE_MAX_WIDTH,
+            delay=delay,
+            include_details=True,
+            headers=headers,
+        )
+    except Exception:
+        log.warning(
+            "Rescan with refreshed cookies failed for %s", job.profile_url, exc_info=True
+        )
+        return None
+
+    if isinstance(collected, ProfileMediaCollection):
+        media_urls = collected.media_urls
+        profile_tabs = collected.profile_tabs
+        media_by_tab = collected.media_by_tab
+        warnings = collected.warnings
+    else:
+        media_urls = collected
+        profile_tabs = []
+        media_by_tab = None
+        warnings = []
+
+    if not media_urls:
+        return None
+
+    log.info(
+        "Refreshing cookies yielded %d media link(s) for %s", len(media_urls), job.username
+    )
+
+    return store_profile_media(
+        Path(DB_PATH),
+        job.chat_id,
+        job.username,
+        job.profile_url,
+        media_urls,
+        source=f"{job.source}-cookies-refresh",
+        added_by=job.added_by,
+        profile_tabs=profile_tabs,
+        media_by_tab=media_by_tab,
+        warnings=warnings,
+    )
+
+
 @dataclass
 class ProfileExportRequest:
     chat_id: int
@@ -6485,6 +6545,34 @@ async def _profile_scan_worker(worker_id: int) -> None:
                         profile_url=job.profile_url,
                     )
                 )
+
+            if result.added_items == 1 and result.media_urls:
+                log.info(
+                    "Only one new link added for %s, retrying with refreshed cookies",
+                    job.profile_url,
+                )
+                rescan_result = await _rescan_profile_with_fresh_cookies(job)
+                if rescan_result:
+                    if rescan_result.metadata_targets:
+                        await _enqueue_metadata_job(
+                            MetadataJob(
+                                items=rescan_result.metadata_targets,
+                                username=job.username,
+                                profile_url=job.profile_url,
+                            )
+                        )
+                    result.media_urls = dedupe_keep_order(
+                        result.media_urls + rescan_result.media_urls
+                    )
+                    result.added_items += rescan_result.added_items
+                    result.link_added = result.link_added or rescan_result.link_added
+                    if rescan_result.profile_tabs:
+                        result.profile_tabs = rescan_result.profile_tabs
+                    if rescan_result.media_by_tab:
+                        result.media_by_tab.update(rescan_result.media_by_tab)
+                    for warning in rescan_result.warnings:
+                        if warning not in result.warnings:
+                            result.warnings.append(warning)
             if result.added_items > 0 or not result.media_urls:
                 total = len(result.media_urls)
                 text = (
