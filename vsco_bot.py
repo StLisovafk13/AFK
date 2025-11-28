@@ -91,6 +91,7 @@ except Exception:  # pragma: no cover - optional dependency
 import sys
 import contextlib
 import shlex
+import socket
 
 # ---- external utils (optional HTML export parser) ----
 from vsco_parser import parse_html_file, dedupe_rows
@@ -577,6 +578,27 @@ def setup_logging():
 
 setup_logging()
 log = logging.getLogger("vsco-bot")
+
+
+def _get_instance_ip_address() -> Optional[str]:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            ip = sock.getsockname()[0]
+            if ip:
+                return ip
+    except Exception:
+        log.debug("Failed to detect IP via UDP socket", exc_info=True)
+
+    try:
+        hostname = socket.gethostname()
+        ip = socket.gethostbyname(hostname)
+        if ip:
+            return ip
+    except Exception:
+        log.debug("Failed to resolve hostname IP", exc_info=True)
+
+    return None
 
 
 def _parse_links_notify_time(raw: str) -> Optional[dtime]:
@@ -7775,9 +7797,29 @@ async def _start_polling_with_retries(*, max_attempts: Optional[int] = None) -> 
             raise
 
 
+async def _notify_startup_ip(ip_address: Optional[str]) -> None:
+    targets: Set[int | str] = set()
+    if ARCHIVE_ADMIN_CHANNEL_ID:
+        targets.add(ARCHIVE_ADMIN_CHANNEL_ID)
+    targets.update(BOT_ADMIN_IDS)
+
+    if not targets:
+        return
+
+    ip_label = ip_address or "не удалось определить"
+    text = f"🤖 Бот запущен.\nIP: <code>{escape(ip_label)}</code>"
+
+    for chat_id in targets:
+        try:
+            await bot.send_message(chat_id, text, disable_web_page_preview=True)
+        except Exception:
+            log.warning("Failed to send startup IP to %s", chat_id, exc_info=True)
+
+
 async def main():
     init_db()
     await bot.delete_webhook(drop_pending_updates=True)
+    await _notify_startup_ip(_get_instance_ip_address())
     # --- start download worker ---
     global _DL_WORKER_TASK, _DL_QUEUE
     if _DL_QUEUE is None:
