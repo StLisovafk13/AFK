@@ -34,7 +34,18 @@ from collections import Counter
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Dict, Any, Tuple, Sequence, Set
+from typing import (
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Dict,
+    Any,
+    Tuple,
+    Sequence,
+    Set,
+    Callable,
+)
 from datetime import datetime, timedelta, timezone, time as dtime
 from urllib.parse import (
     urljoin,
@@ -105,7 +116,13 @@ from vsco_utils import (
     playwright_scan_profile,
     upscale_w_param,
 )
+from exif_fetcher import (
+    ExifExtractionError,
+    extract_exif_from_url,
+    extract_exif_with_playwright,
+)
 from profile_link_scanner import (
+    DEFAULT_USER_AGENT,
     ProfileMediaCollection,
     ScanResult,
     collect_profile_media,
@@ -6078,6 +6095,92 @@ class MetadataJob:
     profile_url: str
 
 
+def _build_metadata_fetcher(profile_url: str) -> Callable[[str], Dict[str, Any]]:
+    referer = profile_url or "https://vsco.co/"
+
+    def fetch(url: str) -> Dict[str, Any]:
+        try:
+            return extract_exif_from_url(url, referer=referer)
+        except ExifExtractionError as exc:
+            log.warning(
+                "EXIF через curl не получен для %s (referer=%s): %s. Пробуем Playwright.",
+                url,
+                referer,
+                exc,
+            )
+        try:
+            return extract_exif_with_playwright(url, referer=referer)
+        except Exception as exc:
+            log.debug(
+                "Playwright тоже не смог вытащить EXIF для %s (referer=%s): %s",
+                url,
+                referer,
+                exc,
+            )
+            raise
+
+    return fetch
+
+
+async def _rescan_profile_with_fresh_cookies(
+    job: ProfileScanJob,
+    *,
+    delay: float = 0.4,
+) -> Optional[ScanResult]:
+    """Retry profile scan with a fresh cookie jar when only one new link is found."""
+
+    fresh_ua = f"{DEFAULT_USER_AGENT} ({secrets.token_hex(4)})"
+    headers = {
+        "User-Agent": fresh_ua,
+        "Cache-Control": "no-cache",
+    }
+
+    try:
+        collected = await collect_profile_media(
+            job.profile_url,
+            max_width=MEDIA_PAGE_MAX_WIDTH,
+            delay=delay,
+            include_details=True,
+            headers=headers,
+        )
+    except Exception:
+        log.warning(
+            "Rescan with refreshed cookies failed for %s", job.profile_url, exc_info=True
+        )
+        return None
+
+    if isinstance(collected, ProfileMediaCollection):
+        media_urls = collected.media_urls
+        profile_tabs = collected.profile_tabs
+        media_by_tab = collected.media_by_tab
+        warnings = collected.warnings
+    else:
+        media_urls = collected
+        profile_tabs = []
+        media_by_tab = None
+        warnings = []
+
+    if not media_urls:
+        return None
+
+    log.info(
+        "Refreshing cookies yielded %d media link(s) for %s", len(media_urls), job.username
+    )
+
+    return store_profile_media(
+        Path(DB_PATH),
+        job.chat_id,
+        job.username,
+        job.profile_url,
+        media_urls,
+        source=f"{job.source}-cookies-refresh",
+        added_by=job.added_by,
+        profile_tabs=profile_tabs,
+        media_by_tab=media_by_tab,
+        warnings=warnings,
+    )
+
+
 @dataclass
 class ProfileExportRequest:
     chat_id: int
@@ -6442,6 +6545,66 @@ async def _profile_scan_worker(worker_id: int) -> None:
                         profile_url=job.profile_url,
                     )
                 )
+
+            async def _merge_rescan_result(rescan_result: ScanResult) -> None:
+                if rescan_result.metadata_targets:
+                    await _enqueue_metadata_job(
+                        MetadataJob(
+                            items=rescan_result.metadata_targets,
+                            username=job.username,
+                            profile_url=job.profile_url,
+                        )
+                    )
+                result.media_urls = dedupe_keep_order(
+                    result.media_urls + rescan_result.media_urls
+                )
+                result.added_items += rescan_result.added_items
+                result.link_added = result.link_added or rescan_result.link_added
+                if rescan_result.profile_tabs:
+                    result.profile_tabs = rescan_result.profile_tabs
+                if rescan_result.media_by_tab:
+                    result.media_by_tab.update(rescan_result.media_by_tab)
+                if rescan_result.warnings:
+                    for warning in rescan_result.warnings:
+                        if warning not in result.warnings:
+                            result.warnings.append(warning)
+                else:
+                    result.warnings = []
+
+            if result.added_items == 1 and result.media_urls:
+                attempt = 0
+                while attempt < 10:
+                    attempt += 1
+                    log.info(
+                        "Only one new link added for %s, retrying with refreshed cookies (attempt %s/10)",
+                        job.profile_url,
+                        attempt,
+                    )
+                    rescan_result = await _rescan_profile_with_fresh_cookies(job)
+                    if not rescan_result:
+                        continue
+
+                    await _merge_rescan_result(rescan_result)
+
+                    if rescan_result.added_items > 0:
+                        break
+            if result.warnings:
+                attempt = 0
+                while attempt < 10 and result.warnings:
+                    attempt += 1
+                    log.info(
+                        "Profile flagged as partially scanned for %s, refreshing cookies (attempt %s/10)",
+                        job.profile_url,
+                        attempt,
+                    )
+                    rescan_result = await _rescan_profile_with_fresh_cookies(job)
+                    if not rescan_result:
+                        continue
+
+                    await _merge_rescan_result(rescan_result)
+
+                    if not result.warnings:
+                        break
             if result.added_items > 0 or not result.media_urls:
                 total = len(result.media_urls)
                 text = (
@@ -6501,10 +6664,12 @@ async def _metadata_worker(worker_id: int) -> None:
         job: MetadataJob = await _META_UPDATE_QUEUE.get()
         try:
             if job.items:
+                meta_fetcher = _build_metadata_fetcher(job.profile_url)
                 await asyncio.to_thread(
                     populate_media_metadata,
                     Path(DB_PATH),
                     job.items,
+                    meta_fetcher=meta_fetcher,
                 )
         except asyncio.CancelledError:
             log.info("Metadata worker #%s cancelled", worker_id)

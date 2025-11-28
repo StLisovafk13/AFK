@@ -1,15 +1,17 @@
 """Utilities for extracting EXIF metadata from remote image URLs."""
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 from typing import Any, Dict, Optional
 
-__all__ = ["extract_exif_from_url"]
+__all__ = ["extract_exif_from_url", "extract_exif_with_playwright"]
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -88,6 +90,15 @@ def _call_exiftool(path: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _extract_metadata_from_file(path: str) -> Dict[str, Any]:
+    size_bytes = os.path.getsize(path)
+    meta: Dict[str, Any] = {"size_bytes": size_bytes}
+    exif = _call_exiftool(path)
+    if exif:
+        meta["exiftool"] = exif
+    return meta
+
+
 def extract_exif_from_url(
     url: str,
     *,
@@ -138,14 +149,74 @@ def extract_exif_from_url(
         raise ExifExtractionError(f"curl failed for {url}: {exc}") from exc
 
     try:
-        size_bytes = os.path.getsize(temp_path)
-        meta: Dict[str, Any] = {"size_bytes": size_bytes}
-        exif = _call_exiftool(temp_path)
-        if exif:
-            meta["exiftool"] = exif
-        return meta
+        return _extract_metadata_from_file(temp_path)
     finally:
         try:
             os.remove(temp_path)
         except OSError:
             pass
+
+
+def extract_exif_with_playwright(
+    url: str,
+    *,
+    referer: Optional[str] = "https://vsco.co/",
+    timeout: int = 20,
+    user_agent: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Download an image using Playwright and extract EXIF metadata.
+
+    This helper intentionally opens the referer page first to pick up any
+    session cookies that the CDN might require. It mirrors the return shape of
+    :func:`extract_exif_from_url`.
+    """
+
+    from playwright.sync_api import sync_playwright
+
+    temp_file = tempfile.NamedTemporaryFile(delete=False)
+    temp_file.close()
+    temp_path = Path(temp_file.name)
+
+    headers = {"Referer": referer} if referer else {}
+    ua = user_agent or _DEFAULT_HEADERS.get("User-Agent") or "Mozilla/5.0"
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.firefox.launch(headless=True)
+            context = browser.new_context(user_agent=ua)
+            try:
+                if referer:
+                    page = context.new_page()
+                    try:
+                        page.goto(
+                            referer,
+                            wait_until="domcontentloaded",
+                            timeout=timeout * 1000,
+                        )
+                    except Exception:
+                        # Even if the page fails to load completely we still try
+                        # to reuse whatever cookies were set.
+                        pass
+                response = context.request.get(
+                    url,
+                    timeout=timeout * 1000,
+                    headers=headers,
+                )
+                if not response.ok:
+                    raise ExifExtractionError(
+                        f"playwright failed for {url}: status={response.status}"
+                    )
+                content = response.body()
+                temp_path.write_bytes(content)
+            finally:
+                context.close()
+                browser.close()
+
+        return _extract_metadata_from_file(str(temp_path))
+    except ExifExtractionError:
+        raise
+    except Exception as exc:  # pragma: no cover - network/browser failures
+        raise ExifExtractionError(f"playwright failed for {url}: {exc}") from exc
+    finally:
+        with contextlib.suppress(Exception):
+            temp_path.unlink()
