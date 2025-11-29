@@ -437,6 +437,7 @@ async def playwright_scan_profile(
     target_count: int = 0,
     navigation_timeout_ms: Optional[int] = 30000,
     headless: bool = True,
+    browser_name: str = "firefox",
     keep_browser_open: bool = False,
 ) -> list[str]:
     """Extract profile media via Playwright with graceful HTTP fallback."""
@@ -485,12 +486,18 @@ async def playwright_scan_profile(
         playwright = await playwright_cm.__aenter__()
         playwright_started = True
 
+        browser_name = (browser_name or "firefox").strip().lower()
+        browser_type = getattr(playwright, browser_name, None)
+        if browser_type is None:
+            raise ValueError(f"Unsupported Playwright browser '{browser_name}'")
+
         _log(
             "debug",
-            "playwright_scan_profile: launching Firefox (headless=%s)",
+            "playwright_scan_profile: launching %s (headless=%s)",
+            browser_name,
             headless,
         )
-        browser = await playwright.firefox.launch(headless=headless)
+        browser = await browser_type.launch(headless=headless)
         _log("debug", "playwright_scan_profile: creating new browser context")
         context = await browser.new_context()
         _log("debug", "playwright_scan_profile: creating new page")

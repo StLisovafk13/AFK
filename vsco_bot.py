@@ -199,6 +199,9 @@ def _env_flag(name: str, default: bool) -> bool:
 BOT_INLINE_PLAYWRIGHT = _env_flag("BOT_INLINE_PLAYWRIGHT", False)
 BOT_PLAYWRIGHT_HEADLESS = _env_flag("BOT_PLAYWRIGHT_HEADLESS", True)
 BOT_PLAYWRIGHT_KEEP_OPEN = _env_flag("BOT_PLAYWRIGHT_KEEP_OPEN", False)
+BOT_PLAYWRIGHT_BROWSER = (
+    os.getenv("BOT_PLAYWRIGHT_BROWSER", "firefox").strip().lower() or "firefox"
+)
 
 
 def _parse_admin_ids(raw: str) -> set[int]:
@@ -1636,6 +1639,7 @@ async def _normalize_single_vsco_url(
                     session=session,
                     logger=log,
                     headless=BOT_PLAYWRIGHT_HEADLESS and not BOT_PLAYWRIGHT_KEEP_OPEN,
+                    browser_name=BOT_PLAYWRIGHT_BROWSER,
                     keep_browser_open=BOT_PLAYWRIGHT_KEEP_OPEN,
                 )
             except Exception:
