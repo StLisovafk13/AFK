@@ -305,6 +305,9 @@ async def _collect_with_playwright(
             if clicked and clicks_without_growth >= no_growth_click_limit:
                 LOGGER.debug("Клики Load More не дают новых ссылок, останавливаемся")
                 break
+            if stagnation >= stagnation_limit:
+                LOGGER.warning("Нет роста медиа, останавливаем повторные попытки Load More")
+                break
 
         if not last_html:
             # Гарантируем, что у нас есть HTML последнего состояния
@@ -332,7 +335,7 @@ async def _collect_with_playwright(
             except Exception:
                 # На этом этапе дальнейшая прокрутка бессмысленна.
                 raise
-            return await _scroll(page)
+            return await asyncio.wait_for(_scroll(page), timeout=600)
     except Exception as exc:
         LOGGER.warning("Playwright не справился: %s", exc)
     finally:
@@ -366,142 +369,84 @@ async def collect_profile_media(
     per-tab mapping for the caller.
     """
 
-    session_headers = {"User-Agent": DEFAULT_USER_AGENT}
-    if headers:
-        session_headers.update(headers)
+    from bs4 import BeautifulSoup
 
-    normalized_profile_url = _normalize_tab_url(profile_url)
+    session_headers = {"User-Agent": DEFAULT_USER_AGENT, **(headers or {})}
     aggregated_urls: list[str] = []
     media_by_tab: dict[str, list[str]] = {}
-    tabs: Sequence[Dict[str, Any]] | None = None
-
-    seen_tab_urls: set[str] = set()
+    tabs: list[dict[str, Any]] = []
     warnings: list[str] = []
+    seen: set[str] = set()
+    queue = [profile_url]
 
-    def _record_warning(source: str, html: str) -> None:
-        if not html or PARTIAL_LOAD_MARKER not in html:
-            return
-        first_detected = PARTIAL_LOAD_WARNING not in warnings
-        if first_detected:
-            warnings.append(PARTIAL_LOAD_WARNING)
-        if first_detected or not include_details:
-            LOGGER.warning(
-                "Неполная загрузка содержимого профиля %s (source=%s)",
-                profile_url,
-                source,
-            )
+    def has_more(html: str) -> bool:
+        button = BeautifulSoup(html, "html.parser").select_one("#loadMore-Button")
+        return bool(button is not None and not button.has_attr("disabled")
+                    and not button.has_attr("hidden")
+                    and str(button.get("aria-hidden", "")).lower() != "true"
+                    and not re.search(r"(?:display\s*:\s*none|visibility\s*:\s*hidden)",
+                                      str(button.get("style", "")), re.I)
+                    and str(button.get("aria-disabled", "")).lower() not in ("true", "1"))
 
-    def _store_tab_media(tab_url: str, urls_for_tab: Iterable[str]) -> None:
-        nonlocal aggregated_urls
-        normalized_tab_url = _normalize_tab_url(tab_url, root=profile_url)
-        if not normalized_tab_url:
-            return
-        cleaned = dedupe_keep_order(urls_for_tab)
-        media_by_tab[normalized_tab_url] = cleaned
-        if cleaned:
-            seen_tab_urls.add(normalized_tab_url)
-            aggregated_urls = dedupe_keep_order(aggregated_urls + cleaned)
-
-    session: aiohttp.ClientSession | None = None
+    session = aiohttp.ClientSession(headers=session_headers)
     try:
-        session = aiohttp.ClientSession(headers=session_headers)
-        urls, html = await scan_profile_media(
-            session,
-            profile_url,
-            max_width=max_width,
-            logger=LOGGER,
-        )
-        _record_warning("http", html)
-        aggregated_urls = dedupe_keep_order(urls)
-        if aggregated_urls:
-            _store_tab_media(normalized_profile_url, aggregated_urls)
-        tabs = extract_profile_tab_links(html, root=profile_url)
-
-        if tabs:
-            for tab in tabs:
-                href = tab.get("href") or ""
-                normalized_href = _normalize_tab_url(href, root=profile_url)
-                if (
-                    not normalized_href
-                    or normalized_href in seen_tab_urls
-                    or normalized_href == normalized_profile_url
-                ):
-                    continue
-                seen_tab_urls.add(normalized_href)
-                tab_media, tab_html = await scan_profile_media(
-                    session,
-                    normalized_href,
-                    max_width=max_width,
-                    logger=LOGGER,
+        while queue:
+            tab_url = _normalize_tab_url(queue.pop(0), root=profile_url)
+            if not tab_url or tab_url in seen:
+                continue
+            seen.add(tab_url)
+            try:
+                urls, html = await scan_profile_media(
+                    session, tab_url, max_width=max_width, logger=LOGGER,
                 )
-                _record_warning(normalized_href, tab_html)
-                cleaned = dedupe_keep_order(tab_media)
-                media_by_tab[normalized_href] = cleaned
-                if cleaned:
-                    aggregated_urls = dedupe_keep_order(aggregated_urls + cleaned)
-    finally:
-        if session is not None:
-            await session.close()
-
-    if not aggregated_urls:
-        urls, html = await _collect_with_playwright(
-            profile_url,
-            headers=session_headers,
-            max_width=max_width,
-            delay=delay,
-            target_count=target_count,
-        )
-        _record_warning("playwright", html)
-        aggregated_urls = dedupe_keep_order(urls)
-        if aggregated_urls:
-            _store_tab_media(normalized_profile_url, aggregated_urls)
-        if not tabs:
-            tabs = extract_profile_tab_links(html, root=profile_url)
-        if tabs:
-            async with aiohttp.ClientSession(headers=session_headers) as session_retry:
-                for tab in tabs:
-                    href = tab.get("href") or ""
-                    normalized_href = _normalize_tab_url(href, root=profile_url)
-                    if (
-                        not normalized_href
-                        or normalized_href in seen_tab_urls
-                        or normalized_href == normalized_profile_url
-                    ):
-                        continue
-                    seen_tab_urls.add(normalized_href)
-                    tab_media, tab_html = await scan_profile_media(
-                        session_retry,
-                        normalized_href,
-                        max_width=max_width,
-                        logger=LOGGER,
+            except Exception as exc:
+                LOGGER.warning("HTTP-сбор не удался для %s: %s", tab_url, exc)
+                urls, html = [], ""
+            discovered_tabs = extract_profile_tab_links(html, root=tab_url)
+            urls = dedupe_keep_order(urls)
+            partial_http = PARTIAL_LOAD_MARKER in html
+            needs_browser = (not urls or partial_http or has_more(html)
+                             or bool(target_count and len(urls) < target_count))
+            if needs_browser:
+                try:
+                    browser_urls, browser_html = await _collect_with_playwright(
+                        tab_url, headers=session_headers, max_width=max_width,
+                        delay=delay, target_count=target_count,
                     )
-                    _record_warning(normalized_href, tab_html)
-                    cleaned = dedupe_keep_order(tab_media)
-                    media_by_tab[normalized_href] = cleaned
-                    if cleaned:
-                        aggregated_urls = dedupe_keep_order(aggregated_urls + cleaned)
+                except Exception as exc:
+                    LOGGER.warning("Браузерный сбор не удался для %s: %s", tab_url, exc)
+                    browser_urls, browser_html = [], ""
+                urls = dedupe_keep_order(urls + browser_urls)
+                discovered_tabs += extract_profile_tab_links(browser_html, root=tab_url)
+                limited = bool(target_count and len(urls) >= target_count)
+                incomplete = (not browser_html or PARTIAL_LOAD_MARKER in browser_html
+                              or (has_more(browser_html) and not limited))
+                if incomplete:
+                    warning = (PARTIAL_LOAD_WARNING if partial_http or PARTIAL_LOAD_MARKER in browser_html
+                               else "Профиль загружен не полностью: не удалось завершить сбор медиа.")
+                    if warning not in warnings:
+                        warnings.append(warning)
+                    LOGGER.warning("%s (%s)", warning, tab_url)
+            media_by_tab[tab_url] = urls
+            aggregated_urls = dedupe_keep_order(aggregated_urls + urls)
+            for tab in discovered_tabs:
+                href = _normalize_tab_url(tab.get("href") or "", root=tab_url)
+                if href and href not in {t.get("href") for t in tabs}:
+                    tabs.append({**tab, "href": href})
+                if href and href not in seen:
+                    queue.append(href)
+    finally:
+        await session.close()
 
     if not aggregated_urls:
         LOGGER.warning("Не удалось получить ссылки медиа для %s", profile_url)
-        if include_details:
-            sanitized_tabs = _sanitize_profile_tabs(tabs, root=profile_url)
-            return ProfileMediaCollection(
-                media_urls=[],
-                profile_tabs=sanitized_tabs,
-                media_by_tab={},
-                warnings=warnings.copy(),
-            )
-        return []
-
     if include_details:
-        sanitized_tabs = _sanitize_profile_tabs(tabs, root=profile_url)
         return ProfileMediaCollection(
             media_urls=aggregated_urls,
-            profile_tabs=sanitized_tabs,
-            media_by_tab=media_by_tab.copy(),
-            warnings=warnings.copy(),
+            profile_tabs=_sanitize_profile_tabs(tabs, root=profile_url),
+            media_by_tab=media_by_tab,
+            warnings=warnings,
         )
-
     return aggregated_urls
 
 

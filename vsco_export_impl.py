@@ -120,7 +120,8 @@ class ExportManager:
             await msg.answer("🚫 Экспорт доступен только в личных сообщениях. Напишите мне в ЛС.")
             return
 
-        allowed, info = self._deps.has_daily_data_access(msg.chat.id, getattr(msg.from_user, "id", None))
+        effective_user_id = user_id if user_id is not None else getattr(msg.from_user, "id", None)
+        allowed, info = self._deps.has_daily_data_access(msg.chat.id, effective_user_id)
         if not allowed:
             await msg.answer(info)
             return

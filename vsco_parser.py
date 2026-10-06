@@ -14,6 +14,8 @@ from typing import List, Dict, Optional, Tuple
 from bs4 import BeautifulSoup
 import pandas as pd
 
+from html_utils import json_for_html
+
 
 def split_coords(s: str) -> Tuple[Optional[float], Optional[float]]:
     if not s:
@@ -243,7 +245,7 @@ def dedupe_rows(rows: List[Dict[str, object]], mode: str = "safe") -> List[Dict[
         out.append(r)
     return out
 def build_gallery_html(items, title="VSCO Gallery", subtitle="Merged"):
-    import html as pyhtml, json as pyjson
+    import html as pyhtml
     data = []
     for it in items:
         data.append({
@@ -253,7 +255,7 @@ def build_gallery_html(items, title="VSCO Gallery", subtitle="Merged"):
             "profile_url": it.get("profile_url") or "",
             "image_url": it.get("image_url") or "",
         })
-    data_json = pyjson.dumps(data, ensure_ascii=False)
+    data_json = json_for_html(data)
 
     # Используем .format и экранируем фигурные скобки удвоением {{ }}
     tpl = """<!DOCTYPE html>
@@ -319,6 +321,10 @@ body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
 <script>
 const data = {DATA_JSON};
 
+function escapeHtml(value) {{
+  return String(value).replace(/[&<>"']/g, ch => ({{'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}}[ch]));
+}}
+
 function groupByUsername(items) {{
   const groups = new Map();
   for (const it of items) {{
@@ -352,10 +358,10 @@ function render(groups) {{
     block.dataset.avgLon = avgLon ?? '';
     block.innerHTML = `
       <div class="user-header">
-        <div><span class="username">@${{grp.username || '(no username)'}} </span>
+        <div><span class="username">@${{escapeHtml(grp.username || '(no username)')}} </span>
           <span class="user-sub">${{count}} item(s)${{avgLat!=null&&avgLon!=null?` • avg: ${{avgLat.toFixed(6)}}, ${{avgLon.toFixed(6)}}`:''}}</span>
         </div>
-        <a href="${{grp.profile_url || '#'}}" target="_blank">View Profile</a>
+        <a href="${{escapeHtml(grp.profile_url || '#')}}" target="_blank">View Profile</a>
       </div>
       <div class="user-media-grid"></div>`;
     const grid = block.querySelector('.user-media-grid');
@@ -367,10 +373,10 @@ function render(groups) {{
       card.dataset.lat = typeof e.latitude==='number' ? e.latitude : '';
       card.dataset.lon = typeof e.longitude==='number' ? e.longitude : '';
       card.innerHTML = `
-        ${{e.image_url?`<img src="${{e.image_url}}" alt="VSCO">`:''}}
+        ${{e.image_url?`<img src="${{escapeHtml(e.image_url)}}" alt="VSCO">`:''}}
         <div class="image-info">
-          <div class="coordinates">${{(latStr||lonStr)?`📍 ${{latStr}}, ${{lonStr}}`:''}}</div>
-          <div class="links">${{e.image_url?`<a href="${{e.image_url}}" target="_blank">View Image</a>`:''}}</div>
+          <div class="coordinates">${{(latStr||lonStr)?`📍 ${{escapeHtml(latStr)}}, ${{escapeHtml(lonStr)}}`:''}}</div>
+          <div class="links">${{e.image_url?`<a href="${{escapeHtml(e.image_url)}}" target="_blank">View Image</a>`:''}}</div>
         </div>`;
       grid.appendChild(card);
     }}
@@ -445,7 +451,7 @@ applyFilters();
 
 
 def build_map_html(items, title="Visual Search Results", center_lat=0.0, center_lng=0.0, radius_km=1.0, zoom=12):
-    import html as pyhtml, json as pyjson
+    import html as pyhtml
     users = []
     for it in items:
         if it.get("latitude") is None or it.get("longitude") is None:
@@ -457,7 +463,7 @@ def build_map_html(items, title="Visual Search Results", center_lat=0.0, center_
             "image_url": it.get("image_url") or "",
             "profile_url": it.get("profile_url") or "",
         })
-    users_json = pyjson.dumps(users, ensure_ascii=False)
+    users_json = json_for_html(users)
     tpl = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -472,6 +478,9 @@ def build_map_html(items, title="Visual Search Results", center_lat=0.0, center_
 <div id="map"></div>
 <script>
   const users = {USERS_JSON};
+  function escapeHtml(value) {{
+    return String(value).replace(/[&<>"']/g, ch => ({{'&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}}[ch]));
+  }}
   const map = L.map('map').setView([{CLAT}, {CLNG}], {ZOOM});
   L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{ attribution: '© OpenStreetMap' }}).addTo(map);
   if ({RADIUS} > 0) {{
@@ -479,8 +488,8 @@ def build_map_html(items, title="Visual Search Results", center_lat=0.0, center_
   }}
   users.forEach(u => {{
     const m = L.marker([u.lat, u.lng]).addTo(map);
-    const img = u.image_url ? `<img src="${{u.image_url}}" style="max-width:180px;max-height:180px;border-radius:8px;margin-bottom:8px;">` : '';
-    m.bindPopup(`<div style="min-width:240px"><h4>@${{u.username}}</h4>${{img}}<p>${{u.lat.toFixed(6)}}, ${{u.lng.toFixed(6)}}</p><p><a href="${{u.profile_url}}" target="_blank">View Profile</a></p></div>`);
+    const img = u.image_url ? `<img src="${{escapeHtml(u.image_url)}}" style="max-width:180px;max-height:180px;border-radius:8px;margin-bottom:8px;">` : '';
+    m.bindPopup(`<div style="min-width:240px"><h4>@${{escapeHtml(u.username)}}</h4>${{img}}<p>${{u.lat.toFixed(6)}}, ${{u.lng.toFixed(6)}}</p><p><a href="${{escapeHtml(u.profile_url)}}" target="_blank">View Profile</a></p></div>`);
   }});
 </script>
 </body>

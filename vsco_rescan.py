@@ -60,12 +60,14 @@ def connect_state_db(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS scanned_profiles (
-            profile_url TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS scanned_profiles_by_chat (
+            chat_id INTEGER NOT NULL,
+            profile_url TEXT NOT NULL,
             username TEXT NOT NULL,
             last_scanned_at TEXT NOT NULL,
             status TEXT NOT NULL,
-            added_items INTEGER NOT NULL DEFAULT 0
+            added_items INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(chat_id, profile_url)
         )
         """
     )
@@ -73,9 +75,14 @@ def connect_state_db(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _load_processed_urls(state_conn: sqlite3.Connection) -> set[str]:
-    rows = state_conn.execute("SELECT profile_url FROM scanned_profiles")
-    return {row[0] for row in rows if row[0]}
+def _load_processed_profiles(state_conn: sqlite3.Connection) -> set[tuple[int, str]]:
+    # The legacy URL-only table cannot identify which chat was updated. Keep it
+    # untouched and rebuild per-chat history on the first run of this version.
+    rows = state_conn.execute(
+        "SELECT chat_id, profile_url FROM scanned_profiles_by_chat"
+        " WHERE status IN ('updated', 'unchanged')"
+    )
+    return {(row[0], row[1]) for row in rows if row[1]}
 
 
 def _mark_profile_scanned(
@@ -87,15 +94,15 @@ def _mark_profile_scanned(
 ) -> None:
     state_conn.execute(
         """
-        INSERT INTO scanned_profiles(profile_url, username, last_scanned_at, status, added_items)
-        VALUES(?, ?, ?, ?, ?)
-        ON CONFLICT(profile_url) DO UPDATE SET
+        INSERT INTO scanned_profiles_by_chat(chat_id, profile_url, username, last_scanned_at, status, added_items)
+        VALUES(?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id, profile_url) DO UPDATE SET
             username=excluded.username,
             last_scanned_at=excluded.last_scanned_at,
             status=excluded.status,
             added_items=excluded.added_items
         """,
-        (entry.profile_url, entry.username, utc_now_iso(), status, added_items),
+        (entry.chat_id, entry.profile_url, entry.username, utc_now_iso(), status, added_items),
     )
     state_conn.commit()
 
@@ -127,24 +134,25 @@ def _load_profiles(
         else:
             query += " ORDER BY id DESC"
 
-        processed_urls = _load_processed_urls(state_conn)
+        processed_profiles = _load_processed_profiles(state_conn)
         rows = conn.execute(query, params)
         entries: list[ProfileEntry] = []
         skipped_existing = 0
-        seen_urls: set[str] = set()
+        seen_profiles: set[tuple[int, str]] = set()
         for row in rows:
             profile_url = row[3]
             if not profile_url:
                 continue
-            if profile_url in seen_urls:
+            key = (row[1], profile_url)
+            if key in seen_profiles:
                 continue
-            if profile_url in processed_urls:
+            if key in processed_profiles:
                 skipped_existing += 1
                 continue
 
             entry = ProfileEntry(chat_id=row[1], username=row[2], profile_url=profile_url)
             entries.append(entry)
-            seen_urls.add(profile_url)
+            seen_profiles.add(key)
             if limit is not None and limit > 0 and len(entries) >= limit:
                 break
 
@@ -210,6 +218,8 @@ async def rescan_profiles(
     delay: float,
     target_count: int,
     state_conn: sqlite3.Connection,
+    attempts: int = 3,
+    retry_delay: float = 1.0,
 ) -> RescanSummary:
     semaphore = asyncio.Semaphore(max(1, concurrency))
     state_lock = asyncio.Lock()
@@ -217,25 +227,32 @@ async def rescan_profiles(
     async def _worker(entry: ProfileEntry) -> ScanResult | None:
         async with semaphore:
             LOGGER.info("Пересканируем профиль %s", entry.profile_url)
-            try:
-                result = await _rescan_single(
-                    entry,
-                    db_path=db_path,
-                    max_width=max_width,
-                    delay=delay,
-                    target_count=target_count,
-                )
-            except Exception as exc:  # pragma: no cover - defensive guard
-                LOGGER.exception("Неожиданная ошибка при пересканировании %s: %s", entry.profile_url, exc)
-                result = None
+            result = None
+            for attempt in range(max(1, attempts)):
+                try:
+                    result = await _rescan_single(
+                        entry,
+                        db_path=db_path,
+                        max_width=max_width,
+                        delay=delay,
+                        target_count=target_count,
+                    )
+                except Exception as exc:  # pragma: no cover - defensive guard
+                    LOGGER.exception("Неожиданная ошибка при пересканировании %s: %s", entry.profile_url, exc)
+                if result is not None:
+                    break
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(retry_delay * (2 ** attempt))
 
             added_items = result.added_items if result else 0
             if result is None:
                 status = "failed"
+            elif result.warnings:
+                status = "partial"
             elif added_items > 0:
                 status = "updated"
             else:
-                status = "no_media"
+                status = "unchanged"
 
             async with state_lock:
                 _mark_profile_scanned(
@@ -254,7 +271,8 @@ async def rescan_profiles(
         result = await task
         if result is None:
             continue
-        summary.succeeded += 1
+        if not result.warnings:
+            summary.succeeded += 1
         summary.total_added_items += result.added_items
         if result.warnings:
             LOGGER.warning(

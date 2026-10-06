@@ -33,14 +33,18 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import sys
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, NamedTuple
 
 from urllib.parse import urlsplit
+from download_progress import emit_progress, run_step
+from download_options import add_download_options, validate_download_options
 
 from vsco_utils import (
     dedupe_keep_order,
@@ -57,7 +61,7 @@ from vsco_utils import (
 # -----------------------------
 def setup_logger(username: str) -> Tuple[logging.Logger, Path, str]:
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    logs_dir = Path("logs"); logs_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir = Path(os.getenv("BOT_LOGDIR", "logs")); logs_dir.mkdir(parents=True, exist_ok=True)
     logfile = logs_dir / f"vsco_{username}_{ts}.log"
     logger = logging.getLogger(f"vsco.{username}"); logger.setLevel(logging.DEBUG); logger.handlers.clear()
     fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -78,21 +82,13 @@ def parse_args() -> argparse.Namespace:
     g.add_argument("--username", type=str, help="VSCO username (e.g., johndoe)")
     g.add_argument("--profile-url", type=str, help="Full VSCO profile URL")
     p.add_argument("--out", type=str, default="./downloads", help="Output base dir")
-    p.add_argument("--max", type=int, default=0, help="Max media to download (0 = all)")
-    p.add_argument("--concurrency", type=int, default=4, help="Parallel downloads via Playwright context")
-    p.add_argument("--delay", type=float, default=0.4, help="Delay between scroll steps (sec)")
-    p.add_argument("--timeout", type=float, default=30.0, help="Network timeout seconds")
-    p.add_argument("--max-width", type=int, default=2048, help="Auto-upscale ?w= for images when possible")
-    # ZIP options: по умолчанию архив создаётся; можно выключить флагом --no-zip
-    p.add_argument("--no-zip", action="store_true", help="Do NOT create ZIP (by default ZIP is created)")
-    p.add_argument("--zip-name", type=str, default="", help="ZIP filename (default: <username>_<timestamp>.zip). Для мульти-ZIP это будет базой имени.")
-    # Постеры видео
-    p.add_argument("--skip-video-thumbs", action="store_true",
-                   help="Не сохранять .jpg/.png постеры, которые являются миниатюрами для видео")
-    # Мульти-ZIP
-    p.add_argument("--split-zip-size-mb", type=int, default=0,
-                   help="Макс. размер одного ZIP (МБ). 0 = один архив. Пример: 45 для Telegram.")
-    return p.parse_args()
+    add_download_options(p)
+    args = p.parse_args()
+    try:
+        validate_download_options(args)
+    except ValueError as exc:
+        p.error(str(exc))
+    return args
 
 # -----------------------------
 # ВАЛИДАЦИЯ ОКРУЖЕНИЯ
@@ -233,7 +229,8 @@ async def collect_image_urls(
     clicks_without_growth = 0
     prev_count = len(urls)
 
-    for _ in range(max_scrolls):
+    scan_started = time.monotonic()
+    for scroll in range(max_scrolls):
         # Кнопка Load More
         btn = page.locator("#loadMore-Button").first
         try:
@@ -259,7 +256,7 @@ async def collect_image_urls(
                 except Exception:
                     await page.wait_for_timeout(int(max(1, delay) * 1000))
             except Exception as e:
-                logger.debug(f"Load More: клик не удался: {e}")
+                logger.warning(f"Load More: клик не удался: {type(e).__name__}: {e}")
 
         # Мягкий скролл
         await page.evaluate("""() => { window.scrollBy(0, Math.floor(window.innerHeight * 0.9)); }""")
@@ -291,15 +288,23 @@ async def collect_image_urls(
             if clicked:
                 clicks_without_growth += 1
 
+        emit_progress(logger, "scan", f"Прокрутка {scroll + 1}; кликов Load More: {load_clicks}; "
+                      f"без роста: {stagnation}/{stagnation_limit}; "
+                      f"кнопка: {'активна' if btn_visible and not btn_disabled else 'недоступна'}; "
+                      f"прошло {int(time.monotonic() - scan_started)} с", total=len(urls))
+
         # Выходы
         if target_count and len(urls) >= target_count:
-            logger.debug("Достигли целевого количества ссылок (по --max).")
+            logger.info("Достигли целевого количества ссылок (по --max).")
             break
         if (not btn_exists or not btn_visible or btn_disabled) and stagnation >= stagnation_limit:
-            logger.debug("Похоже, достигнут конец ленты (нет роста и нет активной кнопки).")
+            logger.info("Похоже, достигнут конец ленты (нет роста и нет активной кнопки).")
             break
         if clicked and clicks_without_growth >= no_growth_click_limit:
-            logger.debug("Несколько кликов Load More подряд не дали новых медиа — выходим.")
+            logger.warning("Несколько кликов Load More подряд не дали новых медиа — выходим.")
+            break
+        if stagnation >= stagnation_limit:
+            logger.warning("Нет роста медиа: останавливаем сканирование, даже если Load More остаётся активной.")
             break
 
     short_ok(logger, f"Этап 2–3: извлекли {len(urls)} ссылок (до лимита/конца ленты).")
@@ -318,15 +323,19 @@ async def probe_via_context(logger: logging.Logger, ctx_request, urls: List[str]
     }
 
     async def one(u: str):
+        r = None
         try:
             r = await ctx_request.get(u, headers=headers, timeout=15000)
             ctype = (r.headers.get("content-type") or "").lower()
             if r.ok and (ctype.startswith("image/") or ctype.startswith("video/")):
                 good.append(u); logger.debug(f"CTX PROBE OK {r.status} {ctype} {u}")
             else:
-                logger.debug(f"CTX PROBE BAD {r.status} {ctype} {u}")
+                logger.warning(f"CTX PROBE BAD HTTP {r.status}, content-type={ctype}, host={urlsplit(u).hostname}")
         except Exception as e:
-            logger.debug(f"CTX PROBE EX {u} :: {e}")
+            logger.warning(f"CTX PROBE EX host={urlsplit(u).hostname}: {type(e).__name__}: {e}")
+        finally:
+            if r is not None:
+                await r.dispose()
 
     await asyncio.gather(*[one(u) for u in probe])
     if good:
@@ -352,6 +361,9 @@ async def download_all_via_context(
     out_dir.mkdir(parents=True, exist_ok=True)
     results: List[Dict[str, Any]] = []
     sem = asyncio.Semaphore(max(1, concurrency))
+    saved_bytes = 0
+    successful = failed = 0
+    started = time.monotonic()
     headers = {
         "Referer": referer,
         "Accept": "video/*;q=0.9,image/avif,image/webp,image/*,*/*;q=0.8",
@@ -359,6 +371,7 @@ async def download_all_via_context(
     }
 
     async def fetch(idx: int, url: str):
+        nonlocal saved_bytes, successful, failed
         name = generate_media_filename(url, idx)
         dest = out_dir / name
         meta: Dict[str, Any] = {
@@ -381,7 +394,13 @@ async def download_all_via_context(
 
         async with sem:
             for attempt in range(1, 3 + 1):
+                r = None
+                meta["status"] = None
                 try:
+                    emit_progress(logger, "download", f"Файл {idx}/{len(take)}: запрос к "
+                                  f"{urlsplit(url).hostname}; попытка {attempt}/3; тайм-аут {timeout:g} с",
+                                  total=len(take), completed=len(results), downloaded=successful,
+                                  failed=failed, bytes=saved_bytes)
                     r = await ctx_request.get(url, headers=headers, timeout=int(timeout * 1000))
                     meta["status"] = r.status
                     if r.status >= 400:
@@ -397,9 +416,30 @@ async def download_all_via_context(
                     logger.info(f"[{idx}] OK {name} ({len(body)} bytes)")
                     break
                 except Exception as e:
-                    logger.warning(f"[{idx}] Попытка {attempt}/3 не удалась: {e}")
-                    await asyncio.sleep(0.8 * attempt)
+                    meta["error"] = f"{type(e).__name__}: {e}"
+                    logger.warning(f"[{idx}] Попытка {attempt}/3 не удалась: {meta['error']}")
+                    hint = "Проверьте доступ CDN, cookies и Referer." if meta['status'] == 403 else (
+                        "CDN ограничил частоту; уменьшите --concurrency." if meta['status'] == 429 else
+                        "Проверьте сеть, тайм-аут и доступность файла.")
+                    emit_progress(logger, "download", f"Файл {idx}: {meta['error'][:300]}. {hint}",
+                                  total=len(take), completed=len(results), downloaded=successful,
+                                  failed=failed, bytes=saved_bytes)
+                    if attempt < 3:
+                        await asyncio.sleep(0.8 * attempt)
+                finally:
+                    if r is not None:
+                        await r.dispose()
             results.append(meta)
+            successful += int(meta["ok"])
+            failed += int(not meta["ok"])
+            saved_bytes += meta["bytes"]
+            if meta["ok"]:
+                meta.pop("error", None)
+            elapsed = max(time.monotonic() - started, 0.001)
+            emit_progress(logger, "download", f"Обработан файл {idx}; "
+                          f"средняя скорость {saved_bytes / elapsed / 1048576:.2f} МБ/с",
+                          total=len(take), completed=len(results), downloaded=successful,
+                          failed=failed, bytes=saved_bytes)
 
     take = urls if max_items == 0 else urls[:max_items]
     skipped = sum(1 for u in take if is_vsco_logo_url(u))
@@ -407,6 +447,9 @@ async def download_all_via_context(
         logger.info(f"Пропущено {skipped} служебных изображений VSCO-logo-white перед скачиванием")
         take = [u for u in take if not is_vsco_logo_url(u)]
     logger.info(f"scan_progress {len(take)}")
+    emit_progress(logger, "download", f"Начало загрузки; параллельность {max(1, concurrency)}; "
+                  f"тайм-аут {timeout:g} с; до 3 попыток на файл", total=len(take),
+                  completed=0, downloaded=0, failed=0, bytes=0)
     if take:
         await asyncio.gather(*[fetch(i + 1, u) for i, u in enumerate(take)])
     return results
@@ -480,40 +523,52 @@ def build_zip_multi(
         raise RuntimeError("Нет файлов для архивации.")
     limit_bytes = max(1, split_mb) * 1024 * 1024
 
-    # Разбиваем кандидатов на части
     parts = _split_into_parts(ok_files, limit_bytes)
     zip_paths: List[Path] = []
-
-    base_stem = Path(zip_base_name).stem  # игнорируем исходный .zip
-    for i, files_part in enumerate(parts, 1):
-        zip_name = f"{base_stem}_part{i:02d}.zip"
-        zip_path = (out_dir / zip_name).resolve()
-        with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-            for src in files_part:
-                try:
+    base_stem = Path(zip_base_name).stem
+    pending = list(parts)
+    current_path = None
+    try:
+        while pending:
+            files_part = pending.pop(0)
+            number = len(zip_paths) + 1
+            current_path = (out_dir / f"{base_stem}_part{number:02d}.zip").resolve()
+            emit_progress(logger, "archive", f"Создание тома {number}; файлов: {len(files_part)}",
+                          zip_parts=number + len(pending))
+            with zipfile.ZipFile(current_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                for src in files_part:
                     zf.write(src, arcname=src.name)
-                except Exception as e:
-                    logger.warning(f"Не удалось добавить в ZIP: {src} :: {e}")
-            # служебные (в каждом томе)
-            if manifest_path.exists():
-                zf.write(manifest_path, arcname="manifest.json")
-            if urls_file.exists():
-                zf.write(urls_file, arcname=urls_file.name)
-
-        # валидация
-        try:
-            with zipfile.ZipFile(zip_path, "r") as z:
-                bad = z.testzip()
+                if manifest_path.exists():
+                    zf.write(manifest_path, arcname="manifest.json")
+                if urls_file.exists():
+                    zf.write(urls_file, arcname=urls_file.name)
+            actual_size = current_path.stat().st_size
+            if actual_size > limit_bytes:
+                current_path.unlink()
+                if len(files_part) == 1:
+                    raise RuntimeError(
+                        f"Файл {files_part[0].name} вместе со служебными данными не помещается "
+                        f"в ZIP {split_mb} МБ (получено {actual_size / 1048576:.2f} МБ). "
+                        "Исходные файлы сохранены; используйте --no-zip или больший лимит вне Telegram."
+                    )
+                middle = len(files_part) // 2
+                pending[0:0] = [files_part[:middle], files_part[middle:]]
+                continue
+            with zipfile.ZipFile(current_path) as archive:
+                bad = archive.testzip()
                 if bad is not None:
                     raise RuntimeError(f"ZIP повреждён на файле: {bad}")
-        except Exception as e:
-            raise RuntimeError(f"Проверка ZIP провалилась ({zip_name}): {e}")
-
-        logger.info(f"ZIP-том #{i}: {zip_path.name} ({zip_path.stat().st_size} bytes)")
-        zip_paths.append(zip_path)
-
+            logger.info("ZIP-том #%d: %s (%d bytes)", number, current_path.name, actual_size)
+            zip_paths.append(current_path)
+            current_path = None
+    except Exception:
+        # Do not leave a partial export that could be mistaken for a complete job.
+        for path in zip_paths + ([current_path] if current_path is not None else []):
+            path.unlink(missing_ok=True)
+        raise
     short_ok(logger, f"Создано ZIP-томов: {len(zip_paths)}")
     return zip_paths
+
 
 def build_zip_single(
     logger: logging.Logger,
@@ -536,6 +591,7 @@ def build_zip_single(
     if not members:
         raise RuntimeError("Нет файлов для архивации.")
 
+    emit_progress(logger, "archive", f"Создание архива; файлов: {len(members)}", zip_parts=1)
     with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for src, arcname in members:
             try:
@@ -544,6 +600,7 @@ def build_zip_single(
                 logger.warning(f"Не удалось добавить в ZIP: {src} :: {e}")
 
     # Валидация
+    emit_progress(logger, "archive", "Проверка целостности архива", zip_parts=1)
     try:
         with zipfile.ZipFile(zip_path, "r") as z:
             test = z.testzip()
@@ -573,23 +630,32 @@ async def main_async(args: argparse.Namespace) -> int:
 
     logger.info("== Этап 2–3: Доступ к профилю, сбор URL, Load More + скролл ==")
     async with async_playwright() as pw:
-        browser = await pw.firefox.launch(headless=True)
-        context = await browser.new_context(
+        browser = await run_step(logger, "browser", "Запуск Firefox", pw.firefox.launch(headless=True), args.timeout)
+        context = await run_step(logger, "browser", "Создание браузерного контекста", browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/126.0 Safari/537.36")
-        )
-        page = await context.new_page()
+        ), args.timeout)
+        page = await run_step(logger, "browser", "Создание вкладки", context.new_page(), args.timeout)
+        page.set_default_timeout(int(args.timeout * 1000))
         logger.info(f"Открываю профиль: {profile_url}")
-        resp = await page.goto(profile_url, wait_until="domcontentloaded", timeout=int(args.timeout * 1000))
+        resp = await run_step(logger, "profile", "Открытие профиля", page.goto(
+            profile_url, wait_until="domcontentloaded", timeout=int(args.timeout * 1000)), args.timeout + 1)
+        emit_progress(logger, "profile", f"Профиль ответил HTTP {getattr(resp, 'status', None)}")
         if not resp or not resp.ok:
             short_fail(logger, f"Страница не загрузилась (status={getattr(resp,'status',None)}). Провал шага.")
+            emit_progress(logger, "profile", f"Профиль недоступен: HTTP {getattr(resp, 'status', None)}; "
+                          "проверьте адрес профиля и доступ к VSCO.")
             await context.close(); await browser.close(); return 3
 
-        urls = await collect_image_urls(page, logger, delay=args.delay, timeout=args.timeout,
-                                        target_count=args.max, max_width=args.max_width)
+        emit_progress(logger, "scan", "Поиск медиа на странице", total=0)
+        urls = await run_step(logger, "scan", "Сбор медиа с прокруткой",
+                              collect_image_urls(page, logger, delay=args.delay, timeout=args.timeout,
+                                                 target_count=args.max, max_width=args.max_width), 600)
         if not urls:
-            short_fail(logger, "Не удалось извлечь ссылки на медиа."); await context.close(); await browser.close(); return 3
+            short_fail(logger, "Не удалось извлечь ссылки на медиа.")
+            emit_progress(logger, "scan", "Медиа не найдены: профиль пуст, недоступен или изменилась разметка VSCO.", total=0)
+            await context.close(); await browser.close(); return 3
 
         # Ассоциация постеров с видео (опциональное исключение постеров)
         final_urls, thumb_pairs = pair_thumbnails_with_videos(urls, skip_thumbs=args.skip_video_thumbs)
@@ -604,7 +670,9 @@ async def main_async(args: argparse.Namespace) -> int:
         logger.info(f"Найдено уникальных ссылок: {len(urls)}")
 
         logger.info("== Этап 4: Пробная валидация (через Playwright context) ==")
-        good_sample = await probe_via_context(logger, context.request, urls, referer=profile_url, sample=min(5, len(urls)))
+        good_sample = await run_step(logger, "probe", "Проверка доступа к CDN (до 5 файлов)",
+                                    probe_via_context(logger, context.request, urls, referer=profile_url,
+                                                      sample=min(5, len(urls))), 20)
         if not good_sample:
             logger.warning("Продолжаем загрузку несмотря на пустую пробу (CDN может блокировать пробные запросы).")
 
@@ -629,6 +697,8 @@ async def main_async(args: argparse.Namespace) -> int:
         # -------- ZIP (по умолчанию включён; можно отключить --no-zip)
         zip_created = None
         zip_created_parts: List[Path] = []
+        archive_ok = True
+        archive_error = ""
         if not args.no_zip:
             logger.info("== Этап 7: Архивация (моно или мульти ZIP) ==")
             try:
@@ -655,9 +725,18 @@ async def main_async(args: argparse.Namespace) -> int:
                         zip_name=base_zip_name,
                     )
             except Exception as e:
+                archive_ok = False
+                archive_error = str(e)
                 short_fail(logger, f"ZIP не создан: {e}")
+                emit_progress(logger, "archive", f"Архив не создан: {type(e).__name__}: {str(e)[:400]}")
 
         logger.info("== Этап 8: Итоговый отчёт ==")
+        summary = "Загрузка завершена" if ok else "Загрузка завершилась с ошибками"
+        if not archive_ok:
+            summary += f"; архив не создан: {archive_error[:350]}"
+        emit_progress(logger, "finish", summary,
+                      total=len(items), completed=len(items), downloaded=sum(bool(x.get('ok')) for x in items),
+                      failed=sum(not x.get('ok') for x in items), bytes=sum(x.get('bytes', 0) for x in items))
         logger.info(f"Лог-файл: {logpath}")
         logger.info(f"Каталог загрузки: {out_dir}")
         logger.info(f"Манифест: {manifest_path}")
@@ -668,7 +747,7 @@ async def main_async(args: argparse.Namespace) -> int:
                 logger.info(f"ZIP часть: {p}")
 
         await context.close(); await browser.close()
-        return 0 if ok else 5
+        return 0 if ok and archive_ok else 5
 
 def main():
     args = parse_args()

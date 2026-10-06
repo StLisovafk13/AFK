@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from html_utils import json_for_html
+
 DEFAULT_DB_PATH = os.environ.get("BOT_DB_PATH", "vsco_links.db")
 
 
@@ -139,7 +141,11 @@ def _load_comments(conn: sqlite3.Connection, item_ids: List[int]) -> Dict[int, L
         return {}
     try:
         placeholders = ",".join("?" for _ in item_ids)
-        query = f"SELECT item_id, comment FROM comments WHERE item_id IN ({placeholders}) ORDER BY id"
+        query = (
+            "SELECT c.item_id, c.comment FROM comments AS c"
+            " JOIN items AS i ON i.id=c.item_id AND i.chat_id=c.chat_id"
+            f" WHERE c.item_id IN ({placeholders}) ORDER BY c.id"
+        )
         rows = conn.execute(query, item_ids).fetchall()
     except sqlite3.OperationalError:
         return {}
@@ -279,7 +285,7 @@ def build_profile_html(profile: ProfilePayload) -> str:
         }
         for p in profile.photos_with_coords
     ]
-    map_data_json = json.dumps(map_points, ensure_ascii=False)
+    map_data_json = json_for_html(map_points)
 
     gallery_cards: List[str] = []
     for photo in photos:
@@ -353,6 +359,7 @@ def build_profile_html(profile: ProfilePayload) -> str:
       </section>
       <script>
         const MAP_DATA = {map_data_json};
+        const PROFILE_USERNAME = {json_for_html(profile.username)};
         const map = L.map('photo-map');
         const bounds = L.latLngBounds();
         L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
@@ -361,12 +368,18 @@ def build_profile_html(profile: ProfilePayload) -> str:
         if (MAP_DATA.length) {{
           MAP_DATA.forEach(item => {{
             const marker = L.marker([item.lat, item.lon]).addTo(map);
-            marker.bindPopup(`
-              <div class="popup">
-                <div class="popup-title">@{html.escape(profile.username)}</div>
-                <a href="${{item.url}}" target="_blank" rel="noopener">Открыть фото</a>
-              </div>
-            `);
+            const popup = document.createElement('div');
+            popup.className = 'popup';
+            const popupTitle = document.createElement('div');
+            popupTitle.className = 'popup-title';
+            popupTitle.textContent = '@' + PROFILE_USERNAME;
+            const photoLink = document.createElement('a');
+            photoLink.href = item.url;
+            photoLink.target = '_blank';
+            photoLink.rel = 'noopener';
+            photoLink.textContent = 'Открыть фото';
+            popup.append(popupTitle, photoLink);
+            marker.bindPopup(popup);
             bounds.extend([item.lat, item.lon]);
           }});
           if (bounds.isValid()) {{
