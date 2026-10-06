@@ -96,6 +96,7 @@ import socket
 from download_progress import parse_progress, progress_details
 from html_utils import json_for_html
 from download_options import validate_download_flags
+from network_diagnostics import startup_network_report
 
 # ---- external utils (optional HTML export parser) ----
 from vsco_parser import parse_html_file, dedupe_rows
@@ -7888,8 +7889,13 @@ async def _notify_startup_ip(ip_address: Optional[str]) -> None:
     if not targets:
         return
 
-    ip_label = ip_address or "не удалось определить"
-    text = f"🤖 Бот запущен.\nIP: <code>{escape(ip_label)}</code>"
+    try:
+        text = await asyncio.wait_for(startup_network_report(ip_address), timeout=40)
+    except Exception as exc:
+        log.warning("Startup network diagnostics failed: %s", type(exc).__name__)
+        text = ("🤖 Бот запущен.\n"
+                f"Локальный IP: <code>{escape(ip_address or 'не определён')}</code>\n"
+                f"Проверка внешнего IP и страны не завершена ({type(exc).__name__}).")
 
     for chat_id in targets:
         try:
