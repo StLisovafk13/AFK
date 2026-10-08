@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -817,19 +818,35 @@ def populate_media_metadata(
                 payload = json.dumps(metadata, ensure_ascii=False)
             except (TypeError, ValueError):
                 payload = json.dumps({"raw": str(metadata)}, ensure_ascii=False)
-            try:
-                conn.execute(
-                    "UPDATE items SET meta_json=? WHERE id=?",
-                    (payload, item_id),
-                )
-                conn.commit()
-            except sqlite3.OperationalError as exc:
-                conn.rollback()
-                LOGGER.warning(
-                    "Не удалось обновить метаданные для %s (id=%s): %s",
-                    url,
-                    item_id,
-                    exc,
-                )
+            for attempt in range(3):
+                try:
+                    conn.execute(
+                        "UPDATE items SET meta_json=? WHERE id=?",
+                        (payload, item_id),
+                    )
+                    conn.commit()
+                except sqlite3.OperationalError as exc:
+                    conn.rollback()
+                    if "locked" in str(exc).lower() and attempt < 2:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    LOGGER.warning(
+                        "Не удалось обновить метаданные для %s (id=%s): %s",
+                        url,
+                        item_id,
+                        exc,
+                    )
+                    break
+                except sqlite3.DatabaseError as exc:
+                    conn.rollback()
+                    LOGGER.warning(
+                        "Не удалось обновить метаданные для %s (id=%s): %s",
+                        url,
+                        item_id,
+                        exc,
+                    )
+                    break
+                else:
+                    break
     finally:
         conn.close()
