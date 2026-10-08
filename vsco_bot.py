@@ -1319,7 +1319,7 @@ def fetch_profile_archive_info(username: Optional[str], *, max_items: int = 120)
     finally:
         conn.close()
 
-DAILY_PROFILE_LIMIT = 20
+DAILY_PROFILE_LIMIT = max(0, int(os.getenv("BOT_DAILY_PROFILE_LIMIT", "20") or "20"))
 
 
 def _daily_profile_count(chat_id: int) -> int:
@@ -7609,10 +7609,10 @@ async def cmd_tutorial(msg: Message, user_id: Optional[int] = None):
         "Также формируется карта с координатами.\n\n"
 
         "❗ Для доступа к командам <code>/dl</code> (скачивание профиля) и <code>/export</code> "
-        "(экспорт базы в формате csv, карты и галереи) нужно выполнить одно из условий:\n"
-        "• Отправить в бота или 15 уникальных ссылок профиля, или 10 уникальных ссылок фоток с координатами.\n"
+        "(экспорт базы в формате csv, карты и галереи) нужно добавить новые профили:\n"
+        f"• Минимум {DAILY_PROFILE_LIMIT} новых профилей за последние 24 часа.\n"
         "Можно добавлять комментарий к ссылке, который будет добавлен в базу.\n"
-        "Доступ к командам сбрасывается каждые сутки.\n\n"
+        "Доступ к командам проверяется по данным за последние 24 часа.\n\n"
 
         "🔶 Все результаты <a href='https://t.me/VSCoord_bot'>@VSCoord_bot</a> воспринимаются "
         "<a href='https://t.me/vscoleak_bot'>@vscoleak_bot</a>.\n"
