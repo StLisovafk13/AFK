@@ -436,6 +436,9 @@ async def playwright_scan_profile(
     delay: float = 0.4,
     target_count: int = 0,
     navigation_timeout_ms: Optional[int] = 30000,
+    headless: bool = True,
+    browser_name: str = "firefox",
+    keep_browser_open: bool = False,
 ) -> list[str]:
     """Extract profile media via Playwright with graceful HTTP fallback."""
 
@@ -461,7 +464,7 @@ async def playwright_scan_profile(
     if not gallery_url.endswith("/gallery"):
         gallery_url = f"{gallery_url}/gallery"
 
-    browser = context = page = None
+    browser = context = page = playwright_cm = None
 
     def _log(level: str, message: str, *args: object) -> None:
         if logger is None:
@@ -477,177 +480,181 @@ async def playwright_scan_profile(
         root = getattr(page, "url", None) or gallery_url
         return extract_media_urls_from_html(html, max_width=max_width, root=root)
 
+    playwright_started = False
     try:
-        async with async_playwright() as playwright:
-            _log("debug", "playwright_scan_profile: launching Firefox")
-            browser = await playwright.firefox.launch(headless=True)
-            _log("debug", "playwright_scan_profile: creating new browser context")
-            context = await browser.new_context()
-            _log("debug", "playwright_scan_profile: creating new page")
-            page = await context.new_page()
-            if navigation_timeout_ms is not None:
-                page.set_default_navigation_timeout(navigation_timeout_ms)
-            _log("info", "playwright_scan_profile: navigating to %s", gallery_url)
-            goto_kwargs = {"wait_until": "networkidle"}
-            if navigation_timeout_ms is not None:
-                goto_kwargs["timeout"] = navigation_timeout_ms
-            await page.goto(gallery_url, **goto_kwargs)
+        playwright_cm = async_playwright()
+        playwright = await playwright_cm.__aenter__()
+        playwright_started = True
+
+        browser_name = (browser_name or "firefox").strip().lower()
+        browser_type = getattr(playwright, browser_name, None)
+        if browser_type is None:
+            raise ValueError(f"Unsupported Playwright browser '{browser_name}'")
+
+        _log(
+            "debug",
+            "playwright_scan_profile: launching %s (headless=%s)",
+            browser_name,
+            headless,
+        )
+        browser = await browser_type.launch(headless=headless)
+        _log("debug", "playwright_scan_profile: creating new browser context")
+        context = await browser.new_context()
+        _log("debug", "playwright_scan_profile: creating new page")
+        page = await context.new_page()
+        if navigation_timeout_ms is not None:
+            page.set_default_navigation_timeout(navigation_timeout_ms)
+        _log("info", "playwright_scan_profile: navigating to %s", gallery_url)
+        goto_kwargs = {"wait_until": "networkidle"}
+        if navigation_timeout_ms is not None:
+            goto_kwargs["timeout"] = navigation_timeout_ms
+        await page.goto(gallery_url, **goto_kwargs)
+        _log(
+            "debug",
+            "playwright_scan_profile: navigation finished, current URL %s",
+            getattr(page, "url", None),
+        )
+
+        urls = dedupe_keep_order(await _extract_current_urls())
+        if logger is not None and urls:
+            logger.info("playwright_scan_profile: initial %d asset(s)", len(urls))
+
+        max_scrolls = 120
+        stagnation_limit = 5
+        no_growth_click_limit = 3
+        max_clicks = 500
+        load_clicks = 0
+        stagnation = 0
+        prev_count = len(urls)
+
+        for scroll_idx in range(max_scrolls):
+            btn = page.locator("#loadMore-Button").first
+            try:
+                btn_count = await btn.count()
+                btn_exists = btn_count > 0
+                btn_visible = btn_exists and await btn.is_visible()
+                disabled_attr = await btn.get_attribute("disabled") if btn_exists else None
+                aria_disabled = (
+                    await btn.get_attribute("aria-disabled") if btn_exists else None
+                )
+                btn_disabled = (
+                    disabled_attr is not None
+                    or (aria_disabled or "").lower() in {"true", "1"}
+                )
+            except Exception:
+                btn_exists = btn_visible = False
+                btn_disabled = True
+
             _log(
                 "debug",
-                "playwright_scan_profile: navigation finished, current URL %s",
-                getattr(page, "url", None),
+                (
+                    "playwright_scan_profile: scroll %d - btn_exists=%s "
+                    "btn_visible=%s btn_disabled=%s load_clicks=%d"
+                ),
+                scroll_idx,
+                btn_exists,
+                btn_visible,
+                btn_disabled,
+                load_clicks,
             )
 
-            urls = dedupe_keep_order(await _extract_current_urls())
-            if logger is not None and urls:
-                logger.info("playwright_scan_profile: initial %d asset(s)", len(urls))
-
-            max_scrolls = 120
-            stagnation_limit = 5
-            no_growth_click_limit = 3
-            max_clicks = 500
-            load_clicks = 0
-            stagnation = 0
-            prev_count = len(urls)
-
-            for scroll_idx in range(max_scrolls):
-                btn = page.locator("#loadMore-Button").first
+            clicked = False
+            if (
+                btn_exists
+                and btn_visible
+                and not btn_disabled
+                and load_clicks < max_clicks
+            ):
                 try:
-                    btn_count = await btn.count()
-                    btn_exists = btn_count > 0
-                    btn_visible = btn_exists and await btn.is_visible()
-                    disabled_attr = await btn.get_attribute("disabled") if btn_exists else None
-                    aria_disabled = (
-                        await btn.get_attribute("aria-disabled") if btn_exists else None
-                    )
-                    btn_disabled = (
-                        disabled_attr is not None
-                        or (aria_disabled or "").lower() in {"true", "1"}
-                    )
-                except Exception:
-                    btn_exists = btn_visible = False
-                    btn_disabled = True
-
-                _log(
-                    "debug",
-                    (
-                        "playwright_scan_profile: scroll %d - btn_exists=%s "
-                        "btn_visible=%s btn_disabled=%s load_clicks=%d"
-                    ),
-                    scroll_idx,
-                    btn_exists,
-                    btn_visible,
-                    btn_disabled,
-                    load_clicks,
-                )
-
-                clicked = False
-                if (
-                    btn_exists
-                    and btn_visible
-                    and not btn_disabled
-                    and load_clicks < max_clicks
-                ):
-                    try:
-                        await btn.scroll_into_view_if_needed()
-                        _log(
-                            "debug",
-                            "playwright_scan_profile: button scrolled into view",
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        _log(
-                            "debug",
-                            "playwright_scan_profile: attempting to click load more",
-                        )
-                        await btn.click()
-                        load_clicks += 1
-                        clicked = True
-                        _log(
-                            "debug",
-                            "playwright_scan_profile: load more clicked (%d)",
-                            load_clicks,
-                        )
-                        try:
-                            await page.wait_for_load_state("networkidle", timeout=2000)
-                            _log(
-                                "debug",
-                                "playwright_scan_profile: network idle after click",
-                            )
-                        except Exception:
-                            await page.wait_for_timeout(int(max(0.1, delay) * 1000))
-                            _log(
-                                "debug",
-                                "playwright_scan_profile: network idle timeout, "
-                                "waited for %.2f seconds",
-                                max(0.1, delay),
-                            )
-                    except Exception as exc:
-                        _log(
-                            "warning",
-                            "playwright_scan_profile: load more click failed: %s",
-                            exc,
-                        )
-
-                await page.evaluate(
-                    "() => { window.scrollBy(0, Math.floor(window.innerHeight * 0.9)); }"
-                )
-                await page.wait_for_timeout(int(max(0.1, delay) * 1000))
-                _log(
-                    "debug",
-                    "playwright_scan_profile: performed scroll %d and waited %.2f seconds",
-                    scroll_idx,
-                    max(0.1, delay),
-                )
-
-                extracted = dedupe_keep_order(await _extract_current_urls())
-                combined = dedupe_keep_order(urls + extracted)
-                new_count = len(combined)
-                if logger is not None and new_count > prev_count:
-                    logger.info("playwright_scan_profile: progress %d", new_count)
-                elif logger is not None:
-                    logger.debug(
-                        "playwright_scan_profile: no new assets after scroll %d (total %d)",
-                        scroll_idx,
-                        new_count,
-                    )
-                urls = combined
-
-                if target_count and new_count >= target_count:
-                    _log(
-                        "info",
-                        "playwright_scan_profile: reached target %d assets",
-                        target_count,
-                    )
-                    break
-
-                if new_count > prev_count:
-                    stagnation = 0
-                    prev_count = new_count
-                    continue
-
-                stagnation += 1
-                if (not btn_exists or not btn_visible or btn_disabled) and stagnation >= stagnation_limit:
-                    break
-                if clicked and stagnation >= no_growth_click_limit:
+                    await btn.scroll_into_view_if_needed()
                     _log(
                         "debug",
-                        "playwright_scan_profile: stopping after %d scrolls due to "
-                        "no growth post-click",
-                        scroll_idx + 1,
+                        "playwright_scan_profile: button scrolled into view",
                     )
-                    break
-                if not clicked and stagnation >= stagnation_limit:
+                    await page.wait_for_timeout(50)
+                    await btn.click()
+                    load_clicks += 1
+                    clicked = True
                     _log(
                         "debug",
-                        "playwright_scan_profile: stopping after %d scrolls due to "
-                        "stagnation",
-                        scroll_idx + 1,
+                        "playwright_scan_profile: load more clicked (%d)",
+                        load_clicks,
                     )
-                    break
 
-            return urls
+                    try:
+                        await page.wait_for_load_state("networkidle")
+                        _log(
+                            "debug",
+                            "playwright_scan_profile: network idle after click",
+                        )
+                    except TimeoutError:
+                        _log(
+                            "debug",
+                            "playwright_scan_profile: network idle timeout, continuing",
+                        )
+                except Exception as exc:  # pragma: no cover - best-effort click
+                    _log(
+                        "warning",
+                        "playwright_scan_profile: load more click failed: %s",
+                        exc,
+                    )
+
+            await page.evaluate("window.scrollBy(0, document.body.scrollHeight);")
+            await page.wait_for_timeout(int(max(0.1, delay) * 1000))
+            _log(
+                "debug",
+                "playwright_scan_profile: performed scroll %d and waited %.2f seconds",
+                scroll_idx,
+                max(0.1, delay),
+            )
+
+            extracted = dedupe_keep_order(await _extract_current_urls())
+            combined = dedupe_keep_order(urls + extracted)
+            new_count = len(combined)
+            if logger is not None and new_count > prev_count:
+                logger.info("playwright_scan_profile: progress %d", new_count)
+            elif logger is not None:
+                logger.debug(
+                    "playwright_scan_profile: no new assets after scroll %d (total %d)",
+                    scroll_idx,
+                    new_count,
+                )
+            urls = combined
+
+            if target_count and new_count >= target_count:
+                _log(
+                    "info",
+                    "playwright_scan_profile: reached target %d assets",
+                    target_count,
+                )
+                break
+
+            if new_count > prev_count:
+                stagnation = 0
+                prev_count = new_count
+                continue
+
+            stagnation += 1
+            if (not btn_exists or not btn_visible or btn_disabled) and stagnation >= stagnation_limit:
+                break
+            if clicked and stagnation >= no_growth_click_limit:
+                _log(
+                    "debug",
+                    "playwright_scan_profile: stopping after %d scrolls due to "
+                    "no growth post-click",
+                    scroll_idx + 1,
+                )
+                break
+            if not clicked and stagnation >= stagnation_limit:
+                _log(
+                    "debug",
+                    "playwright_scan_profile: stopping after %d scrolls due to "
+                    "stagnation",
+                    scroll_idx + 1,
+                )
+                break
+
+        return urls
     except Exception as exc:
         if logger is not None:
             logger.warning(
@@ -655,18 +662,29 @@ async def playwright_scan_profile(
                 exc,
             )
     finally:
-        for handle in (page, context, browser):
-            if handle is None:
-                continue
+        if keep_browser_open:
             _log(
-                "debug",
-                "playwright_scan_profile: closing %s",
-                handle.__class__.__name__,
+                "info",
+                "playwright_scan_profile: keeping browser open for inspection",
             )
-            try:
-                await handle.close()  # type: ignore[func-returns-value]
-            except Exception:  # pragma: no cover - cleanup best-effort
-                pass
+        else:
+            for handle in (page, context, browser):
+                if handle is None:
+                    continue
+                _log(
+                    "debug",
+                    "playwright_scan_profile: closing %s",
+                    handle.__class__.__name__,
+                )
+                try:
+                    await handle.close()  # type: ignore[func-returns-value]
+                except Exception:  # pragma: no cover - cleanup best-effort
+                    pass
+            if playwright_cm is not None and playwright_started:
+                try:
+                    await playwright_cm.__aexit__(None, None, None)
+                except Exception:  # pragma: no cover - cleanup best-effort
+                    pass
 
     if session is not None:
         urls, _html = await scan_profile_media(
