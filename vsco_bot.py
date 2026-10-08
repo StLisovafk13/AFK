@@ -131,6 +131,7 @@ from profile_link_scanner import (
     store_profile_media,
 )
 from export_profile_html import ProfilePayload, build_profile_html, load_profile
+from startup_broadcast import StartupBroadcast
 
 # ---------------------- setup & logging ----------------------
 load_dotenv()
@@ -197,6 +198,8 @@ def _env_flag(name: str, default: bool) -> bool:
 
 
 BOT_INLINE_PLAYWRIGHT = _env_flag("BOT_INLINE_PLAYWRIGHT", False)
+BOT_STARTUP_BROADCAST_ENABLED = _env_flag("BOT_STARTUP_BROADCAST_ENABLED", False)
+BOT_STARTUP_BROADCAST_TEXT = os.getenv("BOT_STARTUP_BROADCAST_TEXT", "Бот запущен и готов к работе!")
 
 
 def _parse_admin_ids(raw: str) -> set[int]:
@@ -5334,6 +5337,13 @@ def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"
 if not TOKEN: raise SystemExit("TELEGRAM_BOT_TOKEN is not set")
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
+startup_broadcast = StartupBroadcast(
+    db_connect,
+    enabled=BOT_STARTUP_BROADCAST_ENABLED,
+    text=BOT_STARTUP_BROADCAST_TEXT,
+)
+dp.message.outer_middleware(startup_broadcast)
+dp.callback_query.outer_middleware(startup_broadcast)
 dp.include_router(zip_router)
 @dataclass
 class Session:
@@ -7818,6 +7828,7 @@ async def _notify_startup_ip(ip_address: Optional[str]) -> None:
 
 async def main():
     init_db()
+    await asyncio.to_thread(startup_broadcast.initialize)
     await bot.delete_webhook(drop_pending_updates=True)
     await _notify_startup_ip(_get_instance_ip_address())
     # --- start download worker ---
@@ -7849,9 +7860,13 @@ async def main():
     ):
         _LINKS_NOTIFY_SCHEDULER_TASK = asyncio.create_task(_links_notify_scheduler_loop())
     log.info("Bot is starting polling…")
+    startup_broadcast_task = asyncio.create_task(startup_broadcast.send(bot))
     try:
         await _start_polling_with_retries()
     finally:
+        startup_broadcast_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await startup_broadcast_task
         for task in list(_PROFILE_SCAN_TASKS):
             task.cancel()
             with contextlib.suppress(Exception):
