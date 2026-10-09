@@ -81,6 +81,7 @@ from aiogram.types import (
     KeyboardButton,
 )
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.utils.text_decorations import add_surrogates, remove_surrogates
 import aiohttp
@@ -136,6 +137,7 @@ from startup_broadcast import StartupBroadcast
 # ---------------------- setup & logging ----------------------
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_PROXY = os.getenv("BOT_TELEGRAM_PROXY", "").strip() or None
 
 
 def _prepare_storage_dir(env_var: str, default: Path) -> Path:
@@ -5335,7 +5337,11 @@ def build_map_images(items: List[Dict[str, Any]], title="VSCO Profiles (Images)"
 
 # ---------------------- Bot ----------------------
 if not TOKEN: raise SystemExit("TELEGRAM_BOT_TOKEN is not set")
-bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+bot = Bot(
+    TOKEN,
+    session=AiohttpSession(proxy=TELEGRAM_PROXY),
+    default=DefaultBotProperties(parse_mode="HTML"),
+)
 dp = Dispatcher()
 startup_broadcast = StartupBroadcast(
     db_connect,
