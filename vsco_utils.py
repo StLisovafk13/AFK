@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import re
+from browser_config import browser_headless
 from typing import Any, Iterable, Optional, Sequence
 from urllib.parse import (
     parse_qsl,
@@ -480,7 +481,7 @@ async def playwright_scan_profile(
     try:
         async with async_playwright() as playwright:
             _log("debug", "playwright_scan_profile: launching Firefox")
-            browser = await playwright.firefox.launch(headless=True)
+            browser = await playwright.firefox.launch(headless=browser_headless())
             _log("debug", "playwright_scan_profile: creating new browser context")
             context = await browser.new_context()
             _log("debug", "playwright_scan_profile: creating new page")

@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
+from browser_config import browser_headless
 
 __all__ = ["extract_exif_from_url", "extract_exif_with_playwright"]
 
@@ -182,7 +183,7 @@ def extract_exif_with_playwright(
 
     try:
         with sync_playwright() as pw:
-            browser = pw.firefox.launch(headless=True)
+            browser = pw.firefox.launch(headless=browser_headless())
             context = browser.new_context(user_agent=ua)
             try:
                 if referer:

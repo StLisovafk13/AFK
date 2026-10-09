@@ -24,6 +24,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 import aiohttp
 
 from exif_fetcher import extract_exif_from_url
+from browser_config import browser_headless
 
 from vsco_utils import (
     dedupe_keep_order,
@@ -316,7 +317,7 @@ async def _collect_with_playwright(
     browser = context = page = None
     try:
         async with async_playwright() as playwright:
-            browser = await playwright.firefox.launch(headless=True)
+            browser = await playwright.firefox.launch(headless=browser_headless())
             context = await browser.new_context(extra_http_headers=headers)
             page = await context.new_page()
             try:

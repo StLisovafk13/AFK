@@ -38,6 +38,7 @@ import sys
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from browser_config import browser_headless
 from typing import List, Dict, Any, Optional, Tuple, NamedTuple
 
 from urllib.parse import urlsplit
@@ -573,7 +574,7 @@ async def main_async(args: argparse.Namespace) -> int:
 
     logger.info("== Этап 2–3: Доступ к профилю, сбор URL, Load More + скролл ==")
     async with async_playwright() as pw:
-        browser = await pw.firefox.launch(headless=True)
+        browser = await pw.firefox.launch(headless=browser_headless())
         context = await browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
