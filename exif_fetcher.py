@@ -177,11 +177,10 @@ def extract_exif_with_playwright(
     temp_path = Path(temp_file.name)
 
     headers = {"Referer": referer} if referer else {}
-    ua = user_agent or _DEFAULT_HEADERS.get("User-Agent") or "Mozilla/5.0"
 
     try:
         with managed_sync_browser() as browser:
-            context = browser.new_context(user_agent=ua)
+            context = browser.new_context(**({"user_agent": user_agent} if user_agent else {}))
             if referer:
                 page = context.new_page()
                 try:
