@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
-from browser_config import browser_headless
+from browser_config import managed_sync_browser
 
 __all__ = ["extract_exif_from_url", "extract_exif_with_playwright"]
 
@@ -172,8 +172,6 @@ def extract_exif_with_playwright(
     :func:`extract_exif_from_url`.
     """
 
-    from playwright.sync_api import sync_playwright
-
     temp_file = tempfile.NamedTemporaryFile(delete=False)
     temp_file.close()
     temp_path = Path(temp_file.name)
@@ -182,36 +180,31 @@ def extract_exif_with_playwright(
     ua = user_agent or _DEFAULT_HEADERS.get("User-Agent") or "Mozilla/5.0"
 
     try:
-        with sync_playwright() as pw:
-            browser = pw.firefox.launch(headless=browser_headless())
+        with managed_sync_browser() as browser:
             context = browser.new_context(user_agent=ua)
-            try:
-                if referer:
-                    page = context.new_page()
-                    try:
-                        page.goto(
-                            referer,
-                            wait_until="domcontentloaded",
-                            timeout=timeout * 1000,
-                        )
-                    except Exception:
-                        # Even if the page fails to load completely we still try
-                        # to reuse whatever cookies were set.
-                        pass
-                response = context.request.get(
-                    url,
-                    timeout=timeout * 1000,
-                    headers=headers,
-                )
-                if not response.ok:
-                    raise ExifExtractionError(
-                        f"playwright failed for {url}: status={response.status}"
+            if referer:
+                page = context.new_page()
+                try:
+                    page.goto(
+                        referer,
+                        wait_until="domcontentloaded",
+                        timeout=timeout * 1000,
                     )
-                content = response.body()
-                temp_path.write_bytes(content)
-            finally:
-                context.close()
-                browser.close()
+                except Exception:
+                    # Even if the page fails to load completely we still try
+                    # to reuse whatever cookies were set.
+                    pass
+            response = context.request.get(
+                url,
+                timeout=timeout * 1000,
+                headers=headers,
+            )
+            if not response.ok:
+                raise ExifExtractionError(
+                    f"playwright failed for {url}: status={response.status}"
+                )
+            content = response.body()
+            temp_path.write_bytes(content)
 
         return _extract_metadata_from_file(str(temp_path))
     except ExifExtractionError:

@@ -38,7 +38,7 @@ import sys
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from browser_config import browser_headless
+from browser_config import managed_async_browser
 from typing import List, Dict, Any, Optional, Tuple, NamedTuple
 
 from urllib.parse import urlsplit
@@ -563,7 +563,6 @@ def build_zip_single(
 # MAIN
 # -----------------------------
 async def main_async(args: argparse.Namespace) -> int:
-    from playwright.async_api import async_playwright
 
     user, profile_url = normalize_profile(args.username, args.profile_url)
     logger, logpath, ts = setup_logger(user)
@@ -573,8 +572,7 @@ async def main_async(args: argparse.Namespace) -> int:
     out_root = Path(args.out); out_dir = out_root / user; out_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info("== Этап 2–3: Доступ к профилю, сбор URL, Load More + скролл ==")
-    async with async_playwright() as pw:
-        browser = await pw.firefox.launch(headless=browser_headless())
+    async with managed_async_browser() as browser:
         context = await browser.new_context(
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -585,12 +583,12 @@ async def main_async(args: argparse.Namespace) -> int:
         resp = await page.goto(profile_url, wait_until="domcontentloaded", timeout=int(args.timeout * 1000))
         if not resp or not resp.ok:
             short_fail(logger, f"Страница не загрузилась (status={getattr(resp,'status',None)}). Провал шага.")
-            await context.close(); await browser.close(); return 3
+            return 3
 
         urls = await collect_image_urls(page, logger, delay=args.delay, timeout=args.timeout,
                                         target_count=args.max, max_width=args.max_width)
         if not urls:
-            short_fail(logger, "Не удалось извлечь ссылки на медиа."); await context.close(); await browser.close(); return 3
+            short_fail(logger, "Не удалось извлечь ссылки на медиа."); return 3
 
         # Ассоциация постеров с видео (опциональное исключение постеров)
         final_urls, thumb_pairs = pair_thumbnails_with_videos(urls, skip_thumbs=args.skip_video_thumbs)
@@ -668,7 +666,6 @@ async def main_async(args: argparse.Namespace) -> int:
             for p in zip_created_parts:
                 logger.info(f"ZIP часть: {p}")
 
-        await context.close(); await browser.close()
         return 0 if ok else 5
 
 def main():
