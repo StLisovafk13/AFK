@@ -110,7 +110,12 @@ class ExportManager:
             InlineKeyboardButton(text="🗺️ Карта (польз.)", callback_data="export:format:map_users"),
             InlineKeyboardButton(text="🗺️ Карта (фото)", callback_data="export:format:map_images"),
         ]
-        return InlineKeyboardMarkup(inline_keyboard=[scope_row, types_row, maps_row])
+        city_row = [
+            InlineKeyboardButton(text="🏙️ Город", callback_data="export:city"),
+        ]
+        return InlineKeyboardMarkup(
+            inline_keyboard=[scope_row, types_row, maps_row, city_row]
+        )
 
     async def open_menu(self, msg: Message, user_id: Optional[int] = None) -> None:
         if not await self._deps.ensure_user_has_access(msg, user_id=user_id):
@@ -127,7 +132,7 @@ class ExportManager:
 
         session = self._deps.get_session(msg.chat.id)
         await msg.answer(
-            "Экспорт VSCO:\n• CSV / Галерея\n• Карта: по пользователям или по фото",
+            "Экспорт VSCO:\n• CSV / Галерея\n• Карта: по пользователям или по фото\n• Отчёт по городу (галерея + карта)",
             reply_markup=self.build_scope_keyboard(session),
         )
 
@@ -173,6 +178,19 @@ class ExportManager:
                 await cq.answer("Область обновлена")
             else:
                 await cq.answer("Неизвестная область", show_alert=True)
+            return
+
+        if len(parts) >= 2 and parts[1] == "city":
+            session.pending_action = "city_export"  # type: ignore[attr-defined]
+            scope_label = "текущего чата" if session.export_scope == "chat" else "всей базы"
+            await cq.answer("Введите город", cache_time=0)
+            try:
+                await message.answer(
+                    "🏙️ Отправьте название города."
+                    f" Используется область экспорта: {scope_label}."
+                )
+            except Exception:
+                pass
             return
 
         if len(parts) >= 3 and parts[1] == "format":
