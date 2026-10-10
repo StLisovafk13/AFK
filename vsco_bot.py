@@ -7495,6 +7495,22 @@ async def _dl_worker():
                 _CURRENT_JOB = None
                 continue
 
+            if rc != 0:
+                reason = (
+                    "VSCO не загрузил профиль полностью: ошибка страницы или API медиа. "
+                    "Подробности в журнале загрузчика."
+                    if rc == 6 else f"Загрузчик завершился с ошибкой (код {rc}). Подробности в журнале загрузчика."
+                )
+                await _safe_edit(
+                    job.chat_id,
+                    progress.message_id,
+                    f"❌ Задание #{job.id}: {reason}",
+                    reply_markup=None,
+                )
+                log.error("Job #%s failed with downloader exit code %s; results not sent", job.id, rc)
+                _CURRENT_JOB = None
+                continue
+
             # Отправка результатов
             user_dirs = [p for p in job.out_base.glob("*") if p.is_dir()]
             user_dir = max(user_dirs, key=lambda p: p.stat().st_mtime, default=None)

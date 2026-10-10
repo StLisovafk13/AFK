@@ -39,6 +39,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from browser_config import managed_async_browser
+from gallery_diagnostics import GalleryLoadError, GalleryLoadMonitor
 from typing import List, Dict, Any, Optional, Tuple, NamedTuple
 
 from urllib.parse import urlsplit
@@ -199,6 +200,7 @@ async def collect_image_urls(
     timeout: float,
     target_count: int,
     max_width: int,
+    monitor: Optional[GalleryLoadMonitor] = None,
 ) -> List[str]:
     """
     Открыта страница профиля.
@@ -207,7 +209,10 @@ async def collect_image_urls(
     Параллельно используем мягкий скролл как запасной механизм.
     """
 
+    monitor = monitor or GalleryLoadMonitor(logger)
+
     def extract_from_html(html: str) -> List[str]:
+        monitor.check(html)
         root = page.url if hasattr(page, "url") else None
         return extract_media_urls_from_html(html, max_width=max_width, root=root)
 
@@ -573,20 +578,19 @@ async def main_async(args: argparse.Namespace) -> int:
 
     logger.info("== Этап 2–3: Доступ к профилю, сбор URL, Load More + скролл ==")
     async with managed_async_browser() as browser:
-        context = await browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/126.0 Safari/537.36")
-        )
+        context = await browser.new_context()
         page = await context.new_page()
+        monitor = GalleryLoadMonitor(logger)
+        page.on("response", monitor.on_response)
         logger.info(f"Открываю профиль: {profile_url}")
         resp = await page.goto(profile_url, wait_until="domcontentloaded", timeout=int(args.timeout * 1000))
+        monitor.check(await page.content())
         if not resp or not resp.ok:
             short_fail(logger, f"Страница не загрузилась (status={getattr(resp,'status',None)}). Провал шага.")
             return 3
 
         urls = await collect_image_urls(page, logger, delay=args.delay, timeout=args.timeout,
-                                        target_count=args.max, max_width=args.max_width)
+                                        target_count=args.max, max_width=args.max_width, monitor=monitor)
         if not urls:
             short_fail(logger, "Не удалось извлечь ссылки на медиа."); return 3
 
@@ -674,6 +678,9 @@ def main():
         print("❌ Некорректный --profile-url", file=sys.stderr); sys.exit(2)
     try:
         rc = asyncio.run(main_async(args))
+    except GalleryLoadError as exc:
+        print(f"VSCO incomplete profile: {exc}", file=sys.stderr)
+        rc = 6
     except KeyboardInterrupt:
         print("\nОстановлено пользователем."); rc = 130
     sys.exit(rc)

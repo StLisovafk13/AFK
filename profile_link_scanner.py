@@ -317,7 +317,9 @@ async def _collect_with_playwright(
     browser = context = page = None
     try:
         async with managed_async_browser() as browser:
-            context = await browser.new_context(extra_http_headers=headers)
+            context = await browser.new_context(
+                extra_http_headers={key: value for key, value in headers.items() if key.lower() != "user-agent"}
+            )
             page = await context.new_page()
             try:
                 await page.goto(
