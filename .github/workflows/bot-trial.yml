@@ -1,0 +1,130 @@
+name: Telegram bot trial
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Время работы бота в минутах"
+        type: choice
+        default: "30"
+        options: ["15", "30", "60", "120", "240"]
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: vsco-bot-trial
+  cancel-in-progress: false
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      BOT_DB_PATH: ${{ github.workspace }}/runtime/vsco_links.db
+      BOT_WORKDIR: ${{ github.workspace }}/runtime/work
+      BOT_LOGDIR: ${{ github.workspace }}/runtime/logs
+      BOT_BROWSER_HEADLESS: "1"
+      BOT_BROWSER_KEEP_OPEN: "0"
+      BOT_STARTUP_BROADCAST_ENABLED: "0"
+      PYTHONUNBUFFERED: "1"
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Validate bot token
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          python - <<'PY'
+          import os
+          if not os.getenv("TELEGRAM_BOT_TOKEN", "").strip():
+              raise SystemExit("Add TELEGRAM_BOT_TOKEN in repository Settings → Secrets and variables → Actions")
+          PY
+
+      - name: Install dependencies and Firefox
+        run: |
+          python -m pip install -r requirements.txt
+          python -m playwright install --with-deps firefox
+          sudo apt-get update
+          sudo apt-get install -y libimage-exiftool-perl
+
+      - name: Download latest database artifact
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
+              ...context.repo, name: 'vsco-bot-database', per_page: 100
+            });
+            const artifact = artifacts.filter(a => !a.expired && a.workflow_run?.id !== context.runId)
+              .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0];
+            if (!artifact) {
+              core.info('No saved database found; use BOT_DB_SEED_URL or start with an empty database.');
+              return;
+            }
+            const archive = await github.rest.actions.downloadArtifact({
+              ...context.repo, artifact_id: artifact.id, archive_format: 'zip'
+            });
+            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'bot-database.zip'), Buffer.from(archive.data));
+            core.info(`Downloaded database artifact ${artifact.id} from run ${artifact.workflow_run?.id}`);
+
+      - name: Restore or import database
+        id: database
+        env:
+          BOT_DB_SEED_URL: ${{ secrets.BOT_DB_SEED_URL }}
+        run: |
+          python scripts/actions_database.py restore \
+            --database "$BOT_DB_PATH" \
+            --archive "$RUNNER_TEMP/bot-database.zip"
+          mkdir -p "$BOT_WORKDIR" "$BOT_LOGDIR"
+
+      - name: Run bot for selected duration
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          BOT_ADMIN_IDS: ${{ secrets.BOT_ADMIN_IDS }}
+          TRIAL_MINUTES: ${{ inputs.minutes }}
+        run: |
+          set +e
+          timeout --signal=INT --kill-after=30s "${TRIAL_MINUTES}m" python -u vsco_bot.py
+          result=$?
+          if [ "$result" -eq 124 ]; then
+            echo "Trial duration reached; bot stopped."
+            exit 0
+          fi
+          exit "$result"
+
+      - name: Create consistent SQLite snapshot
+        id: snapshot
+        if: ${{ always() && steps.database.outcome == 'success' }}
+        run: |
+          python scripts/actions_database.py snapshot \
+            --database "$BOT_DB_PATH" \
+            --output "$RUNNER_TEMP/bot-snapshot/vsco_links.db"
+
+      - name: Save database for next run
+        if: ${{ always() && steps.snapshot.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsco-bot-database
+          path: ${{ runner.temp }}/bot-snapshot/vsco_links.db
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Save troubleshooting logs
+        if: ${{ always() && steps.database.outcome == 'success' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsco-bot-logs
+          path: |
+            runtime/logs/
+            logs/
+          if-no-files-found: ignore
+          retention-days: 7
