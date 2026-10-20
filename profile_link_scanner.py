@@ -14,7 +14,6 @@ import asyncio
 import json
 import logging
 import re
-import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +22,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import aiohttp
 
+from database import Connection, connect_database, initialize_schema, OperationalError
 from exif_fetcher import extract_exif_from_url
 from browser_config import managed_async_browser
 
@@ -83,72 +83,17 @@ def utc_now_iso() -> str:
     return datetime.now(LOCAL_TZ).isoformat()
 
 
-def ensure_db_schema(conn: sqlite3.Connection) -> None:
-    """Create the SQLite schema used by :mod:`vsco_bot` when missing."""
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS links(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          chat_id INTEGER NOT NULL,
-          username TEXT NOT NULL,
-          url TEXT NOT NULL,
-          extra_json TEXT DEFAULT '',
-          created_at TEXT NOT NULL,
-          UNIQUE(chat_id, username)
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS items(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          chat_id INTEGER NOT NULL,
-          username TEXT DEFAULT '',
-          latitude REAL,
-          longitude REAL,
-          profile_url TEXT DEFAULT '',
-          image_url TEXT DEFAULT '',
-          source TEXT DEFAULT '',
-          source_file TEXT DEFAULT '',
-          added_by TEXT DEFAULT '',
-          meta_json TEXT DEFAULT '',
-          created_at TEXT NOT NULL,
-          UNIQUE(chat_id, username, image_url, profile_url)
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS comments(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          item_id INTEGER NOT NULL,
-          chat_id INTEGER NOT NULL,
-          comment TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          UNIQUE(item_id, comment),
-          FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
-        )
-        """
-    )
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
-    if "added_by" not in cols:
-        conn.execute("ALTER TABLE items ADD COLUMN added_by TEXT DEFAULT ''")
-    if "meta_json" not in cols:
-        conn.execute("ALTER TABLE items ADD COLUMN meta_json TEXT DEFAULT ''")
-    link_cols = {row[1] for row in conn.execute("PRAGMA table_info(links)")}
-    if "extra_json" not in link_cols:
-        conn.execute("ALTER TABLE links ADD COLUMN extra_json TEXT DEFAULT ''")
-    if "notified_at" not in link_cols:
-        conn.execute("ALTER TABLE links ADD COLUMN notified_at TEXT DEFAULT ''")
+def ensure_db_schema(conn) -> None:
+    initialize_schema(conn)
 
 
-def connect_db(path: Path) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, timeout=60, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    ensure_db_schema(conn)
+def connect_db(path: Path):
+    conn = connect_database(path)
+    try:
+        ensure_db_schema(conn)
+    except Exception:
+        conn.close()
+        raise
     return conn
 
 
@@ -825,7 +770,7 @@ def populate_media_metadata(
                     (payload, item_id),
                 )
                 conn.commit()
-            except sqlite3.OperationalError as exc:
+            except OperationalError as exc:
                 conn.rollback()
                 LOGGER.warning(
                     "Не удалось обновить метаданные для %s (id=%s): %s",

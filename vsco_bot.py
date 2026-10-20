@@ -26,7 +26,6 @@ import csv
 import math
 import os
 import re
-import sqlite3
 import asyncio
 import logging
 import secrets
@@ -65,6 +64,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     reverse_geocoder = None  # type: ignore
 
+from database import Connection, connect_database, initialize_schema, stream_query
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -1103,74 +1103,16 @@ HEADERS = {
 
 # ---------------------- DB ----------------------
 def db_connect():
-    conn = sqlite3.connect(DB_PATH, timeout=60, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
+    return connect_database(DB_PATH)
+
 
 def init_db():
     conn = db_connect()
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS links(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      chat_id INTEGER NOT NULL,
-      username TEXT NOT NULL,
-      url TEXT NOT NULL,
-      extra_json TEXT DEFAULT '',
-      created_at TEXT NOT NULL,
-      UNIQUE(chat_id, username)
-    )""")
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS items(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      chat_id INTEGER NOT NULL,
-      username TEXT DEFAULT '',
-      latitude REAL,
-      longitude REAL,
-      profile_url TEXT DEFAULT '',
-      image_url TEXT DEFAULT '',
-      source TEXT DEFAULT '',
-      source_file TEXT DEFAULT '',
-      added_by TEXT DEFAULT '',
-      meta_json TEXT DEFAULT '',
-      created_at TEXT NOT NULL,
-      UNIQUE(chat_id, username, image_url, profile_url)
-    )""")
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS comments(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      item_id INTEGER NOT NULL,
-      chat_id INTEGER NOT NULL,
-      comment TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      UNIQUE(item_id, comment),
-      FOREIGN KEY(item_id) REFERENCES items(id) ON DELETE CASCADE
-    )""")
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS user_access_links(
-      user_id INTEGER NOT NULL,
-      profile_url TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      PRIMARY KEY(user_id, profile_url)
-    )""")
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS user_access_state(
-      user_id INTEGER PRIMARY KEY,
-      invite_sent_at TEXT DEFAULT ''
-    )""")
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
-    if "added_by" not in cols:
-        conn.execute("ALTER TABLE items ADD COLUMN added_by TEXT DEFAULT ''")
-    if "meta_json" not in cols:
-        conn.execute("ALTER TABLE items ADD COLUMN meta_json TEXT DEFAULT ''")
-    link_cols = {row[1] for row in conn.execute("PRAGMA table_info(links)")}
-    if "extra_json" not in link_cols:
-        conn.execute("ALTER TABLE links ADD COLUMN extra_json TEXT DEFAULT ''")
-    if "notified_at" not in link_cols:
-        conn.execute("ALTER TABLE links ADD COLUMN notified_at TEXT DEFAULT ''")
-    conn.commit(); conn.close()
-    log.info("DB initialized at %s", DB_PATH)
+    try:
+        initialize_schema(conn)
+    finally:
+        conn.close()
+    log.info("Database initialized")
 
 # ---------------------- helpers ----------------------
 def utc_now_iso() -> str:
@@ -1816,7 +1758,7 @@ def format_profile_urls_notice(paths: Sequence[Path], base_dir: Path) -> str:
 
 
 # ---------------------- DB ops ----------------------
-def add_vsco_link_legacy(username: str, url: str, chat_id: int, conn: sqlite3.Connection) -> bool:
+def add_vsco_link_legacy(username: str, url: str, chat_id: int, conn: Connection) -> bool:
     cur = conn.execute(
         "INSERT OR IGNORE INTO links(chat_id,username,url,created_at) VALUES(?,?,?,?)",
         (chat_id, username, url, utc_now_iso())
@@ -2117,7 +2059,7 @@ async def _links_notify_scheduler_loop() -> None:
     finally:
         log.info("Link notification scheduler stopped")
 
-def _get_item_id(conn: sqlite3.Connection, username: str, profile_url: str, image_url: str) -> Optional[int]:
+def _get_item_id(conn: Connection, username: str, profile_url: str, image_url: str) -> Optional[int]:
     row = conn.execute(
         """SELECT id FROM items
            WHERE username=? AND COALESCE(profile_url,'')=COALESCE(?, '')
@@ -2127,7 +2069,7 @@ def _get_item_id(conn: sqlite3.Connection, username: str, profile_url: str, imag
     ).fetchone()
     return row[0] if row else None
 
-def _insert_item(conn: sqlite3.Connection, chat_id: int, username: str, profile_url: str,
+def _insert_item(conn: Connection, chat_id: int, username: str, profile_url: str,
                  image_url: str, latitude: Optional[float], longitude: Optional[float],
                  source: str, source_file: Optional[str], added_by: str) -> int:
     cur = conn.cursor()
@@ -2195,11 +2137,11 @@ def upsert_items_with_comments(chat_id: int, pairs: List[Dict[str,str]], source:
                 )
 
             if comment:
-                conn.execute(
+                comment_cursor = conn.execute(
                     "INSERT OR IGNORE INTO comments(item_id,chat_id,comment,created_at) VALUES(?,?,?,?)",
                     (item_id, chat_id, comment, utc_now_iso())
                 )
-                if conn.total_changes > 0:
+                if comment_cursor.rowcount > 0:
                     added_comments += 1
                     log.debug(
                         "upsert_items_with_comments: added comment for item_id=%s", item_id
@@ -2563,7 +2505,7 @@ def infer_media_total(user_dir: Path) -> Optional[int]:
 
 # ---------------------- Stats ----------------------
 _USERNAME_KEY_SQL = "LOWER(TRIM(COALESCE(username,'')))"
-_MEDIA_KEY_SQL = "COALESCE(NULLIF(TRIM(image_url),''), printf('item:%011d', id))"
+_MEDIA_KEY_SQL = "COALESCE(NULLIF(TRIM(image_url),''), 'item:' || CAST(id AS TEXT))"
 
 
 def _items_where_clause(since_iso: Optional[str], chat_id: int, scope: str) -> Tuple[str, List[Any]]:
@@ -2580,7 +2522,7 @@ def _items_where_clause(since_iso: Optional[str], chat_id: int, scope: str) -> T
     return " AND ".join(clauses), params
 
 
-def _count_new_usernames(conn: sqlite3.Connection, since_iso: str, chat_id: int, scope: str) -> int:
+def _count_new_usernames(conn: Connection, since_iso: str, chat_id: int, scope: str) -> int:
     where_sql, params = _items_where_clause(since_iso, chat_id, scope)
     row = conn.execute(
         f"SELECT COUNT(DISTINCT {_USERNAME_KEY_SQL}) FROM items "
@@ -2589,7 +2531,7 @@ def _count_new_usernames(conn: sqlite3.Connection, since_iso: str, chat_id: int,
     ).fetchone()
     return int(row[0] or 0)
 
-def _count_media(conn: sqlite3.Connection, since_iso: str, chat_id: int, scope: str) -> Tuple[int, int]:
+def _count_media(conn: Connection, since_iso: str, chat_id: int, scope: str) -> Tuple[int, int]:
     where_sql, params = _items_where_clause(since_iso, chat_id, scope)
     row = conn.execute(
         f"""
@@ -2612,7 +2554,7 @@ def _count_media(conn: sqlite3.Connection, since_iso: str, chat_id: int, scope: 
     without_coords = int((row[1] or 0))
     return with_coords, without_coords
 
-def _count_totals(conn: sqlite3.Connection, chat_id: int, scope: str) -> Tuple[int, int, int]:
+def _count_totals(conn: Connection, chat_id: int, scope: str) -> Tuple[int, int, int]:
     where_sql, params = _items_where_clause(None, chat_id, scope)
     username_row = conn.execute(
         f"SELECT COUNT(DISTINCT {_USERNAME_KEY_SQL}) FROM items "
@@ -2690,16 +2632,15 @@ def format_stats_text(stats: Dict[str, Dict[str, int]], scope: str) -> str:
 # ---------------------- Export / Aggregations ----------------------
 def fetch_gallery_users(scope: str, chat_id: int, *, chunk_size: int = 500) -> Iterator[Dict[str, Any]]:
     conn = db_connect()
-    conn.execute("PRAGMA read_uncommitted=1;")
 
     if scope == "chat":
-        cursor = conn.execute(
+        cursor = stream_query(conn,
             "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,meta_json,created_at"
             " FROM items WHERE chat_id=? ORDER BY COALESCE(username,''), id",
             (chat_id,),
         )
     else:
-        cursor = conn.execute(
+        cursor = stream_query(conn,
             "SELECT id,username,profile_url,latitude,longitude,image_url,added_by,source,source_file,meta_json,created_at"
             " FROM items ORDER BY COALESCE(username,''), id"
         )
@@ -3146,7 +3087,7 @@ def fetch_gallery_users(scope: str, chat_id: int, *, chunk_size: int = 500) -> I
         conn.close()
 
 def fetch_items_for_map(scope: str, chat_id: int) -> List[Dict[str, Any]]:
-    conn = db_connect(); conn.execute("PRAGMA read_uncommitted=1;")
+    conn = db_connect()
     if scope == "chat":
         rows = conn.execute(
             "SELECT id,username,profile_url,image_url,latitude,longitude,added_by,source,source_file,meta_json,created_at"

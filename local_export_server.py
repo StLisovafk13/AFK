@@ -27,7 +27,7 @@ import json
 import logging
 import os
 import secrets
-import sqlite3
+from database import DatabaseError
 import time
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -1374,7 +1374,7 @@ class ExportRequestHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-        except sqlite3.Error as err:
+        except DatabaseError as err:
             log.exception("Database error during %s", path)
             self._send_text(
                 json.dumps({"error": "DB error", "details": str(err)}, ensure_ascii=False),
@@ -1487,7 +1487,7 @@ class ExportRequestHandler(BaseHTTPRequestHandler):
                 content_type="application/json; charset=utf-8",
             )
             return
-        except sqlite3.Error as err:
+        except DatabaseError as err:
             log.exception("Database error during POST %s", path)
             self._send_text(
                 json.dumps({"error": "DB error", "details": str(err)}, ensure_ascii=False),
