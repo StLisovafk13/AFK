@@ -17,7 +17,7 @@ from psycopg import sql
 from database import connect_database, initialize_schema, stream_query
 from export_profile_html import load_profile
 from profile_link_scanner import store_profile_media
-from scripts.migrate_to_postgres import inspect_database, migrate
+from scripts.migrate_to_postgres import _sqlite_storage, inspect_database, migrate
 from startup_broadcast import StartupBroadcast
 
 
@@ -142,6 +142,45 @@ class SQLiteTests(BackendContract, unittest.TestCase):
                     connect_database(other_path)
         self.assertFalse(other_path.exists())
 
+    def test_inspection_reports_extra_table_schema_without_record_contents(self):
+        self.insert_item("x" * 1048576)
+        self.conn.execute('CREATE TABLE profiles (id INTEGER PRIMARY KEY, private_text TEXT)')
+        self.conn.execute('INSERT INTO profiles VALUES (?, ?)', (1, "PRIVATE_VALUE_NOT_FOR_REPORT"))
+        self.conn.commit()
+        inspected, report = inspect_database(self.path)
+        inspected.close()
+        self.assertEqual(report["ignored_tables"], ["profiles"])
+        self.assertEqual(report["ignored_table_details"]["profiles"]["rows"], 1)
+        self.assertEqual(report["ignored_table_details"]["profiles"]["columns"][1]["name"], "private_text")
+        self.assertEqual(report["items_text_payload_mib"]["meta_json"], 1.0)
+        self.assertNotIn("PRIVATE_VALUE_NOT_FOR_REPORT", str(report))
+        if report["sqlite_storage_mib"] is not None:
+            self.assertGreater(report["sqlite_storage_mib"]["items"]["table_mib"], 0)
+
+    def test_extra_tables_block_import_before_any_postgres_connection(self):
+        self.conn.execute('CREATE TABLE chat_links (chat_id INTEGER)')
+        self.conn.commit()
+        with patch("scripts.migrate_to_postgres.PostgresConnection") as remote:
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, "Additional tables"):
+                migrate(self.path, "postgresql://example.invalid/db")
+            remote.assert_not_called()
+
+    def test_inspection_handles_unusual_table_names_as_identifiers(self):
+        self.conn.execute('CREATE TABLE "extra""table;--" (id INTEGER)')
+        self.conn.commit()
+        inspected, report = inspect_database(self.path)
+        inspected.close()
+        self.assertEqual(report["ignored_table_details"]['extra"table;--']["rows"], 0)
+
+    def test_optional_dbstat_does_not_prevent_inspection(self):
+        connection = self.conn
+
+        class WithoutDbstat:
+            def execute(self, statement):
+                return connection.execute(statement.replace("FROM dbstat", "FROM unavailable_dbstat"))
+
+        self.assertIsNone(_sqlite_storage(WithoutDbstat()))
+
 
 @unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "Set TEST_DATABASE_URL for a PostgreSQL test instance")
 class PostgreSQLTests(BackendContract, unittest.TestCase):
@@ -182,6 +221,17 @@ class PostgreSQLTests(BackendContract, unittest.TestCase):
         self.assertEqual(self.conn.execute("SELECT id FROM links").fetchone(), (41,))
         self.conn.commit()
         self.assertGreater(self.insert_item(), 73)
+
+    def test_explicit_skip_preserves_main_records_and_original_extra_table(self):
+        source = self.source()
+        with sqlite3.connect(source) as local:
+            local.execute("CREATE TABLE profiles (id INTEGER PRIMARY KEY, note TEXT)")
+            local.execute("INSERT INTO profiles VALUES (1, 'keep in source')")
+        with contextlib.redirect_stdout(io.StringIO()):
+            migrate(source, os.environ["DATABASE_URL"], allow_skipped_tables=True)
+        self.assertEqual(self.conn.execute("SELECT id FROM items").fetchone(), (73,))
+        with sqlite3.connect(source) as local:
+            self.assertEqual(local.execute("SELECT note FROM profiles").fetchone(), ("keep in source",))
 
     def test_copy_failure_rolls_back_rows_from_earlier_tables(self):
         source = self.source()

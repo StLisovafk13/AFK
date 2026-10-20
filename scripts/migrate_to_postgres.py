@@ -17,6 +17,28 @@ from psycopg import sql
 from database import IDENTITY_TABLES, TABLE_COLUMNS, PostgresConnection, database_url, initialize_schema
 
 
+def _identifier(name):
+    return '"' + name.replace('"', '""') + '"'
+
+
+def _sqlite_storage(conn):
+    """Optional SQLite dbstat extension; report physical pages, not a PG estimate."""
+    try:
+        objects = {name: (table, kind) for name, table, kind in conn.execute(
+            "SELECT name, tbl_name, type FROM sqlite_master WHERE type IN ('table','index')")}
+        sizes = {}
+        for name, size, unused in conn.execute("SELECT name, SUM(pgsize), SUM(unused) FROM dbstat GROUP BY name"):
+            table, kind = objects.get(name, (name, "table"))
+            entry = sizes.setdefault(table, {"table_mib": 0, "indexes_mib": 0, "unused_mib": 0})
+            entry["indexes_mib" if kind == "index" else "table_mib"] += size / 1024**2
+            entry["unused_mib"] += unused / 1024**2
+        return {name: {kind: round(size, 2) for kind, size in sizes.items()}
+                for name, sizes in sorted(sizes.items())}
+    except sqlite3.OperationalError:
+        # Some Windows SQLite distributions do not include SQLITE_ENABLE_DBSTAT_VTAB.
+        return None
+
+
 def inspect_database(path: Path):
     if not path.is_file():
         raise ValueError("SQLite source does not exist")
@@ -34,6 +56,22 @@ def inspect_database(path: Path):
         free_count = conn.execute("PRAGMA freelist_count").fetchone()[0]
         counts = {table: conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
                   for table in TABLE_COLUMNS if table in tables}
+        extra = sorted(tables - TABLE_COLUMNS.keys() - {"sqlite_sequence"})
+        extra_details = {}
+        for table in extra:
+            quoted = _identifier(table)
+            extra_details[table] = {
+                "rows": conn.execute(f"SELECT COUNT(*) FROM {quoted}").fetchone()[0],
+                "columns": [{"name": row[1], "type": row[2], "primary_key": row[5]}
+                            for row in conn.execute(f"PRAGMA table_info({quoted})")],
+                "foreign_keys": [{"table": row[2], "from": row[3], "to": row[4]}
+                                 for row in conn.execute(f"PRAGMA foreign_key_list({quoted})")],
+            }
+        item_columns = {row[1] for row in conn.execute('PRAGMA table_info("items")')}
+        measured = [column for column in ("meta_json", "image_url", "profile_url", "source_file")
+                    if column in item_columns]
+        expressions = [f"COALESCE(SUM(LENGTH(CAST({_identifier(column)} AS BLOB))), 0)" for column in measured]
+        payload = conn.execute("SELECT " + ", ".join(expressions) + " FROM items").fetchone() if measured else ()
         orphan_comments = conn.execute("""SELECT COUNT(*) FROM comments c
             LEFT JOIN items i ON i.id=c.item_id WHERE i.id IS NULL""").fetchone()[0]
         report = {
@@ -43,7 +81,10 @@ def inspect_database(path: Path):
             "sqlite_used_pages_mib": round((page_count - free_count) * page_size / 1024**2, 2),
             "sqlite_free_pages_mib": round(free_count * page_size / 1024**2, 2),
             "rows": counts,
-            "ignored_tables": sorted(tables - TABLE_COLUMNS.keys() - {"sqlite_sequence"}),
+            "ignored_tables": extra,
+            "ignored_table_details": extra_details,
+            "sqlite_storage_mib": _sqlite_storage(conn),
+            "items_text_payload_mib": {name: round(size / 1024**2, 2) for name, size in zip(measured, payload)},
             "orphan_comments": orphan_comments,
             "postgres_size_note": "SQLite page usage is not a PostgreSQL size estimate. Allow room for indexes and growth.",
         }
@@ -53,7 +94,7 @@ def inspect_database(path: Path):
         raise
 
 
-def migrate(path: Path, url: str, batch_size=1000):
+def migrate(path: Path, url: str, batch_size=1000, allow_skipped_tables=False):
     if not url.startswith(("postgresql://", "postgres://")):
         raise ValueError("Configure DATABASE_URL with a PostgreSQL URL")
     if batch_size < 1 or batch_size > 10000:
@@ -63,6 +104,9 @@ def migrate(path: Path, url: str, batch_size=1000):
         print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
         if report["orphan_comments"]:
             raise ValueError("Orphan comments found; resolve them before migration. No rows were imported.")
+        if report["ignored_tables"] and not allow_skipped_tables:
+            raise ValueError("Additional tables found. Review ignored_table_details before import. "
+                             "Use --allow-skipped-tables only if their omission is intentional.")
         with closing(PostgresConnection(url)) as target:
             initialize_schema(target)
             # Import is atomic. Failures rollback all rows; existing data is never replaced.
@@ -111,6 +155,8 @@ def main():
     parser.add_argument("command", choices=("inspect", "migrate"))
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--batch-size", type=int, default=1000)
+    parser.add_argument("--allow-skipped-tables", action="store_true",
+                        help="Explicitly allow omission of additional SQLite tables after review")
     args = parser.parse_args()
     try:
         if args.command == "inspect":
@@ -118,7 +164,7 @@ def main():
             conn.close()
             print(json.dumps(report, ensure_ascii=False, indent=2))
         else:
-            migrate(args.source, database_url(), args.batch_size)
+            migrate(args.source, database_url(), args.batch_size, args.allow_skipped_tables)
     except (ValueError, OSError, sqlite3.Error, psycopg.Error) as error:
         # Avoid driver messages containing connection credentials or row contents.
         if isinstance(error, ValueError):
