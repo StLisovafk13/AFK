@@ -6,10 +6,11 @@ import argparse
 import html
 import json
 import os
-import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from database import Connection, connect_database, database_url, OperationalError
 
 DEFAULT_DB_PATH = os.environ.get("BOT_DB_PATH", "vsco_links.db")
 
@@ -134,14 +135,14 @@ def extract_coordinates_from_meta(meta: Dict[str, Any]) -> Optional[Tuple[float,
     return None
 
 
-def _load_comments(conn: sqlite3.Connection, item_ids: List[int]) -> Dict[int, List[str]]:
+def _load_comments(conn: Connection, item_ids: List[int]) -> Dict[int, List[str]]:
     if not item_ids:
         return {}
     try:
         placeholders = ",".join("?" for _ in item_ids)
         query = f"SELECT item_id, comment FROM comments WHERE item_id IN ({placeholders}) ORDER BY id"
         rows = conn.execute(query, item_ids).fetchall()
-    except sqlite3.OperationalError:
+    except OperationalError:
         return {}
     comments: Dict[int, List[str]] = {}
     for item_id, comment in rows:
@@ -171,7 +172,7 @@ def _decode_meta(meta_json: Any) -> Optional[Dict[str, Any]]:
     return decoded if isinstance(decoded, dict) else None
 
 
-def load_profile(conn: sqlite3.Connection, username: str, *, chat_id: Optional[int] = None) -> ProfilePayload:
+def load_profile(conn: Connection, username: str, *, chat_id: Optional[int] = None) -> ProfilePayload:
     normalized = _normalize_username(username)
     if not normalized:
         raise ValueError("Username must be provided")
@@ -456,10 +457,10 @@ def run_cli(argv: Optional[List[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     db_path = Path(args.db_path)
-    if not db_path.exists():
+    if not database_url() and not db_path.exists():
         raise FileNotFoundError(f"Database not found: {db_path}")
 
-    conn = sqlite3.connect(db_path)
+    conn = connect_database(db_path)
     try:
         profile = load_profile(conn, args.username, chat_id=args.chat_id)
     finally:

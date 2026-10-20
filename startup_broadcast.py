@@ -2,8 +2,9 @@
 
 import asyncio
 import logging
-import sqlite3
 from typing import Callable
+from database import Connection
+
 
 from aiogram import BaseMiddleware, Bot
 from aiogram.exceptions import TelegramRetryAfter
@@ -14,7 +15,7 @@ log = logging.getLogger(__name__)
 
 
 class StartupBroadcast(BaseMiddleware):
-    def __init__(self, db_connect: Callable[[], sqlite3.Connection], *, enabled: bool, text: str):
+    def __init__(self, db_connect: Callable[[], Connection], *, enabled: bool, text: str):
         self._db_connect = db_connect
         self.enabled = enabled
         self.text = text.strip()
@@ -24,7 +25,7 @@ class StartupBroadcast(BaseMiddleware):
         conn = self._db_connect()
         try:
             with conn:
-                conn.execute("CREATE TABLE IF NOT EXISTS bot_private_chats (chat_id INTEGER PRIMARY KEY)")
+                conn.execute("CREATE TABLE IF NOT EXISTS bot_private_chats (chat_id BIGINT PRIMARY KEY)")
                 # Positive chat IDs in these tables identify previous private chats.
                 # User IDs from group activity do not establish a private conversation.
                 conn.execute("""

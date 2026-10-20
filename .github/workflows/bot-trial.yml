@@ -11,7 +11,6 @@ on:
 
 permissions:
   contents: read
-  actions: read
 
 concurrency:
   group: vsco-bot-trial
@@ -22,7 +21,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     env:
-      BOT_DB_PATH: ${{ github.workspace }}/runtime/vsco_links.db
       BOT_WORKDIR: ${{ github.workspace }}/runtime/work
       BOT_LOGDIR: ${{ github.workspace }}/runtime/logs
       BOT_BROWSER_HEADLESS: "1"
@@ -38,14 +36,17 @@ jobs:
           python-version: "3.13"
           cache: pip
 
-      - name: Validate bot token
+      - name: Validate required secrets
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
           python - <<'PY'
           import os
           if not os.getenv("TELEGRAM_BOT_TOKEN", "").strip():
               raise SystemExit("Add TELEGRAM_BOT_TOKEN in repository Settings → Secrets and variables → Actions")
+          if not os.getenv("DATABASE_URL", "").strip():
+              raise SystemExit("Add DATABASE_URL from Neon in repository Actions secrets")
           PY
 
       - name: Install dependencies and Firefox
@@ -55,41 +56,27 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libimage-exiftool-perl
 
-      - name: Download latest database artifact
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
-              ...context.repo, name: 'vsco-bot-database', per_page: 100
-            });
-            const artifact = artifacts.filter(a => !a.expired && a.workflow_run?.id !== context.runId)
-              .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0];
-            if (!artifact) {
-              core.info('No saved database found; use BOT_DB_SEED_URL or start with an empty database.');
-              return;
-            }
-            const archive = await github.rest.actions.downloadArtifact({
-              ...context.repo, artifact_id: artifact.id, archive_format: 'zip'
-            });
-            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'bot-database.zip'), Buffer.from(archive.data));
-            core.info(`Downloaded database artifact ${artifact.id} from run ${artifact.workflow_run?.id}`);
-
-      - name: Restore or import database
-        id: database
+      - name: Check PostgreSQL and initialize schema
+        id: neon
         env:
-          BOT_DB_SEED_URL: ${{ secrets.BOT_DB_SEED_URL }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          python scripts/actions_database.py restore \
-            --database "$BOT_DB_PATH" \
-            --archive "$RUNNER_TEMP/bot-database.zip"
+          python - <<'PY'
+          from database import connect_database, initialize_schema
+          conn = connect_database()
+          try:
+              initialize_schema(conn)
+              print("PostgreSQL connection and schema ready")
+          finally:
+              conn.close()
+          PY
           mkdir -p "$BOT_WORKDIR" "$BOT_LOGDIR"
 
       - name: Run bot for selected duration
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           BOT_ADMIN_IDS: ${{ secrets.BOT_ADMIN_IDS }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TRIAL_MINUTES: ${{ inputs.minutes }}
         run: |
           set +e
@@ -101,25 +88,8 @@ jobs:
           fi
           exit "$result"
 
-      - name: Create consistent SQLite snapshot
-        id: snapshot
-        if: ${{ always() && steps.database.outcome == 'success' }}
-        run: |
-          python scripts/actions_database.py snapshot \
-            --database "$BOT_DB_PATH" \
-            --output "$RUNNER_TEMP/bot-snapshot/vsco_links.db"
-
-      - name: Save database for next run
-        if: ${{ always() && steps.snapshot.outcome == 'success' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: vsco-bot-database
-          path: ${{ runner.temp }}/bot-snapshot/vsco_links.db
-          if-no-files-found: error
-          retention-days: 30
-
       - name: Save troubleshooting logs
-        if: ${{ always() && steps.database.outcome == 'success' }}
+        if: ${{ always() && steps.neon.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: vsco-bot-logs
