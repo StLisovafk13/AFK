@@ -15,6 +15,7 @@ export type Profile = {
   image_url: string;
 };
 export type Summary = {
+  snapshot_at?: string;
   items: number;
   profiles: number;
   links: number;

@@ -1,22 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseFilters, where, positiveId } from "../lib/filters";
+import { parseFilters, positiveId } from "../lib/filters";
 import { safeURL, mediaKind } from "../lib/types";
-test("SQL keeps search input in bound parameters and escapes wildcards", () => {
-  const w = where(
-    parseFilters(
-      new URLSearchParams({
-        q: "x%' OR 1=1 --_",
-        chat: "-100123",
-        cursor: "999",
-      }),
-    ),
-  );
-  assert.ok(!w.sql.includes("OR 1=1"));
-  assert.deepEqual(w.values, ["%x\\%' OR 1=1 --\\_%", "-100123", "999"]);
-  assert.ok(w.sql.includes("i.chat_id = $2::bigint"));
-  assert.ok(w.sql.includes("i.id < $3::bigint"));
-});
 test("IDs remain precise strings and reject invalid or overflowing inputs", () => {
   assert.equal(positiveId("9007199254740993"), "9007199254740993");
   for (const id of ["0", "-1", "abc", "1 OR 1=1", "9223372036854775808"])
@@ -29,14 +14,17 @@ test("IDs remain precise strings and reject invalid or overflowing inputs", () =
     "-100123",
   );
 });
-test("coordinates use geographic bounds; profile queries ignore item cursor predicate", () => {
+test("profile filters preserve cursor, coordinate and exact-match options", () => {
   const f = parseFilters(
     new URLSearchParams({ q: "@user", geo: "1", cursor: "123" }),
   );
   assert.equal(f.username, "user");
-  const w = where(f, false);
-  assert.ok(w.sql.includes("BETWEEN -90 AND 90"));
-  assert.ok(!w.sql.includes("i.id <"));
+  assert.equal(f.geo, true);
+  assert.equal(f.cursor, "123");
+  assert.equal(parseFilters(new URLSearchParams({ exact: "1" })).exact, true);
+  assert.throws(() =>
+    parseFilters(new URLSearchParams({ q: "x".repeat(101) })),
+  );
 });
 test("media links reject executable URLs", () => {
   for (const url of [

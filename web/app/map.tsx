@@ -15,6 +15,7 @@ export default function ArchiveMap({
   useEffect(() => {
     let disposed = false;
     let map: import("leaflet").Map | undefined;
+    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
     import("leaflet").then((L) => {
       if (disposed || !root.current) return;
       map = L.map(root.current, { scrollWheelZoom: false }).setView(
@@ -55,11 +56,16 @@ export default function ArchiveMap({
           padding: [36, 36],
           maxZoom: 12,
         });
-      setTimeout(() => map?.invalidateSize(), 100);
+      resizeTimer = setTimeout(() => {
+        if (!disposed) map?.invalidateSize();
+      }, 100);
     });
     return () => {
       disposed = true;
+      clearTimeout(resizeTimer);
+      map?.stop();
       map?.remove();
+      map = undefined;
     };
   }, [items]);
   return (

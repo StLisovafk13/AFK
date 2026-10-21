@@ -33,30 +33,3 @@ export function parseFilters(params: URLSearchParams): Filters {
     exact: params.get("exact") === "1",
   };
 }
-export function where(filters: Filters, cursor = true) {
-  const values: string[] = [];
-  const clauses: string[] = [];
-  const add = (sql: string, value: string) => {
-    values.push(value);
-    clauses.push(sql.replace("?", "$" + values.length));
-  };
-  // Escape LIKE wildcards: typing '%' must never request the entire archive.
-  if (filters.username) {
-    if (filters.exact) add("LOWER(i.username) = LOWER(?)", filters.username);
-    else
-      add(
-        "i.username ILIKE ? ESCAPE '\\'",
-        "%" + filters.username.replace(/[\\%_]/g, "\\$&") + "%",
-      );
-  }
-  if (filters.chat) add("i.chat_id = ?::bigint", filters.chat);
-  if (filters.geo)
-    clauses.push(
-      "i.latitude BETWEEN -90 AND 90 AND i.longitude BETWEEN -180 AND 180",
-    );
-  if (cursor && filters.cursor) add("i.id < ?::bigint", filters.cursor);
-  return {
-    sql: clauses.length ? " WHERE " + clauses.join(" AND ") : "",
-    values,
-  };
-}

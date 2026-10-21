@@ -1,4 +1,4 @@
 import { createRoot } from "react-dom/client";
-import Archive from "./archive";
+import Login from "./login";
 import "./globals.css";
-createRoot(document.getElementById("root")!).render(<Archive />);
+createRoot(document.getElementById("root")!).render(<Login />);

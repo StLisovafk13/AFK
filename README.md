@@ -447,10 +447,13 @@ sqlite3 vsco_links.db "DELETE FROM items WHERE username='vsco_user';"
 
 Теперь у вас есть единая точка входа для понимания всех модулей и их функций: используйте таблицы и ссылки на код, чтобы быстро найти нужную реализацию и интегрировать её в свои сценарии.
 
-## Онлайн-архив через GitHub Actions
+## Онлайн-архив на GitHub Pages
 
 Сайт с галереей, профилями, комментариями и картой находится в [`web/`](web/README.md).
-Workflow [Online archive website](.github/workflows/archive-site.yml) проверяет PR и публикует
-из `main` в ваш Cloudflare Workers. Сайт читает существующую Neon PostgreSQL и защищён
-логином и паролем; `DATABASE_URL` передаётся только на сервер через секреты.
-Первоначальная настройка Cloudflare и список GitHub Secrets описаны в [инструкции](web/README.md).
+Workflow [Online archive website](.github/workflows/archive-site.yml) проверяет PR,
+создаёт зашифрованный снимок Neon и публикует его на `github.io` из `main`.
+Автоматическое обновление — раз в 6 часов, также доступен ручной запуск.
+Для публикации нужны GitHub Secrets `DATABASE_URL` и `ARCHIVE_PASSWORD` и настройка
+**Settings → Pages → Source → GitHub Actions**. Сервер и отдельный аккаунт хостинга не нужны.
+Данные открываются по паролю в браузере; строка подключения к Neon в сайт не попадает.
+Подробности — в [инструкции](web/README.md).

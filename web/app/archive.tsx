@@ -28,6 +28,7 @@ import {
 import type { Detail, Media, Page, Profile, Summary } from "../lib/types";
 import { safeURL, mediaKind } from "../lib/types";
 import ArchiveMap from "./map";
+import { snapshotAPI } from "../lib/snapshot-client";
 
 type View = "gallery" | "profiles" | "map";
 type Failure = { code: string; message: string };
@@ -44,22 +45,7 @@ function date(value: string) {
         year: "numeric",
       });
 }
-async function api<T>(
-  params: URLSearchParams,
-  signal?: AbortSignal,
-): Promise<T> {
-  const response = await fetch("/api/archive?" + params, {
-    signal,
-    cache: "no-store",
-  });
-  const data = (await response.json()) as T & { code?: string; error?: string };
-  if (!response.ok)
-    throw {
-      code: data.code || "ERROR",
-      message: data.error || "Не удалось загрузить данные",
-    };
-  return data;
-}
+const api = snapshotAPI;
 function Thumbnail({
   url,
   alt,
@@ -97,7 +83,7 @@ function Thumbnail({
     />
   );
 }
-export default function Archive() {
+export default function Archive({ onLock }: { onLock?: () => void }) {
   const [view, setView] = useState<View>("gallery");
   const [q, setQ] = useState("");
   const [search, setSearch] = useState("");
@@ -209,7 +195,7 @@ export default function Archive() {
     setGeo(false);
   };
   const filtered = !!(search || chat || geo);
-  const configured = error?.code !== "DATABASE_NOT_CONFIGURED";
+
   const shown = view === "profiles" ? profiles.length : items.length;
   const title =
     view === "gallery"
@@ -220,7 +206,11 @@ export default function Archive() {
   return (
     <div className="site-shell">
       <header className="topbar">
-        <a className="brand" href="/" aria-label="VSCO Archive — главная">
+        <a
+          className="brand"
+          href={import.meta.env.BASE_URL}
+          aria-label="VSCO Archive — главная"
+        >
           <span className="brand-icon">
             <Aperture size={24} />
           </span>
@@ -231,6 +221,11 @@ export default function Archive() {
         <span className="private-tag">
           <ShieldCheck size={14} /> Приватный архив
         </span>
+        {onLock && (
+          <button className="lock-button" onClick={onLock}>
+            Выйти
+          </button>
+        )}
       </header>
       <main>
         <section className="hero">
@@ -246,29 +241,25 @@ export default function Archive() {
             <p>
               Фотографии, профили и места из вашего VSCO-архива.
               <br className="desktop-break" /> Всё в одном пространстве — с
-              актуальными данными из базы.
+              данными из зашифрованного снимка архива.
             </p>
           </div>
           <div className="connection-card">
-            <div
-              className={"connection-icon " + (!configured ? "inactive" : "")}
-            >
+            <div className={"connection-icon " + (error ? "inactive" : "")}>
               <Database size={22} />
             </div>
             <div>
               <span className="connection-label">ИСТОЧНИК ДАННЫХ</span>
-              <strong>Neon PostgreSQL</strong>
+              <strong>Neon → GitHub Pages</strong>
               <span className="connection-state">
                 <i
                   className={busy ? "pending" : error ? "offline" : "online"}
                 />
                 {busy
-                  ? "Проверяем подключение"
-                  : !configured
-                    ? "Ожидает подключения"
-                    : error
-                      ? "Нет соединения"
-                      : "База подключена"}
+                  ? "Загружаем снимок"
+                  : error
+                    ? "Снимок недоступен"
+                    : "Снимок открыт"}
               </span>
             </div>
             <span className="connection-line" />
@@ -423,33 +414,7 @@ export default function Archive() {
             </div>
           </div>
           <div aria-live="polite">
-            {error && !configured ? (
-              <div className="setup-state">
-                <span className="setup-icon">
-                  <Database size={30} />
-                </span>
-                <span className="eyebrow">ОДИН ШАГ ДО ВАШЕГО АРХИВА</span>
-                <h2>Подключите базу Neon</h2>
-                <p>
-                  Сайт готов к просмотру вашей библиотеки.
-                  <br />
-                  Добавьте строку подключения к существующей базе в секреты
-                  сайта.
-                </p>
-                <div className="setup-code">
-                  <span>Секрет сервера</span>
-                  <code>DATABASE_URL</code>
-                  <ShieldCheck size={18} />
-                </div>
-                <p className="setup-note">
-                  После добавления секрета примените настройки повторной
-                  публикацией.
-                  <br />
-                  Данные останутся в Neon, а бот продолжит работать с той же
-                  базой.
-                </p>
-              </div>
-            ) : error && !shown ? (
+            {error && !shown ? (
               <div className="empty-state">
                 <CloudOff size={34} />
                 <h3>Архив пока недоступен</h3>
@@ -591,7 +556,7 @@ export default function Archive() {
               </div>
             )}
           </div>
-          {!busy && configured && next && (
+          {!busy && next && (
             <div className="load-more">
               <button
                 className="load-more-button"
@@ -616,10 +581,16 @@ export default function Archive() {
             <Aperture size={20} />
           </span>
           <div>
-            <strong>Ваш архив — в актуальном состоянии</strong>
+            <strong>Архив на GitHub Pages</strong>
+            {stats?.snapshot_at && (
+              <p>
+                Снимок от {new Date(stats.snapshot_at).toLocaleString("ru-RU")}
+              </p>
+            )}
             <p>
-              Бот сохраняет записи в Neon. Сайт читает их из той же базы.
-              Нажмите «Обновить», чтобы увидеть новые данные.
+              Бот сохраняет записи в Neon. GitHub Actions обновляет снимок
+              каждые 6 часов или по ручному запуску. «Обновить» проверяет
+              последнюю публикацию.
             </p>
           </div>
           <span className="read-only">
@@ -628,7 +599,7 @@ export default function Archive() {
         </section>
       </main>
       <footer>
-        <a className="footer-brand" href="/">
+        <a className="footer-brand" href={import.meta.env.BASE_URL}>
           <Aperture size={17} /> VSCO / Archive
         </a>
         <span>Сохранённые моменты. Новые перспективы.</span>

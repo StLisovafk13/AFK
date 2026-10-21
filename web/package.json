@@ -6,12 +6,12 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "dev": "npm run build:client && node scripts/wrangler.mjs dev --local --ip 127.0.0.1 --port 8787",
-    "build:client": "vite build",
-    "build": "npm run build:client && node scripts/wrangler.mjs deploy --dry-run --outdir dist/worker",
+    "dev": "vite --host 127.0.0.1 --port 5173",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 5173",
     "check": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
-    "deploy": "node scripts/deploy.mjs"
+    "export:pages": "node --import tsx scripts/export-pages.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.2",
@@ -21,7 +21,6 @@
     "react-dom": "19.2.6"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "4.20260515.1",
     "@electric-sql/pglite": "^0.5.10",
     "@types/leaflet": "^1.9.20",
     "@types/node": "22.19.19",
@@ -30,14 +29,7 @@
     "@vitejs/plugin-react": "6.0.2",
     "tsx": "^4.20.0",
     "typescript": "5.9.3",
-    "vinext": "1.0.0-beta.5",
-    "vite": "8.0.13",
-    "wrangler": "4.92.0"
+    "vite": "8.0.13"
   },
-  "type": "module",
-  "overrides": {
-    "miniflare": {
-      "sharp": "0.35.4"
-    }
-  }
+  "type": "module"
 }
