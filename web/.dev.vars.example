@@ -1,0 +1,5 @@
+# Copy to .dev.vars for local development only. Never commit real values.
+DATABASE_URL=
+ARCHIVE_USERNAME=archive
+# Use a unique random password of at least 20 characters.
+ARCHIVE_PASSWORD=

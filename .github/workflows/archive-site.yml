@@ -1,0 +1,65 @@
+name: Online archive website
+
+on:
+  pull_request:
+    paths: ['web/**', '.github/workflows/archive-site.yml']
+  push:
+    branches: [main]
+    paths: ['web/**', '.github/workflows/archive-site.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: archive-website-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: web
+
+jobs:
+  check:
+    name: Test and build archive
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run check
+      - run: npm test
+      - name: Build frontend and validate Worker without production credentials
+        run: npm run build
+
+  deploy:
+    name: Publish to Cloudflare Workers
+    needs: check
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: archive-production
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: Build public application code without secrets
+        run: npm run build:client
+      - name: Deploy Worker, static assets and runtime secrets together
+        run: npm run deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ARCHIVE_PASSWORD: ${{ secrets.ARCHIVE_PASSWORD }}
+          ARCHIVE_USERNAME: ${{ vars.ARCHIVE_USERNAME }}
+          ARCHIVE_WORKER_NAME: ${{ vars.ARCHIVE_WORKER_NAME }}

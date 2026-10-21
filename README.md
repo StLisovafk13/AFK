@@ -446,3 +446,11 @@ sqlite3 vsco_links.db "DELETE FROM items WHERE username='vsco_user';"
 - Большинство скриптов поддерживают параметр `--verbose`, включающий подробные логи Playwright/HTTP.
 
 Теперь у вас есть единая точка входа для понимания всех модулей и их функций: используйте таблицы и ссылки на код, чтобы быстро найти нужную реализацию и интегрировать её в свои сценарии.
+
+## Онлайн-архив через GitHub Actions
+
+Сайт с галереей, профилями, комментариями и картой находится в [`web/`](web/README.md).
+Workflow [Online archive website](.github/workflows/archive-site.yml) проверяет PR и публикует
+из `main` в ваш Cloudflare Workers. Сайт читает существующую Neon PostgreSQL и защищён
+логином и паролем; `DATABASE_URL` передаётся только на сервер через секреты.
+Первоначальная настройка Cloudflare и список GitHub Secrets описаны в [инструкции](web/README.md).
